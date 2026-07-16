@@ -1,11 +1,14 @@
 {
   "name": "@baizor/pipeline-runner",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Standalone long-running runner daemon for cloud-dispatched pipeline runs: registers with a runner token over the control plane's /agent/v1 WSS channel (long-poll fallback seam), heartbeats, accepts job leases, ships events, and relays needs-input. Also installs itself as a native OS service (systemd/launchd/Windows).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IvanMurzak/pipeline-runner.git"
+  },
   "bin": {
-    "pipeline-runner": "./src/cli.ts"
+    "pipeline-runner": "src/cli.ts"
   },
   "exports": {
     ".": "./src/index.ts"
@@ -17,6 +20,9 @@
   },
   "engines": {
     "bun": ">=1.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",
