@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Bun unit tests + typecheck
+    # GitHub-hosted ONLY — never register the private self-hosted runner
+    # (ai-pipeline-win) with this public repo.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run unit tests
+        # Whole-package scan (not just tests/) so co-located src/**/*.test.ts
+        # — the job-execution suites under src/jobs, src/dispatch — are
+        # covered too.
+        run: bun test
+      - name: Typecheck
+        run: bunx tsc --noEmit
