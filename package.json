@@ -1,6 +1,6 @@
 {
   "name": "@baizor/pipeline-runner",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Standalone long-running runner daemon for cloud-dispatched pipeline runs: registers with a runner token over the control plane's /agent/v1 WSS channel (long-poll fallback seam), heartbeats, accepts job leases, ships events, and relays needs-input. Also installs itself as a native OS service (systemd/launchd/Windows).",
   "repository": {
