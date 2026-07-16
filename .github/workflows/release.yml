@@ -1,0 +1,74 @@
+# Publishes @baizor/pipeline-runner to npm via npm Trusted Publishing (OIDC).
+#
+# This workflow does NOT authenticate with any npm token. It relies on the
+# `id-token: write` permission below so npm's OIDC-based Trusted Publishing
+# can issue a short-lived, workflow-scoped credential at publish time.
+#
+# REQUIRES an owner-only, one-time setup performed outside this repo: the
+# Trusted Publisher config for this package must be added on npmjs.com
+# (package Settings -> Trusted Publishers -> GitHub Actions, pointing at
+# IvanMurzak/pipeline-runner + this workflow file, release.yml). Until that
+# is wired up, the "Publish to npm" step below WILL FAIL with an auth error
+# — that is expected and is not a bug in this workflow.
+#
+# The first-ever publish of this package is expected to be done manually by
+# the owner via `npm publish --otp=...`, before Trusted Publishing is
+# configured. This workflow is intended to handle every release from here on.
+#
+# Runs on manual dispatch or when a GitHub Release is published. It
+# intentionally does NOT trigger on push/pull_request — see ci.yml for that.
+name: Release
+
+on:
+  workflow_dispatch: {}
+  release:
+    types: [published]
+
+permissions:
+  id-token: write # OIDC token for npm Trusted Publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      # Pin the toolchain explicitly rather than trusting whatever the
+      # GitHub-hosted runner image happens to ship. npm Trusted Publishing
+      # requires Node >= 22.14.0 and npm >= 11.5.1 (per npm's docs); the
+      # setup-node action's bundled npm may still be older than that even at
+      # this Node version, hence the separate npm upgrade step below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14.0"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm >= 11.5.1 (required for Trusted Publishing/OIDC)
+        run: npm install -g npm@^11.5.1
+
+      - name: Verify toolchain versions
+        run: |
+          node --version
+          npm --version
+          bun --version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      # No NODE_AUTH_TOKEN / npm token of any kind here on purpose — auth is
+      # handled entirely by OIDC Trusted Publishing via the id-token
+      # permission above. --provenance and --access public are kept explicit
+      # (belt-and-braces) even though publishConfig.access is already "public".
+      - name: Publish to npm (Trusted Publishing / OIDC)
+        run: npm publish --provenance --access public
