@@ -77,11 +77,15 @@ src/cli.ts               # thin CLI: register / start / status / service
 
 ## Wire protocol
 
-`src/core/wire.ts` (and the smaller vendored copies under `src/jobs/wire.ts`,
-`src/relay/wire-relay.ts`, `src/shipper/wire-ingest.ts`) are hand-rolled
-copies of the control plane's wire protocol, kept in sync by hand. They will
-be replaced by the published `@baizor/protocol` npm package once it ships;
-until then, treat these files as the source of truth for this repo only.
+The wire protocol comes from the published
+[`@baizor/pipeline-protocol`](https://www.npmjs.com/package/@baizor/pipeline-protocol)
+npm package (repo [`IvanMurzak/pipeline-protocol`](https://github.com/IvanMurzak/pipeline-protocol))
+— zod schemas + inferred TS types, additive-only within a protocol major.
+`src/core/wire.ts`, `src/jobs/wire.ts`, `src/relay/wire-relay.ts`, and
+`src/shipper/wire-ingest.ts` are thin re-export seams over it: they keep the
+runner's internal import paths stable and hold the few runner-local helpers
+(frame builders, deliberately tolerant inbound guards) the package does not
+provide.
 
 ## Develop
 
