@@ -383,7 +383,7 @@ describe('JobExecutor — failure paths', () => {
 });
 
 describe('JobExecutor — needs-input seam', () => {
-  test('a parked question is surfaced to the relay and the answer resumes the SAME iteration', async () => {
+  test('a parked question (older-CLI shape, no question_id) is surfaced with an executor-minted fallback id, and the answer resumes the SAME iteration (06.2.2)', async () => {
     const parkedSeen: ParkedQuestion[] = [];
     const world = makeWorld([driveAwaiting(), DRIVE_COMPLETED], {
       needsInput: {
@@ -400,7 +400,7 @@ describe('JobExecutor — needs-input seam', () => {
       {
         job_id: 'job-1',
         run_id: 'run-1',
-        question_id: 'q-1',
+        question_id: 'q-1', // minted (makeId stub) — driveAwaiting() carries none
         step_id: '02-deploy',
         iteration_path: 'steps/02-deploy.md',
         session_id: 'sess-1',
@@ -423,6 +423,23 @@ describe('JobExecutor — needs-input seam', () => {
       '--json',
     ]);
     expect(world.states).toContain('awaiting_input');
+  });
+
+  test('a parked question carrying drive-minted question_id (06.2.1, b2 contract) is passed through VERBATIM — never re-minted', async () => {
+    const parkedSeen: ParkedQuestion[] = [];
+    const world = makeWorld([driveAwaiting('steps/02-deploy.md', 'Which host?', 'drive-q-42'), DRIVE_COMPLETED], {
+      needsInput: {
+        onQuestion: (parked) => {
+          parkedSeen.push(parked);
+          return 'host-a';
+        },
+      },
+    });
+    const result = await world.executor.start();
+
+    expect(result.ok).toBe(true);
+    expect(parkedSeen).toHaveLength(1);
+    expect(parkedSeen[0]!.question_id).toBe('drive-q-42'); // NOT 'q-1' — the makeId stub never fires
   });
 
   test('the DEFAULT seam auto-fails a parked question (no relay wired yet)', async () => {

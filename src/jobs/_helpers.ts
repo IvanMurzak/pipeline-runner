@@ -162,13 +162,21 @@ export const DRIVE_HALTED: JobExecResult = {
   stderr: '',
 };
 
-export function driveAwaiting(iterationPath = 'steps/02-deploy.md', text = 'Which host?'): JobExecResult {
+/** `questionId` omitted (default) simulates an older CLI that predates the
+ *  b2 park-JSON `question_id` field (06.2.1) — the executor mint-fallback
+ *  case (06.2.2). Pass one to simulate the current contract's passthrough. */
+export function driveAwaiting(
+  iterationPath = 'steps/02-deploy.md',
+  text = 'Which host?',
+  questionId?: string
+): JobExecResult {
   return {
     code: 4,
     stdout: JSON.stringify(
       {
         status: 'awaiting-input',
         step_id: '02-deploy',
+        ...(questionId !== undefined ? { question_id: questionId } : {}),
         iteration_path: iterationPath,
         session_id: 'sess-1',
         question: { text, context: 'ctx', options: ['a', 'b'] },

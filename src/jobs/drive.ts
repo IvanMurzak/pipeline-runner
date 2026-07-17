@@ -8,10 +8,13 @@
  *     --json` runs the pipeline to completion in one supervised process.
  *   - Exit codes: 0 completed · 1 halted/depth-exhausted · 2 usage error ·
  *     3 blocked (nested blocker) · 4 awaiting-input (PARKED on a question).
- *   - Exit 4 stdout carries `{status:"awaiting-input", step_id,
+ *   - Exit 4 stdout carries `{status:"awaiting-input", step_id, question_id,
  *     iteration_path, session_id, question:{text,context,options}}`; resume
  *     the SAME claude session via `--resume --start <iteration> --answer
- *     "<text>"`.
+ *     "<text>"`. `question_id` (06.2.1, b2 — the `pipeline-cli` contract
+ *     surface) is drive's OWN minted identity, echoed by the relay's answer
+ *     so the SAME parked question resumes; an older CLI that predates the
+ *     field omits it, and the executor mints a fallback (06.2.2).
  *   - `--resume` alone re-enters a persisted run (crash / pause recovery).
  *
  * Provider-limit detection is a seam (`ProviderLimitDetector`): the executor
@@ -110,6 +113,10 @@ export function buildDriveArgs(target: DriveTarget, mode: DriveMode): string[] {
 /** A parked needs-input question as drive reports it (exit 4 final JSON). */
 export interface DriveParked {
   step_id: string | null;
+  /** Drive's own minted question identity (06.2.1, b2) — the relay round-trip
+   *  correlates on this exact id. Null for an older CLI whose park JSON
+   *  predates the field; the executor mints a fallback (06.2.2). */
+  question_id: string | null;
   /** Resume target: `--resume --start <iteration_path> --answer <text>`. */
   iteration_path: string;
   session_id: string | null;
@@ -190,6 +197,7 @@ export function classifyDriveOutcome(result: JobExecResult): DriveOutcome {
         kind: 'awaiting_input',
         parked: {
           step_id: asString(json?.step_id),
+          question_id: asString(json?.question_id),
           iteration_path: iteration,
           session_id: asString(json?.session_id),
           question: narrowQuestion(json?.question),

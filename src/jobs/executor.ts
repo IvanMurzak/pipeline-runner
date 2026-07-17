@@ -78,8 +78,10 @@ export interface ParkedQuestion {
   job_id: string;
   run_id: string;
   /** Stable question identity for the relay round-trip (echoed by the
-   *  answer). Drive's park JSON does not carry one yet, so the executor mints
-   *  it — FOLLOW-UP (T1-13): align with the wire `needs_input.question_id`. */
+   *  answer). Sourced from drive's park JSON when present (06.2.1, b2's
+   *  `pipeline-cli` contract); an older CLI whose park JSON predates the
+   *  field gets an executor-minted fallback (06.2.2) — round-trips
+   *  identically either way. */
   question_id: string;
   step_id: string | null;
   iteration_path: string;
@@ -366,11 +368,17 @@ export class JobExecutor {
             return this.fail(reason);
           }
           this.setState('awaiting_input');
+          // 06.2.2: drive's park JSON carries the question_id (b2's
+          // `pipeline-cli` contract, 06.2.1) — use it verbatim so the relay
+          // and drive's OWN session file agree on the identity. An older CLI
+          // that predates the field reports `question_id: null`; the
+          // executor mints a fallback ONLY in that case (never overrides a
+          // drive-provided id).
           const parked: ParkedQuestion = {
             job_id: lease.job_id,
             run_id: lease.run_id,
-            question_id: this.makeId(),
             ...outcome.parked,
+            question_id: outcome.parked.question_id ?? this.makeId(),
           };
           let answer: string | null;
           try {
