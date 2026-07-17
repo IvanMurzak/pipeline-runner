@@ -5,6 +5,7 @@ import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import {
   DRIVE_COMPLETED,
   DRIVE_PROVIDER_LIMIT,
+  driveAwaiting,
   FakeJobExec,
   FakeJobFs,
   FrameSink,
@@ -197,6 +198,44 @@ describe('JobManager — heartbeat composition accessors', () => {
     await tick();
     expect(world.manager.runnerStatus()).toBe('online');
     expect(world.manager.pausedUntil()).toBeNull();
+  });
+
+  // c2 invariant (06.3): a paused OR awaiting-input job MUST stay in
+  // active_run_ids — otherwise a parked run on a live runner would look
+  // idle to the cloud's per-run lease refresher and get interrupted out
+  // from under it. The manager's `active` map already guarantees this (it
+  // only ever deletes on the executor's terminal settle); these tests
+  // assert the invariant explicitly at the heartbeat-composition boundary.
+  test('a provider-limit-paused run stays in activeRunIds (not just runnerStatus)', async () => {
+    const results = [DRIVE_PROVIDER_LIMIT, DRIVE_COMPLETED];
+    const world = makeWorld(() => results.shift()!);
+    world.dispatcher.dispatch(makeLease());
+    await tick();
+
+    expect(world.manager.runnerStatus()).toBe('paused');
+    expect(world.manager.activeRunIds()).toEqual(['run-1']); // still reported while paused
+
+    world.clock.advance(DEFAULT_PROVIDER_LIMIT_PAUSE_MS);
+    await tick();
+    expect(world.manager.activeRunIds()).toEqual([]); // resumed → completed → deregistered
+  });
+
+  test('an awaiting-input-parked run stays in activeRunIds (status stays "online" — only provider-limit pauses report "paused")', async () => {
+    let release: (answer: string | null) => void = () => {};
+    const results = [driveAwaiting(), DRIVE_COMPLETED];
+    const world = makeWorld(() => results.shift()!, {
+      needsInput: { onQuestion: () => new Promise<string | null>((resolve) => (release = resolve)) },
+    });
+    world.dispatcher.dispatch(makeLease());
+    await tick();
+
+    expect(world.manager.activeRunIds()).toEqual(['run-1']); // parked, still active
+    expect(world.manager.runnerStatus()).toBe('online'); // awaiting-input ≠ provider-limit pause
+    expect(world.manager.pausedUntil()).toBeNull();
+
+    release('host-a');
+    await tick();
+    expect(world.manager.activeRunIds()).toEqual([]); // answered → resumed → completed → deregistered
   });
 });
 

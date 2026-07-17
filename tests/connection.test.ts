@@ -297,6 +297,64 @@ describe('heartbeat over the connection', () => {
   });
 });
 
+describe('heartbeat composition (c2 — job manager truth)', () => {
+  test('activeRunIds/runnerStatus/pausedUntil accessors thread onto every beat, and runs_authoritative is always set', async () => {
+    let runIds: string[] = ['run-1'];
+    let status: 'online' | 'paused' = 'paused';
+    let pausedUntil: string | null = '2026-07-17T13:00:00.000Z';
+    const world = makeWorld({
+      clientOverrides: {
+        activeRunIds: () => runIds,
+        runnerStatus: () => status,
+        pausedUntil: () => pausedUntil,
+      },
+    });
+    await goOnline(world, 5);
+    world.clock.advance(5_000);
+    const hb = world.wss.last.sent[1]!;
+    expect(hb.active_run_ids).toEqual(['run-1']);
+    expect(hb.status).toBe('paused');
+    expect(hb.paused_until).toBe('2026-07-17T13:00:00.000Z');
+    expect(hb.runs_authoritative).toBe(true);
+
+    // The invariant: a paused (or awaiting-input) run stays reported in
+    // active_run_ids — asserted here at the composition boundary (the
+    // manager's own map semantics are asserted in jobs/manager.test.ts).
+    world.wss.last.serverSend({ type: 'heartbeat_ack', id: hb.id });
+    runIds = [];
+    status = 'online';
+    pausedUntil = null;
+    world.clock.advance(5_000);
+    const hb2 = world.wss.last.sent[2]!;
+    expect(hb2.active_run_ids).toEqual([]);
+    expect(hb2.status).toBe('online');
+    expect(hb2.paused_until).toBeNull();
+    expect(hb2.runs_authoritative).toBe(true);
+  });
+
+  test('a drain directive still overrides runnerStatus (server directive wins)', async () => {
+    const world = makeWorld({ clientOverrides: { runnerStatus: () => 'paused' } });
+    await goOnline(world, 5);
+    world.clock.advance(5_000);
+    const hb = world.wss.last.sent[1]!;
+    expect(hb.status).toBe('paused'); // no drain yet — the manager's status wins
+    world.wss.last.serverSend({ type: 'heartbeat_ack', id: hb.id, directive: 'drain' });
+    world.clock.advance(5_000);
+    expect(world.wss.last.sent[2]!.status).toBe('draining'); // drain wins over 'paused'
+  });
+
+  test('without accessors wired, heartbeats fall back to the pre-wiring stub ([], "online")', async () => {
+    const world = makeWorld();
+    await goOnline(world, 5);
+    world.clock.advance(5_000);
+    const hb = world.wss.last.sent[1]!;
+    expect(hb.active_run_ids).toEqual([]);
+    expect(hb.status).toBe('online');
+    expect(hb.paused_until).toBeNull();
+    expect(hb.runs_authoritative).toBe(true);
+  });
+});
+
 describe('secrets discipline', () => {
   test('the runner token NEVER appears in any log line across the full lifecycle', async () => {
     // Exercise every logging path: connect, register, transient reject,

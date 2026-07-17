@@ -19,8 +19,11 @@ import { AGENT_VERSION, ConfigStore, defaultConfigDir, describeIdentity, detectO
 import { AgentClient } from './core/connection';
 import { consoleLogger } from './core/log';
 import { defaultTransports } from './core/transport';
+import type { RunnerStatus } from './core/wire';
 // T2-03: job execution (lease → accept → workspace → drive) lives in ./jobs.
-import { attachJobExecution } from './jobs';
+// c2: the event-shipper composition (onWorkspaceReady → EventShipper) also
+// lives there (./jobs/shipper-lifecycle) — see `createShipperLifecycle` below.
+import { attachJobExecution, createShipperLifecycle, type JobManager } from './jobs';
 // T1-15: service install/uninstall/status lives in ./service (its own module).
 import { runService } from './service';
 
@@ -120,6 +123,14 @@ function runStart(): void {
   const store = new ConfigStore();
   const identity = store.load();
   if (identity === null) fail('no agent identity configured — run `pipeline-runner register` first');
+
+  // Assigned below, once `attachJobExecution` returns — these accessors are
+  // captured by closure into `client`'s heartbeat composition (c2: stop
+  // discarding attachJobExecution's return, thread the manager's
+  // activeRunIds()/runnerStatus()/pausedUntil() into the heartbeat loop
+  // instead of the pre-wiring `[]`/'online' stub).
+  let manager: JobManager | null = null;
+
   const client = new AgentClient({
     store,
     transports: defaultTransports(identity.base_url, consoleLogger),
@@ -127,16 +138,31 @@ function runStart(): void {
     events: {
       onFatal: () => process.exit(1),
     },
+    activeRunIds: () => manager?.activeRunIds() ?? [],
+    runnerStatus: (): RunnerStatus => manager?.runnerStatus() ?? 'online',
+    pausedUntil: () => manager?.pausedUntil() ?? null,
   });
+
+  // c2: per-job EventShipper lifecycle (onWorkspaceReady → start, terminal →
+  // stop) — closes E4 (a cloud-dispatched run produced no server-side
+  // events). WSS `upload` transport (default; runner-token authenticated via
+  // this same connection).
+  const shipperLifecycle = createShipperLifecycle({
+    send: (frame) => client.send(frame),
+    dispatcher: client.dispatcher,
+    logger: consoleLogger,
+  });
+
   // T2-03: accept job leases (additive — attaches a `lease` handler only; the
   // register/heartbeat/reconnect paths above are untouched).
-  attachJobExecution(client, {
+  manager = attachJobExecution(client, {
     runnerId: () => store.load()?.runner_id ?? null,
     labels: () => store.load()?.labels ?? [],
     capacity: () => store.load()?.capacity ?? 1,
     draining: () => client.draining,
     workspaceRoot: process.env.PIPELINE_RUNNER_JOBS_DIR ?? join(defaultConfigDir(), 'jobs'),
     logger: consoleLogger,
+    events: shipperLifecycle,
   });
   client.start();
   // Active timers/sockets keep the Bun event loop alive; nothing else to do.
