@@ -15,6 +15,7 @@ import {
 import type { JobExecResult } from './types';
 import { DEFAULT_PROVIDER_LIMIT_PAUSE_MS, type JobResult } from './executor';
 import { attachJobExecution, JobManager, type JobManagerOptions } from './manager';
+import { defaultResolveStartIteration } from './workspace';
 
 const ROOT = join('/w');
 
@@ -58,6 +59,11 @@ function makeWorld(
     fs,
     clock,
     logger,
+    // c4: pin the PLAIN LEXICAL resolver by default — this suite's
+    // `world.exec.of('pipeline')` counts assume the only 'pipeline'-cmd call
+    // is drive. The c4 default-seam wiring itself is covered by
+    // workspace.test.ts + executor.test.ts.
+    resolveStartIteration: defaultResolveStartIteration,
     events: { onJobFinished: (result) => finished.push(result) },
     ...overrides,
   });

@@ -12,11 +12,23 @@
  * ALL git calls go through the injectable `JobExec` seam and all directory
  * work through `JobFs` — tests never touch a real repo or the network.
  *
- * Content-hash verification: the lease may pin `content_hash` (PIPELINE.md +
- * steps/** + scripts/**). The hashing scheme lives in the T1-14 lib which is
- * NOT on this branch, so verification is an injectable seam
- * (`verifyContentHash`); absent a verifier, a pinned hash is logged as
- * unverified and prep continues — FOLLOW-UP: wire the real verifier.
+ * Content-hash verification (06.4, closes B1): the lease may pin
+ * `content_hash` (PIPELINE.md + steps/** + scripts/**). `verifyContentHash`
+ * is an injectable seam; absent an override, the DEFAULT
+ * (`cliContentHashVerifier`) shells the SAME `pipelineBin` drive uses —
+ * `pipeline hash --root <abs> --json` — and compares against the pin. A
+ * mismatch fails prep closed (JobError, F7); a CLI that predates the `hash`
+ * command is compat (warn + proceed, counted via the log).
+ *
+ * Start-iteration resolution (06.5, closes B4): `resolveStartIteration` is
+ * likewise an injectable seam; absent an override, the DEFAULT
+ * (`cliStartIterationResolver`) shells `pipeline plan --root <abs> --json`
+ * (`computePlan` is the single authority for step ordering, graph entry, and
+ * target families) and takes the plan's first enumerated step. A CLI that
+ * predates (or returns unusable output for) `plan --json` falls back to the
+ * flat lexical rule (`defaultResolveStartIteration`) — this is a
+ * correctness concern, not a security boundary, so it degrades gracefully
+ * rather than failing prep.
  *
  * T2-05 ADDITIVE: task-dispatch leases (`pipeline` = the `@task` sentinel)
  * resolve their actual pipeline AFTER checkout through the optional
@@ -34,7 +46,7 @@ import { JobError, type JobExec, type JobExecResult, type JobFs } from './types'
 export type ContentHashVerifier = (pipelineRootAbs: string, expectedHash: string) => boolean | Promise<boolean>;
 
 /** Resolves the run's entry iteration (root-relative, forward slashes). */
-export type StartIterationResolver = (pipelineRootAbs: string, fs: JobFs) => string | null;
+export type StartIterationResolver = (pipelineRootAbs: string, fs: JobFs) => string | null | Promise<string | null>;
 
 export interface PrepareWorkspaceOptions {
   /** The leased job's id — becomes the per-job directory name (sanitized). */
@@ -45,10 +57,17 @@ export interface PrepareWorkspaceOptions {
   exec: JobExec;
   fs: JobFs;
   gitBin?: string;
+  /** The `pipeline` CLI binary — the SAME one drive shells out to; used by
+   *  the DEFAULT hash-verify / start-iteration resolvers below when their
+   *  seam overrides are absent. Defaults to `'pipeline'`. */
+  pipelineBin?: string;
   logger?: Logger;
-  /** Absent ⇒ a pinned hash is logged as unverified (T1-14 follow-up). */
+  /** Absent ⇒ the default `cliContentHashVerifier` (shells `pipelineBin`'s
+   *  `hash --json`, 06.4). */
   verifyContentHash?: ContentHashVerifier;
-  /** Absent ⇒ `defaultResolveStartIteration` (first `steps/*.md`, sorted). */
+  /** Absent ⇒ the default `cliStartIterationResolver` (shells `pipelineBin`'s
+   *  `plan --json`, 06.5; falls back to `defaultResolveStartIteration` on an
+   *  old CLI). */
   resolveStartIteration?: StartIterationResolver;
   /** T2-05 ADDITIVE — task-dispatch resolution seam: invoked AFTER checkout,
    *  and ONLY when `ref.pipeline` is the `@task` sentinel, to resolve the
@@ -108,6 +127,133 @@ function execDetail(result: JobExecResult): string {
   return capped.length > 0 ? `: ${capped}` : '';
 }
 
+/** True when an exec result indicates the binary predates this subcommand
+ *  (`pipeline: unknown command '<name>'`, cli.ts's default-case message) or
+ *  the `pipeline` binary is missing entirely (`JobExec`'s code-127
+ *  contract) — both are compat cases, never a security-relevant failure. */
+function isUnsupportedCommand(result: JobExecResult): boolean {
+  return result.code === 127 || /unknown command/i.test(result.stderr);
+}
+
+// ── verifyContentHash default: shells `pipeline hash --json` (06.4) ─────────
+
+export interface CliHashVerifierOptions {
+  /** The async subprocess seam — the SAME one the checkout/drive use. */
+  exec: JobExec;
+  /** The `pipeline` CLI binary (defaults to `pipeline`, like drive). */
+  pipelineBin?: string;
+  logger?: Logger;
+}
+
+/** Parse `pipeline hash --json` stdout (`{"content_hash":"sha256:<hex>"}`)
+ *  into the reported hash, or null when unparseable/missing. */
+function parseHashJson(stdout: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim());
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const value = (parsed as Record<string, unknown>).content_hash;
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * The default `verifyContentHash` (06.4, closes B1: a pinned hash was
+ * previously accepted unverified): shells the SAME `pipelineBin` drive uses —
+ * `pipeline hash --root <abs> --json` — and compares the reported hash to
+ * the lease's pin. A mismatch THROWS `JobError` directly, in the exact
+ * `03-flows.md` §F7 shape (`content hash mismatch (expected …, got …)`) —
+ * rather than returning `false` — so the reason string carries the ACTUAL
+ * computed hash too; the generic `!ok` message `prepareWorkspace` falls back
+ * to below (for a directly-injected boolean verifier) only ever has the
+ * expected side. A CLI that predates the `hash` command (unknown command /
+ * binary missing) is compat: warn + treat as verified (counted via the warn
+ * log) rather than failing a pinned lease the runner simply cannot check yet.
+ */
+export function cliContentHashVerifier(options: CliHashVerifierOptions): ContentHashVerifier {
+  const bin = options.pipelineBin ?? 'pipeline';
+  const logger = options.logger ?? nullLogger;
+  return async (pipelineRootAbs, expectedHash) => {
+    const result = await options.exec.run(bin, ['hash', '--root', pipelineRootAbs, '--json']);
+    if (isUnsupportedCommand(result)) {
+      logger.warn(
+        `pipeline hash unsupported by this CLI (predates the hash command) — content_hash ${expectedHash} not verified, proceeding (compat)`
+      );
+      return true;
+    }
+    const actual = result.code === 0 ? parseHashJson(result.stdout) : null;
+    if (actual === null) {
+      throw new JobError(`pipeline hash failed (exit ${result.code ?? 'none'})${execDetail(result)}`);
+    }
+    if (actual !== expectedHash) {
+      throw new JobError(`content hash mismatch (expected ${expectedHash}, got ${actual})`);
+    }
+    return true;
+  };
+}
+
+// ── resolveStartIteration default: shells `pipeline plan --json` (06.5) ─────
+
+export interface CliPlanResolverOptions {
+  /** The async subprocess seam — the SAME one the checkout/drive use. */
+  exec: JobExec;
+  /** The `pipeline` CLI binary (defaults to `pipeline`, like drive). */
+  pipelineBin?: string;
+  logger?: Logger;
+}
+
+/** The entry step's `steps/`-relative path from `pipeline plan --json`
+ *  stdout (`plan.steps[0].rel` — the SAME field `pipeline next`'s own init
+ *  and `pipeline-ui`'s launcher use as a run's entry point). Null when the
+ *  output carries no usable entry (unparseable JSON, no `steps` array, or an
+ *  empty plan). */
+function parsePlanEntryRel(stdout: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const steps = (parsed as Record<string, unknown>).steps;
+  if (!Array.isArray(steps) || steps.length === 0) return null;
+  const first: unknown = steps[0];
+  if (typeof first !== 'object' || first === null || Array.isArray(first)) return null;
+  const rel = (first as Record<string, unknown>).rel;
+  return typeof rel === 'string' && rel.length > 0 ? rel : null;
+}
+
+/**
+ * The default `resolveStartIteration` (06.5, closes B4: the lexically-first
+ * `steps/*.md` file was used even when it wasn't the pipeline's real entry):
+ * shells the SAME `pipelineBin` drive uses — `pipeline plan --root <abs>
+ * --json` (`computePlan` is the single authority for step ordering, graph
+ * entry, and target families) — and takes the plan's first enumerated step.
+ * Output the CLI cannot be trusted to have supplied correctly (predates the
+ * command, unparseable JSON, no steps) falls back to the flat lexical rule
+ * (`defaultResolveStartIteration`) — start-iteration resolution is a
+ * correctness concern, not a security boundary, so graceful degradation to
+ * the historical behavior beats failing prep outright.
+ */
+export function cliStartIterationResolver(options: CliPlanResolverOptions): StartIterationResolver {
+  const bin = options.pipelineBin ?? 'pipeline';
+  const logger = options.logger ?? nullLogger;
+  return async (pipelineRootAbs, fs) => {
+    const result = await options.exec.run(bin, ['plan', '--root', pipelineRootAbs, '--json']);
+    const rel = isUnsupportedCommand(result) ? null : parsePlanEntryRel(result.stdout);
+    if (rel === null) {
+      logger.warn(
+        `pipeline plan unavailable or unusable for start-iteration resolution (exit ${result.code ?? 'none'})` +
+          `${execDetail(result)} — falling back to the lexical entry rule`
+      );
+      return defaultResolveStartIteration(pipelineRootAbs, fs);
+    }
+    return `steps/${rel}`;
+  };
+}
+
 /**
  * Prepare the job's isolated workspace. Throws `JobError` with an actionable
  * message on any failure (git failure detail included, never the job JWT).
@@ -115,6 +261,7 @@ function execDetail(result: JobExecResult): string {
 export async function prepareWorkspace(options: PrepareWorkspaceOptions): Promise<PreparedWorkspace> {
   const { ref, exec, fs } = options;
   const git = options.gitBin ?? 'git';
+  const pipelineBin = options.pipelineBin ?? 'pipeline';
   const logger = options.logger ?? nullLogger;
   const dir = join(options.root, sanitizeJobId(options.jobId));
 
@@ -163,21 +310,20 @@ export async function prepareWorkspace(options: PrepareWorkspaceOptions): Promis
   }
 
   if (ref.content_hash !== undefined && ref.content_hash !== null) {
-    if (options.verifyContentHash !== undefined) {
-      const ok = await options.verifyContentHash(pipelineRoot, ref.content_hash);
-      if (!ok) {
-        throw new JobError(
-          `pipeline content hash mismatch: checkout of ${rel} @ ${ref.ref} does not match pinned ${ref.content_hash}`
-        );
-      }
-    } else {
-      // T1-14 hash lib is not vendored here yet — do not fail a pinned lease.
-      logger.warn(`lease pins content_hash ${ref.content_hash} but no verifier is wired — proceeding unverified`);
+    const verify = options.verifyContentHash ?? cliContentHashVerifier({ exec, pipelineBin, logger });
+    const ok = await verify(pipelineRoot, ref.content_hash);
+    if (!ok) {
+      // Only reachable via a directly-injected boolean verifier — the
+      // default `cliContentHashVerifier` throws its own detailed JobError
+      // (expected + ACTUAL hash) on mismatch instead of returning false.
+      throw new JobError(
+        `pipeline content hash mismatch: checkout of ${rel} @ ${ref.ref} does not match pinned ${ref.content_hash}`
+      );
     }
   }
 
-  const resolveStart = options.resolveStartIteration ?? defaultResolveStartIteration;
-  const startIteration = resolveStart(pipelineRoot, fs);
+  const resolveStart = options.resolveStartIteration ?? cliStartIterationResolver({ exec, pipelineBin, logger });
+  const startIteration = await resolveStart(pipelineRoot, fs);
   if (startIteration === null) {
     throw new JobError(`pipeline has no entry iteration (no steps/*.md under ${rel})`);
   }

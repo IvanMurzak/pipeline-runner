@@ -21,6 +21,7 @@ import {
   type JobState,
   type ParkedQuestion,
 } from './executor';
+import { defaultResolveStartIteration } from './workspace';
 
 const ROOT = join('/w');
 const DIR = join(ROOT, 'job-1');
@@ -68,6 +69,12 @@ function makeWorld(queue: JobExecResult[], overrides: Partial<JobExecutorOptions
     clock,
     logger,
     makeId: () => 'q-1',
+    // c4: pin the PLAIN LEXICAL resolver by default so this suite's `pipeline`
+    // exec assertions (drive-only, via `driveExec`'s shift-queue) are
+    // unaffected by the new plan-shelling default — the c4 wiring itself is
+    // covered by workspace.test.ts (prepareWorkspace's true default) and the
+    // dedicated "default seams reach prepareWorkspace" test below.
+    resolveStartIteration: defaultResolveStartIteration,
     ...overrides,
     exec,
     events: { onStateChange: (s) => states.push(s), ...overrides.events },
@@ -136,6 +143,65 @@ describe('JobExecutor — happy path', () => {
     const world = makeWorld([DRIVE_COMPLETED]);
     await world.executor.start();
     expect(world.logger.joined()).not.toContain('jwt-secret-1');
+  });
+});
+
+// c4 (06.4/06.5): when the verifyContentHash / resolveStartIteration seams
+// are NOT overridden, prep must shell `pipeline hash` / `pipeline plan`
+// through the SAME `pipelineBin` drive uses — previously the executor never
+// threaded `this.pipelineBin` into `prepareWorkspace` at all, so this proves
+// that wire (not just workspace.ts's own default construction, covered in
+// workspace.test.ts) actually reaches the executor layer.
+describe('JobExecutor — c4 default hash/plan seams reach prepareWorkspace', () => {
+  test('the SAME custom pipelineBin verifies the pinned hash and resolves start-iteration via plan', async () => {
+    const exec = new FakeJobExec((cmd, args) => {
+      if (cmd === 'git') return GIT_OK;
+      if (args[0] === 'hash') return { code: 0, stdout: JSON.stringify({ content_hash: 'sha256:abc' }), stderr: '' };
+      if (args[0] === 'plan') return { code: 0, stdout: JSON.stringify({ steps: [{ rel: '01-plan.md' }] }), stderr: '' };
+      return DRIVE_COMPLETED;
+    });
+    const lease = makeLease({ pipeline_ref: { ...makeLease().pipeline_ref, content_hash: 'sha256:abc' } });
+    const world = makeWorld([], {
+      exec,
+      lease,
+      pipelineBin: 'custom-pipeline',
+      // Defeat makeWorld's baseline lexical override — exercise the TRUE
+      // defaults (cliContentHashVerifier / cliStartIterationResolver).
+      resolveStartIteration: undefined,
+      verifyContentHash: undefined,
+    });
+
+    const result = await world.executor.start();
+    expect(result).toEqual({ job_id: 'job-1', run_id: 'run-1', ok: true, outcome: 'completed' });
+
+    const hashCall = world.exec.calls.find((c) => c.args[0] === 'hash');
+    const planCall = world.exec.calls.find((c) => c.args[0] === 'plan');
+    const driveCall = world.exec.calls.find((c) => c.args[0] === 'drive');
+    expect(hashCall).toEqual({ cmd: 'custom-pipeline', args: ['hash', '--root', PIPELINE_ROOT, '--json'], opts: {} });
+    expect(planCall).toEqual({ cmd: 'custom-pipeline', args: ['plan', '--root', PIPELINE_ROOT, '--json'], opts: {} });
+    expect(driveCall?.cmd).toBe('custom-pipeline');
+  });
+
+  test('a hash mismatch on the default verifier halts prep before any drive spawn', async () => {
+    const exec = new FakeJobExec((cmd, args) => {
+      if (cmd === 'git') return GIT_OK;
+      if (args[0] === 'hash') return { code: 0, stdout: JSON.stringify({ content_hash: 'sha256:actual' }), stderr: '' };
+      return DRIVE_COMPLETED;
+    });
+    const lease = makeLease({ pipeline_ref: { ...makeLease().pipeline_ref, content_hash: 'sha256:expected' } });
+    const world = makeWorld([], {
+      exec,
+      lease,
+      resolveStartIteration: undefined,
+      verifyContentHash: undefined,
+    });
+
+    const result = await world.executor.start();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('content hash mismatch (expected sha256:expected, got sha256:actual)');
+    }
+    expect(world.exec.calls.some((c) => c.args[0] === 'drive')).toBe(false);
   });
 });
 

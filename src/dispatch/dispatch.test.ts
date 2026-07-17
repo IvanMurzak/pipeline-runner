@@ -24,6 +24,7 @@ import {
 import type { JobExecResult } from '../jobs/types';
 import { JobExecutor, type JobExecutorOptions, type JobWorkspaceContext } from '../jobs/executor';
 import { JobManager } from '../jobs/manager';
+import { defaultResolveStartIteration } from '../jobs/workspace';
 import type { TaskDispatchInput, TaskPipelineResolution } from './matcher';
 
 const ROOT = join('/w');
@@ -63,6 +64,9 @@ function makeExecutor(exec: FakeJobExec, overrides: Partial<JobExecutorOptions> 
     workspaceRoot: ROOT,
     fs: readyFs(),
     logger,
+    // c4: pin the plain lexical resolver — this suite's exec fakes script
+    // `match`/`drive` only and are unrelated to c4's plan-based default.
+    resolveStartIteration: defaultResolveStartIteration,
     ...overrides,
     exec,
   });
@@ -228,6 +232,7 @@ describe('task dispatch — through the JobManager', () => {
       labels: () => ['os:linux'],
       exec,
       fs: readyFs(),
+      resolveStartIteration: defaultResolveStartIteration,
       events: { onJobFinished: (result) => finished.push(result) },
     });
     manager.attach(dispatcher);
@@ -254,6 +259,7 @@ describe('task dispatch — through the JobManager', () => {
       labels: () => ['os:linux'],
       exec,
       fs: readyFs(),
+      resolveStartIteration: defaultResolveStartIteration,
       resolveTaskPipeline: async () => {
         resolved += 1;
         return { pipeline: '.claude/pipeline/release', manifest: RELEASE_MANIFEST, score: 1 };

@@ -16,6 +16,7 @@ import { CaptureLogger, tick } from '../../tests/_helpers';
 import { DRIVE_COMPLETED, driveAwaiting, FakeJobExec, FakeJobFs, GIT_OK, makeLease } from '../jobs/_helpers';
 import { JobExecutor } from '../jobs/executor';
 import type { JobExecResult } from '../jobs/types';
+import { defaultResolveStartIteration } from '../jobs/workspace';
 import { PullRelayAdapter } from './adapter';
 import { NeedsInputRelay, type RelayClientPort } from './bridge';
 
@@ -102,6 +103,9 @@ function makeWiredWorld(queue: JobExecResult[]) {
     exec,
     fs: readyFs(),
     logger,
+    // c4: pin the plain lexical resolver — this suite's `driveExec` queue
+    // scripts drive results only and is unrelated to c4's plan-based default.
+    resolveStartIteration: defaultResolveStartIteration,
     needsInput: adapter,
   });
   return { client, bridge, adapter, executor, exec, logger };
