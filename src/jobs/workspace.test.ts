@@ -22,8 +22,22 @@ function readyFs(dir: string, pipelineRel = '.claude/pipeline/release'): FakeJob
   return fs;
 }
 
+/** Baseline options. `resolveStartIteration` defaults to the plain LEXICAL
+ *  resolver — tests unrelated to c4's plan-based default (the git-checkout
+ *  mechanics, hash verification, etc.) should not incidentally also shell
+ *  `pipeline plan`. Pass `{ resolveStartIteration: undefined }` in `extra` to
+ *  exercise the REAL default (`cliStartIterationResolver`) instead — an
+ *  explicit `undefined` key in a later spread always wins over this baseline. */
 function options(fs: FakeJobFs, exec: FakeJobExec, extra: Partial<PrepareWorkspaceOptions> = {}): PrepareWorkspaceOptions {
-  return { jobId: 'job-1', ref: makeLease().pipeline_ref, root: ROOT, exec, fs, ...extra };
+  return {
+    jobId: 'job-1',
+    ref: makeLease().pipeline_ref,
+    root: ROOT,
+    exec,
+    fs,
+    resolveStartIteration: defaultResolveStartIteration,
+    ...extra,
+  };
 }
 
 describe('sanitizeJobId', () => {
@@ -123,14 +137,6 @@ describe('prepareWorkspace', () => {
     await expect(prepareWorkspace(options(fs, exec))).rejects.toThrow('no entry iteration');
   });
 
-  test('a pinned content_hash without a verifier warns and proceeds', async () => {
-    const exec = new FakeJobExec(() => GIT_OK);
-    const logger = new CaptureLogger();
-    const ref = { ...makeLease().pipeline_ref, content_hash: 'sha-abc' };
-    await prepareWorkspace(options(readyFs(dir), exec, { ref, logger }));
-    expect(logger.joined()).toContain('content_hash sha-abc but no verifier is wired');
-  });
-
   test('a verifier mismatch fails the prep', async () => {
     const exec = new FakeJobExec(() => GIT_OK);
     const ref = { ...makeLease().pipeline_ref, content_hash: 'sha-abc' };
@@ -170,5 +176,108 @@ describe('prepareWorkspace', () => {
     );
     expect(called).toBe(false);
     expect(logger.joined()).not.toContain('content_hash');
+  });
+});
+
+// c4 — 06.4: the DEFAULT verifyContentHash shells `pipelineBin`'s
+// `hash --root <abs> --json` (the SAME binary drive uses) and compares
+// against the pin. Exercises the TRUE default (no `verifyContentHash`
+// override), unlike the direct-injection tests above.
+describe('prepareWorkspace — default content-hash verifier (cliContentHashVerifier)', () => {
+  const dir = join(ROOT, 'job-1');
+  const pipelineRoot = join(dir, '.claude', 'pipeline', 'release');
+
+  test('a match passes, shelling the same pipelineBin drive uses', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'hash' ? { code: 0, stdout: JSON.stringify({ content_hash: 'sha256:abc' }), stderr: '' } : GIT_OK
+    );
+    const ref = { ...makeLease().pipeline_ref, content_hash: 'sha256:abc' };
+    const ws = await prepareWorkspace(options(readyFs(dir), exec, { ref, pipelineBin: 'my-pipeline' }));
+    expect(ws.pipelineRoot).toBe(pipelineRoot);
+    const hashCall = exec.calls.find((c) => c.args[0] === 'hash');
+    expect(hashCall?.cmd).toBe('my-pipeline');
+    expect(hashCall?.args).toEqual(['hash', '--root', pipelineRoot, '--json']);
+  });
+
+  test('a mismatch fails prep closed with the exact F7 reason string', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'hash' ? { code: 0, stdout: JSON.stringify({ content_hash: 'sha256:actual' }), stderr: '' } : GIT_OK
+    );
+    const ref = { ...makeLease().pipeline_ref, content_hash: 'sha256:expected' };
+    await expect(prepareWorkspace(options(readyFs(dir), exec, { ref }))).rejects.toThrow(
+      'content hash mismatch (expected sha256:expected, got sha256:actual)'
+    );
+  });
+
+  test('a CLI predating `hash` (unknown command) warns and proceeds — compat', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'hash' ? { code: 2, stdout: '', stderr: "pipeline: unknown command 'hash'\n\nusage: ..." } : GIT_OK
+    );
+    const logger = new CaptureLogger();
+    const ref = { ...makeLease().pipeline_ref, content_hash: 'sha256:expected' };
+    const ws = await prepareWorkspace(options(readyFs(dir), exec, { ref, logger }));
+    expect(ws.pipelineRoot).toBe(pipelineRoot); // prep proceeded, did not throw
+    expect(logger.joined()).toContain('content_hash sha256:expected not verified, proceeding');
+  });
+
+  test('a missing `pipeline` binary (spawn ENOENT, code 127) is compat too', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'hash' ? { code: 127, stdout: '', stderr: '', error: 'spawn pipeline ENOENT' } : GIT_OK
+    );
+    const logger = new CaptureLogger();
+    const ref = { ...makeLease().pipeline_ref, content_hash: 'sha256:expected' };
+    await prepareWorkspace(options(readyFs(dir), exec, { ref, logger }));
+    expect(logger.joined()).toContain('not verified, proceeding');
+  });
+});
+
+// c4 — 06.5: the DEFAULT resolveStartIteration shells `pipelineBin`'s
+// `plan --root <abs> --json` and takes the plan's first enumerated step
+// (computePlan is the single ordering/graph-entry/target-family authority),
+// instead of the flat lexical rule.
+describe('prepareWorkspace — default start-iteration resolver (cliStartIterationResolver)', () => {
+  const dir = join(ROOT, 'job-1');
+  const pipelineRoot = join(dir, '.claude', 'pipeline', 'release');
+
+  /** A pipeline whose top-level `steps/*.md` is a DECOY: the real entry (as
+   *  a graph/target-family pipeline might organize its routing steps) lives
+   *  nested one level down — invisible to the flat, non-recursive lexical
+   *  rule. If resolution fell back to `defaultResolveStartIteration` here it
+   *  would (wrongly) pick `01-helper.md`. */
+  function graphFs(): FakeJobFs {
+    const fs = new FakeJobFs();
+    fs.existing.add(pipelineRoot);
+    fs.listings.set(join(pipelineRoot, 'steps'), ['01-helper.md']);
+    return fs;
+  }
+
+  test("resolves the plan's entry step over the lexical rule (graph/target-family fixture)", async () => {
+    const planJson = JSON.stringify({
+      steps: [{ rel: '00-entry/01-start.md' }, { rel: '01-helper.md' }],
+    });
+    const exec = new FakeJobExec((_cmd, args) => (args[0] === 'plan' ? { code: 0, stdout: planJson, stderr: '' } : GIT_OK));
+    const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined, pipelineBin: 'my-pipeline' }));
+
+    expect(ws.startIteration).toBe('steps/00-entry/01-start.md'); // NOT 'steps/01-helper.md'
+    const planCall = exec.calls.find((c) => c.args[0] === 'plan');
+    expect(planCall?.cmd).toBe('my-pipeline');
+    expect(planCall?.args).toEqual(['plan', '--root', pipelineRoot, '--json']);
+  });
+
+  test('falls back to the lexical rule when the CLI predates `plan` (unknown command)', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'plan' ? { code: 2, stdout: '', stderr: "pipeline: unknown command 'plan'\n\nusage: ..." } : GIT_OK
+    );
+    const logger = new CaptureLogger();
+    const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined, logger }));
+
+    expect(ws.startIteration).toBe('steps/01-helper.md');
+    expect(logger.joined()).toContain('falling back to the lexical entry rule');
+  });
+
+  test('falls back to the lexical rule on unparseable plan output', async () => {
+    const exec = new FakeJobExec((_cmd, args) => (args[0] === 'plan' ? { code: 0, stdout: 'not json', stderr: '' } : GIT_OK));
+    const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined }));
+    expect(ws.startIteration).toBe('steps/01-helper.md');
   });
 });

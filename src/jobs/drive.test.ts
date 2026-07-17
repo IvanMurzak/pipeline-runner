@@ -371,4 +371,52 @@ describe('defaultProviderLimitDetector', () => {
   test('null on an unrelated failure', () => {
     expect(defaultProviderLimitDetector({ code: 1, stdout: '', stderr: 'tests failed' })).toBeNull();
   });
+
+  // 06.7 — structured-first: a parseable drive final JSON is authoritative.
+  describe('structured provider_limit (06.7)', () => {
+    test('a structured hit wins outright, retry_after_ms passed through', () => {
+      const result = {
+        code: 1,
+        stdout: JSON.stringify({ status: 'halted', provider_limit: { reason: 'usage_limit_reached', retry_after_ms: 300_000 } }),
+        stderr: '',
+      };
+      expect(defaultProviderLimitDetector(result)).toEqual({ reason: 'usage_limit_reached', retry_after_ms: 300_000 });
+    });
+
+    test('a structured hit without retry_after_ms', () => {
+      const result = {
+        code: 1,
+        stdout: JSON.stringify({ status: 'halted', provider_limit: { reason: 'rate_limited' } }),
+        stderr: '',
+      };
+      expect(defaultProviderLimitDetector(result)).toEqual({ reason: 'rate_limited' });
+    });
+
+    // The E13 false-positive regression: a CLEAN, parseable halt envelope
+    // whose text merely MENTIONS a limit in prose, with no structured
+    // `provider_limit` field, must NOT pause — the parsed envelope is
+    // authoritative and the regex scan never runs against it.
+    test('a clean halt JSON that only mentions a limit in prose, no structured field → NO pause (E13)', () => {
+      const result = {
+        code: 1,
+        stdout: JSON.stringify({
+          status: 'halted',
+          reason: 'reviewer flagged: logs discuss a rate limit but the actual failure was unrelated test breakage',
+        }),
+        stderr: '',
+      };
+      expect(defaultProviderLimitDetector(result)).toBeNull();
+    });
+
+    test('a malformed provider_limit (wrong shape) is treated as absent, not regex-scanned', () => {
+      const result = { code: 1, stdout: JSON.stringify({ status: 'halted', provider_limit: 'rate limit' }), stderr: '' };
+      expect(defaultProviderLimitDetector(result)).toBeNull();
+    });
+
+    test('no parseable envelope at all still falls back to the regex scan (pre-06.7 CLI / crashed drive)', () => {
+      // Same fixture as the top-level "detects a usage-limit message" test —
+      // asserted again here to document that this IS the fallback path.
+      expect(defaultProviderLimitDetector(DRIVE_PROVIDER_LIMIT)).toEqual({ reason: 'usage limit' });
+    });
+  });
 });

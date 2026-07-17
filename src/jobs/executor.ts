@@ -145,7 +145,9 @@ export interface JobExecutorOptions {
   exec: JobExec;
   fs: JobFs;
   gitBin?: string;
-  /** The `pipeline` CLI binary. */
+  /** The `pipeline` CLI binary — used for `drive`, task-dispatch matching,
+   *  and (by default, c4) content-hash verification + start-iteration
+   *  resolution. ONE binary for the whole job. */
   pipelineBin?: string;
   /** EXTRA env for drive invocations (secret injection is a follow-up). */
   env?: Record<string, string | undefined>;
@@ -257,6 +259,13 @@ export class JobExecutor {
         exec: this.options.exec,
         fs: this.options.fs,
         gitBin: this.options.gitBin,
+        // c4: the SAME binary drive shells out to — the DEFAULT hash-verify /
+        // start-iteration resolvers (workspace.ts) use it to shell `pipeline
+        // hash`/`pipeline plan` when `verifyContentHash`/`resolveStartIteration`
+        // below are absent (previously unwired: prep always fell through to
+        // the warn-unverified / lexical-only defaults regardless of this
+        // field).
+        pipelineBin: this.pipelineBin,
         logger: this.logger,
         verifyContentHash: this.options.verifyContentHash,
         resolveStartIteration: this.options.resolveStartIteration,

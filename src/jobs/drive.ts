@@ -20,8 +20,15 @@
  * Provider-limit detection is a seam (`ProviderLimitDetector`): the executor
  * checks every drive exec result against it BEFORE exit-code classification,
  * and a positive match pauses the job (auto-resume) instead of failing it.
- * The default detector is a conservative pattern scan over the combined
- * output; deployments with structured limit reporting inject their own.
+ * The default detector is STRUCTURED-FIRST (06.7): a drive final JSON that
+ * parses is authoritative — its `provider_limit` field (present ⇒ pause,
+ * absent ⇒ not a limit, even when other text in the same envelope happens to
+ * MENTION "rate limit") decides the outcome outright, and the conservative
+ * regex scan over combined stdout+stderr never runs against a well-formed
+ * envelope. The regex is now a FALLBACK for the one case structure can't
+ * help with — no parseable JSON at all (a crashed drive process, stderr-only
+ * signal, or a pre-06.7 CLI that never emits the field). This closes E13's
+ * false-pauses on logs that merely discuss a limit without one occurring.
  */
 
 import type { JobExecResult } from './types';
@@ -213,7 +220,7 @@ export function classifyDriveOutcome(result: JobExecResult): DriveOutcome {
   }
 }
 
-// ── Provider-limit detection (seam + conservative default) ──────────────────
+// ── Provider-limit detection (seam + structured-first default) ──────────────
 
 /** A detected provider/usage limit. `retry_after_ms` when the provider stated
  *  a window; absent ⇒ the executor's pause policy decides. */
@@ -233,12 +240,38 @@ const PROVIDER_LIMIT_PATTERNS: RegExp[] = [
   /too many requests/i,
 ];
 
+/** Narrow a parsed drive final JSON's `provider_limit` field to a well-formed
+ *  `ProviderLimit`, or null when the field is absent or malformed (an object
+ *  is present but `reason` is missing/blank, or the field is some other
+ *  shape entirely) — either way, a PARSED envelope with no usable
+ *  `provider_limit` means "not a limit", full stop (06.7). */
+function structuredProviderLimit(json: Record<string, unknown>): ProviderLimit | null {
+  const raw = json.provider_limit;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.reason !== 'string' || record.reason.length === 0) return null;
+  return typeof record.retry_after_ms === 'number' && Number.isFinite(record.retry_after_ms)
+    ? { reason: record.reason, retry_after_ms: record.retry_after_ms }
+    : { reason: record.reason };
+}
+
 /**
- * Conservative default: a NON-completed drive whose output mentions a
- * usage/rate-limit condition. A completed run (exit 0) is never limit-paused.
+ * Structured-first default (06.7, closes E13): a drive final JSON that
+ * PARSES is authoritative about provider limits — its `provider_limit`
+ * field decides the outcome outright, present or absent, and the
+ * conservative regex scan below never runs against a well-formed envelope
+ * (the false-positive source: a halt reason or log line that merely
+ * MENTIONS "rate limit" without one actually occurring). The regex is a
+ * FALLBACK for the one case structure can't help with: no parseable JSON at
+ * all (drive crashed before it could format one, or predates 06.7 and never
+ * emits the field either way) — exactly the scenario the original
+ * conservative scan was built for. A completed run (exit 0) is never
+ * limit-paused, structured or not.
  */
 export const defaultProviderLimitDetector: ProviderLimitDetector = (result) => {
   if (result.code === DRIVE_EXIT.completed) return null;
+  const json = parseDriveFinalJson(result.stdout);
+  if (json !== null) return structuredProviderLimit(json);
   const text = `${result.stdout}\n${result.stderr}`;
   for (const pattern of PROVIDER_LIMIT_PATTERNS) {
     const match = text.match(pattern);
