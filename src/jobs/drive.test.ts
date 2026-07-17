@@ -132,6 +132,111 @@ describe('buildDriveArgs', () => {
     const noFlags = buildDriveArgs(TARGET, { kind: 'resume' });
     expect(buildDriveArgs({ ...TARGET, defaultModel: '', defaultEffort: '   ' }, { kind: 'resume' })).toEqual(noFlags);
   });
+
+  // env-variables design (task d1, D11 corollary): lease `variables` map to
+  // `--var NAME=value` — but ONLY on the START invocation, never on
+  // resume/answer (D11 makes --var on an already-frozen resume a loud exit-2
+  // usage error; the runner must never trip it).
+  describe('lease variables (env-variables d1)', () => {
+    test('a START invocation emits one --var NAME=value per entry, sorted by name, each a single argv element', () => {
+      const args = buildDriveArgs(
+        { ...TARGET, variables: { PP_SERVICE: 'payments', PP_CHANNEL: '#releases' } },
+        { kind: 'start', startIteration: 'steps/01-plan.md' }
+      );
+      expect(args).toEqual([
+        'drive',
+        '--root',
+        '/ws/.claude/pipeline/release',
+        '--run-id',
+        'run-1',
+        '--start',
+        'steps/01-plan.md',
+        '--var',
+        'PP_CHANNEL=#releases',
+        '--var',
+        'PP_SERVICE=payments',
+        '--json',
+      ]);
+    });
+
+    test('a value containing spaces/metacharacters stays ONE argv element (no shell, no re-splitting)', () => {
+      const args = buildDriveArgs(
+        { ...TARGET, variables: { PP_SERVICE: 'hello world; rm -rf / && echo $(whoami)' } },
+        { kind: 'start', startIteration: 'steps/01-plan.md' }
+      );
+      const varIndex = args.indexOf('--var');
+      expect(varIndex).toBeGreaterThanOrEqual(0);
+      expect(args[varIndex + 1]).toBe('PP_SERVICE=hello world; rm -rf / && echo $(whoami)');
+      // Exactly two elements for this one entry — flag + single combined value.
+      expect(args.filter((a) => a === '--var')).toHaveLength(1);
+    });
+
+    test('a PLAIN RESUME never carries --var even though the target still holds variables', () => {
+      const args = buildDriveArgs({ ...TARGET, variables: { PP_SERVICE: 'payments' } }, { kind: 'resume' });
+      expect(args).toEqual(['drive', '--root', '/ws/.claude/pipeline/release', '--run-id', 'run-1', '--resume', '--json']);
+      expect(args).not.toContain('--var');
+    });
+
+    test('an ANSWER invocation never carries --var either', () => {
+      const args = buildDriveArgs(
+        { ...TARGET, variables: { PP_SERVICE: 'payments' } },
+        { kind: 'answer', startIteration: 'steps/02-deploy.md', answer: 'host-a' }
+      );
+      expect(args).not.toContain('--var');
+      expect(args).toEqual([
+        'drive',
+        '--root',
+        '/ws/.claude/pipeline/release',
+        '--run-id',
+        'run-1',
+        '--resume',
+        '--start',
+        'steps/02-deploy.md',
+        '--answer',
+        'host-a',
+        '--json',
+      ]);
+    });
+
+    test('an ABSENT variables map on a START invocation is byte-identical to today (regression)', () => {
+      expect(buildDriveArgs(TARGET, { kind: 'start', startIteration: 'steps/01-plan.md' })).toEqual([
+        'drive',
+        '--root',
+        '/ws/.claude/pipeline/release',
+        '--run-id',
+        'run-1',
+        '--start',
+        'steps/01-plan.md',
+        '--json',
+      ]);
+    });
+
+    test('an EMPTY variables map emits no --var flags', () => {
+      const args = buildDriveArgs({ ...TARGET, variables: {} }, { kind: 'start', startIteration: 'steps/01-plan.md' });
+      expect(args).not.toContain('--var');
+    });
+
+    test('variables ride alongside a matrix-cell execution override (both features compose)', () => {
+      const args = buildDriveArgs(
+        { ...TARGET, defaultModel: 'opus', variables: { PP_SERVICE: 'payments' } },
+        { kind: 'start', startIteration: 'steps/01-plan.md' }
+      );
+      expect(args).toEqual([
+        'drive',
+        '--root',
+        '/ws/.claude/pipeline/release',
+        '--run-id',
+        'run-1',
+        '--default-model',
+        'opus',
+        '--start',
+        'steps/01-plan.md',
+        '--var',
+        'PP_SERVICE=payments',
+        '--json',
+      ]);
+    });
+  });
 });
 
 describe('parseDriveFinalJson', () => {

@@ -77,15 +77,31 @@ export function buildAcceptFrame(lease: LeaseMessage, runnerId: string): AcceptM
   return frame;
 }
 
+/**
+ * `run_status` PLUS the runner's own `variables_applied` echo (env-variables
+ * design task d1, [06 §5](../../.claude/design/env-variables/06-cloud-integration.md)):
+ * NAMES ONLY (never values) of the lease `variables` this run applied via
+ * `--var` on the START invocation. Not (yet) a field the package's
+ * `RunStatusMessageSchema` declares — it rides the schema's `.passthrough()`
+ * on the wire, so this is a LOCAL type extension (same pattern as
+ * `../shipper/wire-ingest.ts`'s `UploadAckMessage.error`). This is the ONLY
+ * way cloud can detect a pre-d1 runner silently DROPPING the `variables`
+ * field (RFC 6709 silent-discard): such a runner never sets this field at
+ * all, vs. a d1+ runner that sets it (even to `[]`) whenever the lease
+ * carried a `variables` map.
+ */
+export type RunStatusFrame = RunStatusMessage & { variables_applied?: string[] };
+
 /** Build a `run_status` frame. Fire-and-forget — no correlation id. */
 export function buildRunStatusFrame(
   runId: string,
   jobId: string,
   phase: RunStatusPhase,
-  detail?: { outcome?: string | null; halt_reason?: string | null }
-): RunStatusMessage {
-  const frame: RunStatusMessage = { type: 'run_status', run_id: runId, job_id: jobId, phase };
+  detail?: { outcome?: string | null; halt_reason?: string | null; variables_applied?: string[] }
+): RunStatusFrame {
+  const frame: RunStatusFrame = { type: 'run_status', run_id: runId, job_id: jobId, phase };
   if (detail?.outcome !== undefined) frame.outcome = detail.outcome;
   if (detail?.halt_reason !== undefined) frame.halt_reason = detail.halt_reason;
+  if (detail?.variables_applied !== undefined) frame.variables_applied = detail.variables_applied;
   return frame;
 }

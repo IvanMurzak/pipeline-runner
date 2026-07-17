@@ -52,6 +52,14 @@ export interface DriveTarget {
    *  effort`). Emitted as `--default-effort` → computePlan's `defaultEffort`.
    *  Absent/blank ⇒ no flag. */
   defaultEffort?: string;
+  /** env-variables design (task b1/d1) — the lease's frozen `PP_*` map
+   *  (`lease.variables`). Mapped to one `--var NAME=value` flag per entry —
+   *  but, unlike `defaultModel`/`defaultEffort` above, ONLY on the START
+   *  invocation (see `buildDriveArgs`): variables are frozen at run init
+   *  (D11) and the CLI rejects a repeated `--var` on an already-frozen resume
+   *  with a loud exit-2 usage error. Absent/empty ⇒ no flags, ever — a lease
+   *  without `variables` drives byte-identically to today. */
+  variables?: Record<string, string>;
 }
 
 /** Build the exact `pipeline` argv for one drive invocation. */
@@ -68,6 +76,25 @@ export function buildDriveArgs(target: DriveTarget, mode: DriveMode): string[] {
   switch (mode.kind) {
     case 'start':
       args.push('--start', mode.startIteration);
+      // D11 corollary: lease variables are frozen at init — send --var ONLY
+      // on this START invocation, never on resume/answer (those cases below
+      // never read target.variables at all — structurally START-only, not
+      // just by convention). Each entry is ONE argv element ("NAME=value"):
+      // no shell, no joining, no re-splitting — a value containing spaces or
+      // metacharacters stays exactly one argument (T8/T3 discipline). A value
+      // containing its own `=` is safe too: the CLI's --var parser splits on
+      // the FIRST `=` only (pipeline-cli `commands/drive.ts`, design 04 §1).
+      // Sorted by name for deterministic argv (mirrors the existing
+      // Object.entries(...).sort(([a],[b]) => a.localeCompare(b)) convention
+      // in ../service/systemd.ts / launchd.ts) — a lease's variables arrive as
+      // a plain JS object, and argv order should not depend on wire/JSON key
+      // order. NOTE: an empty-string value is emitted verbatim as `--var
+      // NAME=` (unlike the blank-⇒-no-flag defaultModel/defaultEffort above):
+      // an empty resolved variable is a legitimate distinct value (D1), never
+      // "absent", so it must ride through unfiltered.
+      for (const [name, value] of Object.entries(target.variables ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+        args.push('--var', `${name}=${value}`);
+      }
       break;
     case 'resume':
       args.push('--resume');
