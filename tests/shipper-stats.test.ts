@@ -35,6 +35,36 @@ describe('DiskStatsSource', () => {
   test('a missing stats dir finds nothing', () => {
     const source = new DiskStatsSource(new MemShipperFs(), STATS_DIR);
     expect(source.findRunRecord('run-A')).toBeNull();
+    expect(source.scanRecords(0)).toEqual([]);
+  });
+
+  test('scanRecords: newest record per run, ended_at-windowed, per-file mtime gate', () => {
+    const fs = new MemShipperFs();
+    fs.appendText(
+      `${STATS_DIR}/workflows/release/runs.jsonl`,
+      JSON.stringify({ schema: 1, run_id: 'run-A', outcome: 'failed', ended_at: '2026-07-11T13:00:00.000Z' }) +
+        '\n' +
+        JSON.stringify({ schema: 1, run_id: 'run-A', outcome: 'completed', ended_at: '2026-07-11T13:05:00.000Z' }) + // newer wins
+        '\n' +
+        JSON.stringify({ schema: 1, run_id: 'run-old', outcome: 'completed', ended_at: '2026-06-01T00:00:00.000Z' }) + // outside window
+        '\n' +
+        JSON.stringify({ schema: 1, run_id: 'run-no-end', outcome: 'completed' }) + // unwindowable — skipped
+        '\n'
+    );
+    // Per-run log dirs are never scanned for records.
+    fs.appendText(`${STATS_DIR}/workflows/release/runs/run-A.log`, 'human log text');
+
+    const source = new DiskStatsSource(fs, STATS_DIR);
+    const windowStart = Date.parse('2026-07-01T00:00:00.000Z');
+    expect(source.scanRecords(windowStart).map((r) => [r.run_id, r.outcome])).toEqual([['run-A', 'completed']]);
+
+    // Unchanged file ⇒ mtime gate skips it; a change re-reads it.
+    expect(source.scanRecords(windowStart)).toEqual([]);
+    fs.appendText(
+      `${STATS_DIR}/workflows/release/runs.jsonl`,
+      JSON.stringify({ schema: 1, run_id: 'run-B', outcome: 'completed', ended_at: '2026-07-11T14:00:00.000Z' }) + '\n'
+    );
+    expect(source.scanRecords(windowStart).map((r) => r.run_id).sort()).toEqual(['run-A', 'run-B']);
   });
 });
 

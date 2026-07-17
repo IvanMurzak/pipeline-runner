@@ -16,6 +16,14 @@ const norm = (path: string): string => path.replace(/\\/g, '/');
 export class MemShipperFs implements ShipperFileSystem {
   files = new Map<string, Uint8Array>();
   dirs = new Set<string>();
+  /** Logical per-file mtime: a monotonic counter bumped on every mutation
+   *  (deterministic change detection — the shipper compares values only). */
+  mtimes = new Map<string, number>();
+  private mtimeTick = 0;
+
+  private touch(key: string): void {
+    this.mtimes.set(key, ++this.mtimeTick);
+  }
 
   /** Append raw bytes to a file (journal-writer side of the tests). */
   appendBytes(path: string, bytes: Uint8Array): void {
@@ -25,6 +33,7 @@ export class MemShipperFs implements ShipperFileSystem {
     next.set(existing, 0);
     next.set(bytes, existing.length);
     this.files.set(key, next);
+    this.touch(key);
   }
 
   /** Append UTF-8 text to a file. */
@@ -34,7 +43,9 @@ export class MemShipperFs implements ShipperFileSystem {
 
   /** Truncate/replace a file with raw text (journal rotation in tests). */
   setText(path: string, text: string): void {
-    this.files.set(norm(path), new TextEncoder().encode(text));
+    const key = norm(path);
+    this.files.set(key, new TextEncoder().encode(text));
+    this.touch(key);
   }
 
   readFileText(path: string): string | null {
@@ -43,7 +54,9 @@ export class MemShipperFs implements ShipperFileSystem {
   }
 
   writeFileText(path: string, data: string): void {
-    this.files.set(norm(path), new TextEncoder().encode(data));
+    const key = norm(path);
+    this.files.set(key, new TextEncoder().encode(data));
+    this.touch(key);
   }
 
   mkdirp(path: string): void {
@@ -52,6 +65,12 @@ export class MemShipperFs implements ShipperFileSystem {
 
   statSize(path: string): number | null {
     return this.files.get(norm(path))?.length ?? null;
+  }
+
+  statMtime(path: string): number | null {
+    const key = norm(path);
+    if (!this.files.has(key)) return null;
+    return this.mtimes.get(key) ?? 0;
   }
 
   readRange(path: string, start: number, end: number): Uint8Array {
@@ -82,7 +101,9 @@ export class MemShipperFs implements ShipperFileSystem {
   }
 
   remove(path: string): void {
-    this.files.delete(norm(path));
+    const key = norm(path);
+    this.files.delete(key);
+    this.mtimes.delete(key);
   }
 
   rename(from: string, to: string): void {
@@ -90,7 +111,10 @@ export class MemShipperFs implements ShipperFileSystem {
     const bytes = this.files.get(key);
     if (bytes === undefined) throw new Error(`rename: no such file ${from}`);
     this.files.delete(key);
-    this.files.set(norm(to), bytes);
+    this.mtimes.delete(key);
+    const toKey = norm(to);
+    this.files.set(toKey, bytes);
+    this.touch(toKey);
   }
 }
 
@@ -126,6 +150,35 @@ export class FakeUploadTransport implements UploadTransport {
       .filter((batch) => batch.run_id === runId)
       .flatMap((batch) => batch.events.map((event) => event.seq));
   }
+}
+
+// ── Stats-record factory ─────────────────────────────────────────────────────
+
+/** A schema-valid (protocol `RunRecordStatsSchema`) run record, as the plugin
+ *  writes it to `runs.jsonl` (no revision/origin — the shipper stamps those). */
+export function validRunRecord(runId: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema: 1,
+    run_id: runId,
+    pipeline: 'release',
+    started_at: '2026-07-11T12:59:00.000Z',
+    ended_at: '2026-07-11T13:00:00.000Z',
+    duration_s: 60,
+    outcome: 'completed',
+    halt_reason: null,
+    runner: 'manager',
+    mode: null,
+    steps_run: 1,
+    steps: [],
+    improver_runs: 0,
+    improver_applied: 0,
+    scripts_created: 0,
+    merges: 0,
+    merge_conflicts: 0,
+    llm_steps: 1,
+    tokens: null,
+    ...overrides,
+  };
 }
 
 // ── Journal-event factories ──────────────────────────────────────────────────

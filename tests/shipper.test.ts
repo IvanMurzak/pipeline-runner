@@ -10,7 +10,7 @@ import { EventShipper } from '../src/shipper/shipper';
 import { QUESTION_PLACEHOLDER } from '../src/shipper/privacy';
 import type { StatsSource } from '../src/shipper/stats';
 import { CaptureLogger, FakeClock } from './_helpers';
-import { FakeUploadTransport, journalLine, MemShipperFs, settle } from './_shipper-helpers';
+import { FakeUploadTransport, journalLine, MemShipperFs, settle, validRunRecord } from './_shipper-helpers';
 
 const JOURNAL = 'C:/proj/.claude/pipeline/.runtime/events.jsonl';
 const STATE = 'C:/state/agent/shipper/j1';
@@ -203,10 +203,7 @@ describe('EventShipper — privacy tier on the upload path', () => {
 
 describe('EventShipper — .stats fold', () => {
   const statsSource: StatsSource = {
-    findRunRecord: (runId) =>
-      runId === 'run-A'
-        ? { schema: 1, run_id: 'run-A', pipeline: 'release', outcome: 'completed', ended_at: '2026-07-11T13:00:00.000Z', duration_s: 60, steps_run: 1, transcript: 'SECRET_transcript' }
-        : null,
+    findRunRecord: (runId) => (runId === 'run-A' ? validRunRecord('run-A', { transcript: 'SECRET_transcript' }) : null),
   };
 
   test('a terminal event triggers ONE stats.run_record through the same seq/privacy path', async () => {
@@ -221,6 +218,9 @@ describe('EventShipper — .stats fold', () => {
     const last = transport.confirmed.at(-1)!.events.at(-1)!.payload as Record<string, unknown>;
     expect(last.type).toBe('stats.run_record');
     expect((last.data as Record<string, unknown>).outcome).toBe('completed');
+    // D13/D18: the first dispatched ship stamps revision 1 + origin explicitly.
+    expect((last.data as Record<string, unknown>).revision).toBe(1);
+    expect((last.data as Record<string, unknown>).origin).toBe('dispatched');
     expect(JSON.stringify(last)).not.toContain('SECRET_transcript'); // metadata tier
 
     // A second terminal event for the same run does NOT re-fold.

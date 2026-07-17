@@ -19,9 +19,14 @@
  *     ─DRAIN─▶ oldest-first upload through the `UploadTransport` seam with
  *           core-backoff retries; confirmed chunks are deleted
  *
- * `.stats` folding: a terminal event triggers a one-shot synthetic
- * `stats.run_record` for that run through the same filter/seq/spool path
- * (see ./stats.ts — minimal seam, scope-flagged).
+ * `.stats` shipping — the unified watcher (design 08 D13+D18, see
+ * ./stats.ts): a terminal event triggers a one-shot synthetic
+ * `stats.run_record` (`origin:"dispatched"`, `revision:1`), and a periodic
+ * mtime-gated rescan ships LOCAL-run records (`origin:"local"`, gated by the
+ * default-ON `sync_local_stats` flag) and RE-ships token-enriched records
+ * (`revision`+1, exactly once) — all through the same filter/seq/spool path.
+ * Every stats payload is schema-validated (protocol `RunRecordStatsSchema`)
+ * and excerpt-stripped (D16) BEFORE it is spooled.
  *
  * SECURITY: log lines never contain payloads, tokens, or stripped content —
  * only counts, seq ranges, types, and transport status strings.
@@ -39,14 +44,23 @@ import {
   DEFAULT_PRIVACY_TIER,
   filterEventForTier,
   resolvePrivacyTier,
+  stripStatsFailureExcerpts,
   type PrivacyFilterOptions,
   type PrivacyTier,
 } from './privacy';
-import { isTerminalEventType, nullStatsSource, statsRecordEvent, type StatsSource } from './stats';
+import {
+  DEFAULT_STATS_RESCAN_MS,
+  STATS_RESCAN_WINDOW_MS,
+  isTerminalEventType,
+  nullStatsSource,
+  resolveSyncLocalStats,
+  statsRecordEvent,
+  type StatsSource,
+} from './stats';
 import { DEFAULT_SPOOL_MAX_EVENTS, Spool } from './spool';
 import { JournalTail } from './tail';
 import type { UploadTransport } from './upload-transport';
-import type { IngestBatchRequest, IngestEventRecord } from './wire-ingest';
+import { RunRecordStatsSchema, type IngestBatchRequest, type IngestEventRecord } from './wire-ingest';
 
 export const DEFAULT_BATCH_MAX_EVENTS = 100;
 export const DEFAULT_BATCH_MAX_MS = 2_000;
@@ -77,6 +91,12 @@ export interface EventShipperOptions {
   /** The `project_root` stamped on synthetic stats events. */
   projectRoot?: string;
   statsSource?: StatsSource;
+  /** `sync_local_stats` (design D18): ship LOCALLY-started runs' stats
+   *  records (metrics only). Unset ⇒ env `PIPELINE_SYNC_LOCAL_STATS` ⇒ ON.
+   *  Unrecognized values fail toward privacy (off). */
+  syncLocalStats?: boolean | string;
+  /** Cadence of the periodic stats rescan (D13+D18); mtime-gated, cheap. */
+  statsRescanMs?: number;
   fs?: ShipperFileSystem;
   clock?: Clock;
   logger?: Logger;
@@ -118,6 +138,8 @@ export function shipperStateDir(
 
 export class EventShipper {
   readonly tier: PrivacyTier;
+  /** Resolved `sync_local_stats` flag (D18). */
+  readonly syncLocalStats: boolean;
 
   private readonly fs: ShipperFileSystem;
   private readonly clock: Clock;
@@ -130,6 +152,7 @@ export class EventShipper {
   private readonly batchMaxEvents: number;
   private readonly batchMaxMs: number;
   private readonly pollMs: number;
+  private readonly statsRescanMs: number;
   private readonly maxTrackedRuns: number;
   private readonly backoff: BackoffPolicy;
   private readonly rng: () => number;
@@ -147,6 +170,7 @@ export class EventShipper {
   private retryTimer: unknown = null;
   private pollTimer: unknown = null;
   private flushTimer: unknown = null;
+  private rescanTimer: unknown = null;
   private started = false;
 
   constructor(private readonly options: EventShipperOptions) {
@@ -158,6 +182,7 @@ export class EventShipper {
     this.batchMaxEvents = options.batchMaxEvents ?? DEFAULT_BATCH_MAX_EVENTS;
     this.batchMaxMs = options.batchMaxMs ?? DEFAULT_BATCH_MAX_MS;
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;
+    this.statsRescanMs = options.statsRescanMs ?? DEFAULT_STATS_RESCAN_MS;
     this.maxTrackedRuns = options.maxTrackedRuns ?? DEFAULT_MAX_TRACKED_RUNS;
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.rng = options.rng ?? Math.random;
@@ -175,6 +200,13 @@ export class EventShipper {
     } else {
       this.logger.info(`privacy tier: ${this.tier} (opt-in)`);
     }
+
+    const localSync = resolveSyncLocalStats(options.syncLocalStats, options.env ?? process.env);
+    this.syncLocalStats = localSync.enabled;
+    if (localSync.warning !== null) this.logger.warn(localSync.warning);
+    this.logger.info(
+      `local-run stats sync: ${this.syncLocalStats ? 'on (metrics only — set sync_local_stats=0 to opt out)' : 'off'}`
+    );
 
     this.cursorStore = new CursorStore(this.fs, options.stateDir);
     const loaded = this.cursorStore.load();
@@ -215,8 +247,13 @@ export class EventShipper {
       this.flushNow();
       this.flushTimer = this.clock.setTimeout(flushLoop, this.batchMaxMs);
     };
+    const rescanLoop = (): void => {
+      this.rescanStats();
+      this.rescanTimer = this.clock.setTimeout(rescanLoop, this.statsRescanMs);
+    };
     this.pollTimer = this.clock.setTimeout(pollLoop, this.pollMs);
     this.flushTimer = this.clock.setTimeout(flushLoop, this.batchMaxMs);
+    this.rescanTimer = this.clock.setTimeout(rescanLoop, this.statsRescanMs);
     void this.drain();
   }
 
@@ -226,7 +263,8 @@ export class EventShipper {
     if (this.pollTimer !== null) this.clock.clearTimeout(this.pollTimer);
     if (this.flushTimer !== null) this.clock.clearTimeout(this.flushTimer);
     if (this.retryTimer !== null) this.clock.clearTimeout(this.retryTimer);
-    this.pollTimer = this.flushTimer = this.retryTimer = null;
+    if (this.rescanTimer !== null) this.clock.clearTimeout(this.rescanTimer);
+    this.pollTimer = this.flushTimer = this.retryTimer = this.rescanTimer = null;
     this.pollOnce();
     this.flushNow();
     await this.drain();
@@ -296,15 +334,119 @@ export class EventShipper {
     if (!this.cursor.endedRuns.includes(runId)) this.cursor.endedRuns.push(runId);
   }
 
+  /** Journal trigger (terminal event): the run's first ship, dispatched. */
   private foldStats(runId: string): number {
-    if (this.cursor.statsShipped.includes(runId)) return 0;
+    if (this.cursor.statsShipped.includes(runId) || this.cursor.localStatsShipped.includes(runId)) return 0;
     const record = this.statsSource.findRunRecord(runId);
-    if (record === null) return 0;
-    const event = statsRecordEvent(runId, record, this.projectRoot, new Date(this.clock.now()).toISOString());
-    const added = this.queueEvent(runId, event);
+    if (record === null) return 0; // not written yet — the rescan will catch it
+    return this.shipDispatchedFirst(runId, record);
+  }
+
+  private shipDispatchedFirst(runId: string, record: Record<string, unknown>): number {
+    const shipped = this.shipStatsRecord(runId, record, 'dispatched', 1);
+    if (shipped === null) return 0;
     this.cursor.statsShipped.push(runId);
+    this.finishStatsShip(runId, shipped, 1);
     this.logger.info(`stats record folded for run ${runId}`);
+    return 1;
+  }
+
+  /**
+   * Strip (D16) → stamp revision/origin (D13/D18) → VALIDATE against the
+   * protocol `RunRecordStatsSchema` → queue through the normal privacy/seq
+   * path. A malformed record is never queued (and therefore never spooled);
+   * callers must not mark it shipped, so a later corrected rewrite of the
+   * file retries. Returns the stamped record, or null when rejected.
+   */
+  private shipStatsRecord(
+    runId: string,
+    record: Record<string, unknown>,
+    origin: 'dispatched' | 'local',
+    revision: number
+  ): Record<string, unknown> | null {
+    const stamped = { ...stripStatsFailureExcerpts(record), revision, origin };
+    const parsed = RunRecordStatsSchema.safeParse(stamped);
+    if (!parsed.success) {
+      // Log the FIELD PATHS only — issue messages are schema-side text, but
+      // never echo record values.
+      const paths = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'))];
+      this.logger.warn(
+        `stats record for run ${runId} failed schema validation (fields: ${paths.join(', ')}) — not spooled`
+      );
+      return null;
+    }
+    this.queueEvent(runId, statsRecordEvent(runId, stamped, this.projectRoot, new Date(this.clock.now()).toISOString()));
+    return stamped;
+  }
+
+  /** Shared post-ship bookkeeping: revision + tokens-synced marker. */
+  private finishStatsShip(runId: string, shippedRecord: Record<string, unknown>, revision: number): void {
+    this.cursor.statsRevisionShipped[runId] = revision;
+    if (shippedRecord.tokens !== null && shippedRecord.tokens !== undefined && !this.cursor.statsTokensShipped.includes(runId)) {
+      this.cursor.statsTokensShipped.push(runId);
+    }
+  }
+
+  // ── Periodic rescan (D13 + D18 unified watcher) ────────────────────────────
+
+  /**
+   * One mtime-gated rescan cycle over the stats source, windowed to records
+   * whose `ended_at` is within {@link STATS_RESCAN_WINDOW_MS} (14 days):
+   *
+   *   - UNSHIPPED record of a journal-KNOWN run → its record landed after
+   *     the terminal fold looked for it — ship as `origin:"dispatched"`.
+   *   - UNSHIPPED record of a journal-UNKNOWN run → a LOCALLY started run
+   *     (D18) — ship with `origin:"local"` when `sync_local_stats` allows;
+   *     skipped (unmarked, so a later flag flip still ships it) when not.
+   *   - SHIPPED record whose `tokens` went null→non-null → re-ship with
+   *     `revision`+1, exactly once (D13).
+   *
+   * Returns the number of events queued. Tests drive this directly.
+   */
+  rescanStats(): number {
+    if (this.statsSource.scanRecords === undefined) return 0;
+    const windowStartMs = this.clock.now() - STATS_RESCAN_WINDOW_MS;
+    let added = 0;
+    for (const record of this.statsSource.scanRecords(windowStartMs)) {
+      const runId = typeof record.run_id === 'string' && record.run_id.length > 0 ? record.run_id : null;
+      if (runId === null) continue;
+
+      const shippedLocal = this.cursor.localStatsShipped.includes(runId);
+      if (!shippedLocal && !this.cursor.statsShipped.includes(runId)) {
+        added += this.shipFirstFromRescan(runId, record);
+        continue;
+      }
+
+      // Enrichment re-ship: tokens null→non-null since the last ship (D13).
+      if (record.tokens === null || record.tokens === undefined) continue;
+      if (this.cursor.statsTokensShipped.includes(runId)) continue;
+      const revision = (this.cursor.statsRevisionShipped[runId] ?? 1) + 1;
+      const shipped = this.shipStatsRecord(runId, record, shippedLocal ? 'local' : 'dispatched', revision);
+      if (shipped !== null) {
+        this.finishStatsShip(runId, shipped, revision);
+        this.logger.info(`stats record re-shipped for run ${runId} (revision ${revision} — tokens enriched)`);
+        added += 1;
+      }
+    }
+    if (this.pending.length >= this.batchMaxEvents) this.flushNow();
     return added;
+  }
+
+  private shipFirstFromRescan(runId: string, record: Record<string, unknown>): number {
+    const journalKnown = runId in this.cursor.perRunSeq || this.cursor.endedRuns.includes(runId);
+    if (journalKnown) return this.shipDispatchedFirst(runId, record);
+
+    // Journal-unknown finished record = a locally started run (D18).
+    if (!this.syncLocalStats) return 0;
+    const shipped = this.shipStatsRecord(runId, record, 'local', 1);
+    if (shipped === null) return 0;
+    this.cursor.localStatsShipped.push(runId);
+    // A record only exists for a FINISHED run — note it ended so the cursor
+    // bound (G6) can evict its seq counter like any dispatched run's.
+    this.noteRunEnded(runId);
+    this.finishStatsShip(runId, shipped, 1);
+    this.logger.info(`stats record shipped for local run ${runId} (sync_local_stats on)`);
+    return 1;
   }
 
   // ── Flush (durable spool + cursor commit) ──────────────────────────────────

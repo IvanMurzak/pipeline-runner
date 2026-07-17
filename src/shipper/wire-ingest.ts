@@ -46,6 +46,11 @@ import type { WireFrame } from '../core/wire';
 
 export type { IngestBatchRequest, IngestBatchResponse, UploadMessage } from '@baizor/pipeline-protocol';
 
+/** The `stats.run_record` PAYLOAD contract (protocol 0.2.0, design D12) —
+ *  the shipper validates every stats record against it BEFORE spooling. */
+export { RunRecordStatsSchema, RUN_RECORD_ORIGINS } from '@baizor/pipeline-protocol';
+export type { RunRecordStats, RunRecordOrigin } from '@baizor/pipeline-protocol';
+
 /**
  * One record in an ingest batch: the shipper-assigned `seq` + the opaque
  * event `payload`. `seq` is a non-negative integer (the store seeds its

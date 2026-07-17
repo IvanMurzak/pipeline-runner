@@ -134,6 +134,34 @@ fallback) with restrictive file permissions where the OS supports them. The
 runner token is a secret: it is persisted (it is the runner's credential) but
 never logged.
 
+## Run-stats sync and the `sync_local_stats` flag
+
+A registered runner syncs per-run **statistics records** to the control plane
+through its event shipper: durations, step statuses/outcomes, token and cost
+counts, tool-call/failure counts, model/effort ids — **metrics only, never
+transcripts, prompts, code, file contents, or error text**. Tool-failure
+entries are stripped down to the tool name, step id and count before anything
+leaves the machine; the failure's error excerpt text never ships, on any
+privacy tier. Every record is validated against the published
+`@baizor/pipeline-protocol` `RunRecordStatsSchema` before it is buffered or
+uploaded.
+
+**Disclosure (shown at runner registration):** on a machine registered as a
+runner, this covers *cloud-dispatched* runs **and** pipeline runs you start
+*locally* on that machine — local-run metric sync is **on by default** so
+your dashboards see your whole fleet's activity. Records are tagged
+`origin: "dispatched" | "local"` so analytics can tell them apart. Late token
+enrichment is picked up by a periodic rescan (14-day window per record) and
+re-synced as a superseding revision of the same record.
+
+Opt out of local-run sync at any time with `sync_local_stats=0` — set the
+environment variable `PIPELINE_SYNC_LOCAL_STATS=0` for the runner process
+(cloud-dispatched runs keep syncing; they are the product's job telemetry).
+Unrecognized values fail toward privacy (treated as opt-out). The broader
+privacy tier of the event stream is governed separately by
+`PIPELINE_PRIVACY_TIER` (default `metadata` — content never leaves the
+machine).
+
 ## Layout
 
 ```

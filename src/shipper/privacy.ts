@@ -10,7 +10,10 @@
  *     Implemented as a POSITIVE ALLOWLIST per event type — an unknown event
  *     type ships with its `data` fully stripped, and an unknown field inside a
  *     known type is DROPPED by default. New fields never leak.
- *   - `events`: the full event stream and stats detail, verbatim.
+ *   - `events`: the full event stream and stats detail, verbatim — EXCEPT
+ *     `RunFailureDetail.error` excerpts in stats records, which the stats
+ *     ship path strips at EVERY tier (design D16 / G-sec-2, see
+ *     `stripStatsFailureExcerpts`).
  *   - `full`: + step transcripts and logs. Transcript/log shipping is NOT yet
  *     implemented (scope-flagged in T1-12); `full` currently ships exactly
  *     what `events` ships.
@@ -221,6 +224,19 @@ const STATS_RECORD_ALLOWLIST: Record<string, FieldRule> = {
   merges: 'keep',
   merge_conflicts: 'keep',
   llm_steps: 'keep',
+  // Sync-mechanics stamps (protocol 0.2.0): the shipper's own revision/origin
+  // (design D13/D18) — counters/taxonomy, never content.
+  revision: 'keep',
+  origin: 'keep',
+};
+
+/** `RunFailureDetail` entries inside a stats record (design D16): timestamp,
+ *  tool name and step id are metadata; the `error` excerpt text is CONTENT
+ *  and is deliberately ABSENT from this allowlist (stripped). */
+const STATS_FAILURE_ALLOWLIST: Record<string, FieldRule> = {
+  ts: 'keep',
+  tool: 'keep',
+  step: 'keep',
 };
 
 const STATS_STEP_ALLOWLIST: Record<string, FieldRule> = {
@@ -305,7 +321,30 @@ export function filterStatsRecordMetadata(
   }
   if (isRecord(record.tokens)) out.tokens = filterByAllowlist(record.tokens, STATS_TOKENS_ALLOWLIST, salt);
   else if (record.tokens === null) out.tokens = null;
+  if (Array.isArray(record.failures)) {
+    out.failures = record.failures
+      .filter(isRecord)
+      .map((failure) => filterByAllowlist(failure, STATS_FAILURE_ALLOWLIST, salt));
+  }
   return out;
+}
+
+/**
+ * D16 (G-sec-2): strip `RunFailureDetail.error` excerpt text from a stats
+ * run record — applied by the shipper on the stats path at EVERY tier,
+ * BEFORE the tier filter and BEFORE anything is spooled. Failure excerpts
+ * routinely contain code, paths and command lines; the design strips them
+ * by default (tool name + step + count survive — the count both as the
+ * array length and as `tokens.failed_tools`). Entries that are not objects
+ * carry no classifiable metadata and are dropped entirely.
+ */
+export function stripStatsFailureExcerpts(record: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(record.failures)) return record;
+  const failures = record.failures.filter(isRecord).map((failure) => {
+    const { error: _stripped, ...rest } = failure;
+    return rest;
+  });
+  return { ...record, failures };
 }
 
 /**
