@@ -8,6 +8,11 @@
  * Everything is construction-time-lazy: importing this module starts no
  * timers, spawns no processes, opens no sockets. Wire it onto a running
  * `AgentClient` with `attachJobExecution(client, { runnerId, workspaceRoot, … })`.
+ *
+ * `./shipper-lifecycle` (c2) is the event-shipper composition seam: build it
+ * with `createShipperLifecycle({ send, dispatcher, … })` and pass the result
+ * as `attachJobExecution`'s `events` — one `EventShipper` per active job,
+ * started at `onWorkspaceReady`, stopped at `onJobFinished`.
  */
 
 export * from './wire';
@@ -16,3 +21,4 @@ export * from './workspace';
 export * from './drive';
 export * from './executor';
 export * from './manager';
+export * from './shipper-lifecycle';

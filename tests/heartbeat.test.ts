@@ -48,7 +48,7 @@ describe('HeartbeatLoop cadence', () => {
     loop.stop();
   });
 
-  test('frames carry runner_id, active_run_ids (empty for now), status, and a fresh correlation id', () => {
+  test('frames carry runner_id, active_run_ids (empty absent an accessor), status, paused_until, runs_authoritative, and a fresh correlation id', () => {
     const { loop, clock, sent } = makeLoop();
     loop.start();
     clock.advance(10_000);
@@ -58,10 +58,34 @@ describe('HeartbeatLoop cadence', () => {
       runner_id: 'r-1',
       active_run_ids: [],
       status: 'online',
+      paused_until: null,
+      runs_authoritative: true,
     });
     loop.handleAck({ type: 'heartbeat_ack', id: 'hb-1' });
     clock.advance(10_000);
     expect(sent[1]!.id).toBe('hb-2'); // fresh id per beat
+    loop.stop();
+  });
+
+  test('activeRunIds/pausedUntil accessors compose real run state onto the frame (c2)', () => {
+    let runIds: string[] = [];
+    let paused: string | null = null;
+    const { loop, clock, sent } = makeLoop({
+      activeRunIds: () => runIds,
+      pausedUntil: () => paused,
+    });
+    loop.start();
+    clock.advance(10_000);
+    expect(sent[0]!.active_run_ids).toEqual([]);
+    expect(sent[0]!.paused_until).toBeNull();
+    loop.handleAck({ type: 'heartbeat_ack', id: 'hb-1' });
+
+    runIds = ['run-1', 'run-2'];
+    paused = '2026-07-17T13:00:00.000Z';
+    clock.advance(10_000);
+    expect(sent[1]!.active_run_ids).toEqual(['run-1', 'run-2']);
+    expect(sent[1]!.paused_until).toBe('2026-07-17T13:00:00.000Z');
+    expect(sent[1]!.runs_authoritative).toBe(true);
     loop.stop();
   });
 

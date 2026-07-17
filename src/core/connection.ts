@@ -67,6 +67,16 @@ export interface AgentClientOptions {
   makeId?: () => string;
   registerTimeoutMs?: number;
   maxMissedAcks?: number;
+  /** Heartbeat composition (c2): the job manager's truthful in-flight run ids.
+   *  Absent ⇒ `[]` (no job execution wired — e.g. the `register` command). */
+  activeRunIds?(): string[];
+  /** Heartbeat composition: the job manager's status ("paused" while every
+   *  active job is provider-limit-paused). Absent ⇒ "online". Overridden by
+   *  `draining` (a server directive takes precedence over a job-level pause). */
+  runnerStatus?(): RunnerStatus;
+  /** Heartbeat composition: earliest scheduled provider-limit auto-resume
+   *  among paused jobs, or null. Absent ⇒ `null`. */
+  pausedUntil?(): string | null;
   events?: AgentClientEvents;
 }
 
@@ -249,8 +259,13 @@ export class AgentClient {
       runnerId: frame.runner_id,
       intervalS: identity.heartbeat_interval_s,
       send: (hb) => this.connection?.send(hb),
-      status: (): RunnerStatus => (this.draining_ ? 'draining' : 'online'),
-      activeRunIds: () => [],
+      // Draining (a server directive) always wins; otherwise defer to the job
+      // manager's truthful status (c2 wiring — replaces the `[]`/'online'
+      // stub that made E4 possible: a cloud-dispatched run produced no
+      // server-side events and heartbeats never reflected real work).
+      status: (): RunnerStatus => (this.draining_ ? 'draining' : (this.options.runnerStatus?.() ?? 'online')),
+      activeRunIds: () => this.options.activeRunIds?.() ?? [],
+      pausedUntil: () => this.options.pausedUntil?.() ?? null,
       onDirective: (directive) => {
         if (directive === 'drain') {
           this.draining_ = true;

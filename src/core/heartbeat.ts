@@ -1,8 +1,22 @@
 /**
  * Heartbeat loop. After `register_ack` the connection starts one of these; it
  * sends a `heartbeat` frame every `heartbeat_interval_s` (server-stated, or
- * `DEFAULT_HEARTBEAT_INTERVAL_S`) carrying `runner_id`, `active_run_ids`
- * (empty for now — T1-12 owns runs), and `status`.
+ * `DEFAULT_HEARTBEAT_INTERVAL_S`) carrying `runner_id`, `active_run_ids`,
+ * `status`, `paused_until`, and the `runs_authoritative` capability flag.
+ *
+ * `active_run_ids` / `status` / `paused_until` are composed from the caller's
+ * accessors (the connection threads in the `JobManager`'s truthful
+ * `activeRunIds()` / `runnerStatus()` / `pausedUntil()` — c2 wiring); absent
+ * accessors default to the pre-wiring stub (`[]` / `"online"` / `null`).
+ *
+ * `runs_authoritative: true` is EMITTED UNCONDITIONALLY (design decision D13,
+ * capability-keyed not presence-keyed): the cloud only applies per-run lease
+ * logic when this flag is present, so a caller that has NOT wired real
+ * `activeRunIds`/`status` accessors would otherwise be lying about
+ * exhaustiveness. This loop's `[]`/`"online"` defaults ARE exhaustively true
+ * in that case (no accessor ⇒ no job manager attached ⇒ genuinely zero active
+ * runs — e.g. the `register` command's ephemeral validation connection), so
+ * the flag is always safe to emit from this loop.
  *
  * Each beat sets a fresh correlation `id`; the matching `heartbeat_ack` is
  * paired by that id via `handleAck`. Ack directives:
@@ -43,10 +57,13 @@ export interface HeartbeatOptions {
   /** Called when `maxMissedAcks` consecutive beats went unacked. */
   onMissedAcks?(misses: number): void;
   maxMissedAcks?: number;
-  /** Current in-flight run ids (empty for now; T1-12 supplies real ones). */
+  /** Current in-flight run ids; absent ⇒ `[]`. */
   activeRunIds?(): string[];
   /** Current runner status; defaults to "online". */
   status?(): RunnerStatus;
+  /** ISO time the earliest provider-limit-paused job auto-resumes, or null
+   *  when nothing is paused; absent ⇒ `null`. */
+  pausedUntil?(): string | null;
   makeId?(): string;
   clock?: Clock;
   logger?: Logger;
@@ -140,6 +157,10 @@ export class HeartbeatLoop {
       runner_id: this.options.runnerId,
       active_run_ids: this.options.activeRunIds?.() ?? [],
       status: this.options.status?.() ?? 'online',
+      paused_until: this.options.pausedUntil?.() ?? null,
+      // D13 — capability-keyed heartbeat semantics; see the module doc for
+      // why this is safe to emit unconditionally from this loop.
+      runs_authoritative: true,
     };
     this.beats += 1;
     try {
