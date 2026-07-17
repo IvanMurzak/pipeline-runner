@@ -288,12 +288,27 @@ describe('classifyDriveOutcome', () => {
     });
   });
 
-  test('exit 4 → awaiting_input with the parked question narrowed', () => {
+  test('exit 4 → awaiting_input with the parked question narrowed (no question_id: older-CLI shape)', () => {
     const outcome = classifyDriveOutcome(driveAwaiting('steps/02-deploy.md', 'Which host?'));
     expect(outcome).toEqual({
       kind: 'awaiting_input',
       parked: {
         step_id: '02-deploy',
+        question_id: null,
+        iteration_path: 'steps/02-deploy.md',
+        session_id: 'sess-1',
+        question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] },
+      },
+    });
+  });
+
+  test('exit 4 carries drive-minted question_id verbatim (06.2.1, b2 contract)', () => {
+    const outcome = classifyDriveOutcome(driveAwaiting('steps/02-deploy.md', 'Which host?', 'drive-q-42'));
+    expect(outcome).toEqual({
+      kind: 'awaiting_input',
+      parked: {
+        step_id: '02-deploy',
+        question_id: 'drive-q-42',
         iteration_path: 'steps/02-deploy.md',
         session_id: 'sess-1',
         question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] },

@@ -24,6 +24,12 @@ import type { RunnerStatus } from './core/wire';
 // c2: the event-shipper composition (onWorkspaceReady → EventShipper) also
 // lives there (./jobs/shipper-lifecycle) — see `createShipperLifecycle` below.
 import { attachJobExecution, createShipperLifecycle, type JobManager } from './jobs';
+// c3 (T1-13): the needs-input relay bridge + its pull->push adapter — see
+// `runStart` below for the construction order. `NeedsInputRelay` is aliased
+// because `./jobs` exports a DIFFERENT interface of the same name (the
+// executor's synchronous-pull seam) — `01-current-architecture.md` §1.5
+// calls out the two-shapes collision this alias avoids at the import site.
+import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './relay';
 // T1-15: service install/uninstall/status lives in ./service (its own module).
 import { runService } from './service';
 
@@ -130,6 +136,11 @@ function runStart(): void {
   // activeRunIds()/runnerStatus()/pausedUntil() into the heartbeat loop
   // instead of the pre-wiring `[]`/'online' stub).
   let manager: JobManager | null = null;
+  // c3: assigned right after `client` below (the bridge needs the live
+  // `client` as its RelayClientPort). `onOnline` only fires once the
+  // connection actually registers — well after that assignment — so this
+  // forward reference is safe (mirrors the `manager` pattern above).
+  let relayBridge: NeedsInputRelayBridge;
 
   const client = new AgentClient({
     store,
@@ -137,11 +148,30 @@ function runStart(): void {
     logger: consoleLogger,
     events: {
       onFatal: () => process.exit(1),
+      // c3: re-send every still-pending needs_input frame once THIS
+      // runner's own connection is back online (bridge.ts's `send()`
+      // returned false while offline — the question stayed pending, never
+      // lost, because drive already journalled the park as `awaiting_input`).
+      // NOT the same gap as E12/06.2.4 (an answer POSTed to the CLOUD while
+      // the runner was offline needing cloud-side `redeliverQueuedAnswers`
+      // on register/reconnect) — that is a separate, P4, cloud-side change.
+      onOnline: () => relayBridge.resurfacePending(),
     },
     activeRunIds: () => manager?.activeRunIds() ?? [],
     runnerStatus: (): RunnerStatus => manager?.runnerStatus() ?? 'online',
     pausedUntil: () => manager?.pausedUntil() ?? null,
   });
+
+  // c3 (T1-13): construct ONE needs-input relay bridge + its pull->push
+  // adapter on this connection — closes E3 (every parked question
+  // previously failed the job, "T1-13 not wired", executor.ts:384). Two-
+  // phase construction (see relay/adapter.ts's module doc): the adapter is
+  // built first (no bridge yet), the bridge takes the adapter as its
+  // `DriveSession`, then `attach()` closes the loop — all synchronously,
+  // before `client.start()`, so no lease can race the wiring.
+  const relayAdapter = new PullRelayAdapter({ logger: consoleLogger });
+  relayBridge = new NeedsInputRelayBridge({ client, drive: relayAdapter, logger: consoleLogger });
+  relayAdapter.attach(relayBridge);
 
   // c2: per-job EventShipper lifecycle (onWorkspaceReady → start, terminal →
   // stop) — closes E4 (a cloud-dispatched run produced no server-side
@@ -162,6 +192,9 @@ function runStart(): void {
     draining: () => client.draining,
     workspaceRoot: process.env.PIPELINE_RUNNER_JOBS_DIR ?? join(defaultConfigDir(), 'jobs'),
     logger: consoleLogger,
+    // c3: the needs-input relay — every parked question now round-trips
+    // through the bridge instead of hitting the default auto-fail seam.
+    needsInput: relayAdapter,
     events: shipperLifecycle,
   });
   client.start();
