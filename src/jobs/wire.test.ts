@@ -186,4 +186,25 @@ describe('jobs wire — run_status', () => {
     expect(frame.phase).toBe('halted');
     expect(frame.halt_reason).toBe('boom');
   });
+
+  // env-variables design (task d1): the `variables_applied` NAMES-ONLY echo —
+  // an additive extra field the package schema does not (yet) declare, riding
+  // its `.passthrough()` (see the doc on `buildRunStatusFrame`).
+  describe('variables_applied echo (env-variables d1)', () => {
+    test('started carries variables_applied when supplied', () => {
+      const frame = buildRunStatusFrame('run-1', 'job-1', 'started', { variables_applied: ['PP_SERVICE', 'PP_CHANNEL'] });
+      expect(frame.variables_applied).toEqual(['PP_SERVICE', 'PP_CHANNEL']);
+    });
+
+    test('started omits variables_applied entirely when not supplied (byte-identical to today)', () => {
+      const frame = buildRunStatusFrame('run-1', 'job-1', 'started');
+      expect('variables_applied' in frame).toBe(false);
+    });
+
+    test('an empty applied-names array is still carried (lease had an EMPTY variables map)', () => {
+      const frame = buildRunStatusFrame('run-1', 'job-1', 'started', { variables_applied: [] });
+      expect('variables_applied' in frame).toBe(true);
+      expect(frame.variables_applied).toEqual([]);
+    });
+  });
 });

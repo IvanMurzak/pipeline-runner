@@ -218,6 +218,129 @@ describe('JobExecutor — matrix execution overrides (T3-06)', () => {
   });
 });
 
+describe('JobExecutor — lease variables (env-variables d1)', () => {
+  test('a lease with variables: START carries --var flags AND run_status started echoes variables_applied (names only)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED], {
+      lease: makeLease({ variables: { PP_SERVICE: 'payments', PP_CHANNEL: '#releases' } }),
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(1);
+    expect(drive[0]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--start',
+      'steps/01-plan.md',
+      '--var',
+      'PP_CHANNEL=#releases',
+      '--var',
+      'PP_SERVICE=payments',
+      '--json',
+    ]);
+
+    const started = world.sink.ofType('run_status')[0] as Record<string, unknown>;
+    expect(started).toEqual({
+      type: 'run_status',
+      run_id: 'run-1',
+      job_id: 'job-1',
+      phase: 'started',
+      variables_applied: ['PP_CHANNEL', 'PP_SERVICE'],
+    });
+    // NAMES ONLY — no value ever rides the echo.
+    expect(JSON.stringify(started)).not.toContain('payments');
+    expect(JSON.stringify(started)).not.toContain('releases');
+  });
+
+  test('a provider-limit auto-resume does NOT repeat --var (D11: START only)', async () => {
+    const world = makeWorld([DRIVE_PROVIDER_LIMIT, DRIVE_COMPLETED], {
+      lease: makeLease({ variables: { PP_SERVICE: 'payments' } }),
+    });
+    const done = world.executor.start();
+    await tick();
+    world.clock.advance(DEFAULT_PROVIDER_LIMIT_PAUSE_MS);
+    await tick();
+    expect((await done).ok).toBe(true);
+
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(2);
+    expect(drive[0]!.args).toContain('--var');
+    expect(drive[1]!.args).not.toContain('--var');
+    expect(drive[1]!.args).toEqual(['drive', '--root', PIPELINE_ROOT, '--run-id', 'run-1', '--resume', '--json']);
+  });
+
+  test('a needs-input answer resume does NOT repeat --var (D11: START only)', async () => {
+    const world = makeWorld([driveAwaiting(), DRIVE_COMPLETED], {
+      lease: makeLease({ variables: { PP_SERVICE: 'payments' } }),
+      needsInput: { onQuestion: () => 'host-a' },
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(2);
+    expect(drive[0]!.args).toContain('--var');
+    expect(drive[1]!.args).not.toContain('--var');
+    expect(drive[1]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--resume',
+      '--start',
+      'steps/02-deploy.md',
+      '--answer',
+      'host-a',
+      '--json',
+    ]);
+  });
+
+  test('a lease WITHOUT variables drives + reports byte-identically to today (regression)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED]); // makeLease() default carries no `variables`
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).not.toContain('--var');
+    expect(world.sink.frames).toEqual([
+      { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'started' },
+      { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'completed', outcome: 'completed' },
+    ]);
+    expect('variables_applied' in (world.sink.ofType('run_status')[0] as Record<string, unknown>)).toBe(false);
+  });
+
+  test('an EMPTY lease variables map still echoes variables_applied: [] (distinguishable from absent)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED], { lease: makeLease({ variables: {} }) });
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).not.toContain('--var');
+    const started = world.sink.ofType('run_status')[0] as Record<string, unknown>;
+    expect(started.variables_applied).toEqual([]);
+  });
+
+  test('variables and a matrix-cell execution override compose on the SAME start invocation', async () => {
+    const world = makeWorld([DRIVE_COMPLETED], {
+      lease: makeLease({ execution_overrides: { model: 'opus' }, variables: { PP_SERVICE: 'payments' } }),
+    });
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--default-model',
+      'opus',
+      '--start',
+      'steps/01-plan.md',
+      '--var',
+      'PP_SERVICE=payments',
+      '--json',
+    ]);
+  });
+});
+
 describe('JobExecutor — failure paths', () => {
   test('drive halt → run_status halted with the reason, result failed', async () => {
     const world = makeWorld([DRIVE_HALTED]);

@@ -30,6 +30,6 @@
     "typescript": "^5.9.0"
   },
   "dependencies": {
-    "@baizor/pipeline-protocol": "0.1.0"
+    "@baizor/pipeline-protocol": "0.2.0"
   }
 }

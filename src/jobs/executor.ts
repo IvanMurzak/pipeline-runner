@@ -279,8 +279,23 @@ export class JobExecutor {
       secret_slugs: lease.secret_slugs,
     });
 
+    // The `variables_applied` echo (names only, NEVER values — [06 §5]): the
+    // ONLY way cloud can detect a pre-d1 runner silently dropping the lease's
+    // `variables` field. Present (even as `[]`) iff the lease carries the
+    // field at all (`!== undefined`, the SAME presence check `driveTarget`
+    // uses below for this lease field); a lease predating it omits
+    // `variables_applied` entirely, keeping the `started` frame byte-identical
+    // to today. Sorted for the same determinism reason as buildDriveArgs's
+    // `--var` ordering. Computed and reported HERE — immediately after
+    // `onWorkspaceReady`, exactly where `setState('running')`/`report('started')`
+    // have always fired — rather than after the drive-target assembly below,
+    // so a future bug in THAT assembly can never delay or swallow this report
+    // (`start()` never rejects by contract).
+    const variablesApplied =
+      lease.variables !== undefined ? Object.keys(lease.variables).sort((a, b) => a.localeCompare(b)) : undefined;
+
     this.setState('running');
-    this.report('started');
+    this.report('started', { variables_applied: variablesApplied });
     this.logger.info(`job ${lease.job_id}: drive starting (run ${lease.run_id})`);
 
     // T3-06: a matrix cell's execution_overrides become RUN-LEVEL drive
@@ -288,11 +303,15 @@ export class JobExecutor {
     // carries the same model + effort. An absent/empty override yields a target
     // with no default fields ⇒ buildDriveArgs emits no extra flags (unchanged).
     const overrides = lease.execution_overrides;
+    // env-variables design (task d1): the lease's frozen `PP_*` map, if any —
+    // mapped to `--var` on the START invocation ONLY (buildDriveArgs enforces
+    // this structurally; see its doc). Absent ⇒ no field ⇒ no flags, ever.
     const driveTarget: DriveTarget = {
       pipelineRoot: workspace.pipelineRoot,
       runId: lease.run_id,
       ...(overrides?.model ? { defaultModel: overrides.model } : {}),
       ...(overrides?.effort ? { defaultEffort: overrides.effort } : {}),
+      ...(lease.variables !== undefined ? { variables: lease.variables } : {}),
     };
 
     let mode: DriveMode = { kind: 'start', startIteration: workspace.startIteration };
@@ -408,7 +427,10 @@ export class JobExecutor {
     return result;
   }
 
-  private report(phase: 'started' | 'completed' | 'halted', detail?: { outcome?: string; halt_reason?: string }): void {
+  private report(
+    phase: 'started' | 'completed' | 'halted',
+    detail?: { outcome?: string; halt_reason?: string; variables_applied?: string[] }
+  ): void {
     const frame = buildRunStatusFrame(this.runId, this.jobId, phase, detail);
     if (!this.options.send(frame)) {
       // Not online right now — the authoritative record is the event journal
