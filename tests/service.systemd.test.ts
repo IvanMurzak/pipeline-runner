@@ -67,7 +67,7 @@ describe('renderSystemdUnit (pure)', () => {
 });
 
 describe('systemd install', () => {
-  test('writes the unit and reloads + enables --now', () => {
+  test('writes the unit, reloads + enables --now, then enables lingering', () => {
     const exec = new FakeExec();
     const fs = new FakeServiceFs();
     const result = installService({ ...OPTS, exec, fs });
@@ -77,6 +77,7 @@ describe('systemd install', () => {
     expect(exec.sequence).toEqual([
       'systemctl --user daemon-reload',
       'systemctl --user enable --now pipeline-runner.service',
+      'loginctl enable-linger',
     ]);
     expect(result.action).toBe('install');
     expect(result.backend).toBe('systemd');
@@ -95,6 +96,39 @@ describe('systemd install', () => {
     } catch (err) {
       expect((err as Error).message).toContain('enable-linger');
     }
+  });
+
+  test('daemon-reload failure never reaches the loginctl step', () => {
+    const exec = new FakeExec(({ args }) =>
+      args.includes('daemon-reload') ? { code: 1, stderr: 'no bus' } : {}
+    );
+    expect(() => installService({ ...OPTS, exec, fs: new FakeServiceFs() })).toThrow(ServiceError);
+    expect(exec.calls.some((c) => c.cmd === 'loginctl')).toBe(false);
+  });
+
+  test('successful lingering is reported in messages', () => {
+    const exec = new FakeExec();
+    const result = installService({ ...OPTS, exec, fs: new FakeServiceFs() });
+    expect(result.messages.some((m) => m.includes('enabled lingering'))).toBe(true);
+  });
+
+  test('a linger failure does NOT throw — install still succeeds, with an actionable warning', () => {
+    const exec = new FakeExec(({ cmd, args }) =>
+      cmd === 'loginctl' && args[0] === 'enable-linger'
+        ? { code: 1, stderr: 'Interactive authentication required.' }
+        : {}
+    );
+    const result = installService({ ...OPTS, exec, fs: new FakeServiceFs() });
+    expect(result.action).toBe('install'); // did not throw
+    expect(exec.sequence).toEqual([
+      'systemctl --user daemon-reload',
+      'systemctl --user enable --now pipeline-runner.service',
+      'loginctl enable-linger',
+    ]);
+    const warning = result.messages.find((m) => m.startsWith('warning:'));
+    expect(warning).toContain('Interactive authentication required.');
+    expect(result.messages.join('\n')).toContain('loginctl enable-linger "$USER"');
+    expect(result.messages.join('\n')).toContain('SYSTEM unit');
   });
 });
 

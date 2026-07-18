@@ -47,7 +47,57 @@ bun src/cli.ts service <install|uninstall|status> [--dry-run]
 | `--store-only` | no | Store the identity but skip the one-time connect-and-validate step. |
 
 `service install` supports `--dry-run` to print the generated systemd
-unit / launchd plist / `sc.exe create` command without touching the system.
+unit / launchd plist / `sc.exe create` + `sc.exe failure` commands without
+touching the system.
+
+### Reboot/logout recovery of the installed service
+
+Crash-resume (below) only helps if the daemon actually comes back after it
+dies — `service install` now also configures the OS side of that, per
+platform:
+
+- **Linux (systemd, user unit):** install additionally runs
+  `loginctl enable-linger` so the user's systemd instance — and this unit —
+  keeps running after logout and starts again at boot, without an active
+  login session. This is best-effort: if lingering can't be enabled (e.g. no
+  polkit/D-Bus permission in a locked-down or containerized session), install
+  still succeeds — a warning names the exact command to run yourself:
+  `loginctl enable-linger "$USER"`.
+  **System-unit alternative:** for boot-level start that does not depend on
+  lingering at all, run the daemon as a root SYSTEM unit instead: copy the
+  `[Unit]`/`[Service]` block from `service install --dry-run` into
+  `/etc/systemd/system/pipeline-runner.service` (drop the user-only
+  `WantedBy=default.target` line in favor of `multi-user.target` if you want
+  it before any login), then `sudo systemctl enable --now
+  pipeline-runner.service`. This is a manual step — `service install` never
+  requests elevation and does not manage system units itself.
+- **Windows (SCM):** install additionally runs
+  `sc.exe failure <name> reset= 86400 actions= restart/5000`, so the Service
+  Control Manager restarts the process 5s after a crash (the failure counter
+  resets after 24h of uninterrupted uptime). `sc.exe create ... start= auto`
+  alone — what this backend did before — starts the service at boot but
+  configures NO recovery action, so the SCM never restarted a crashed
+  process. Verify the configured recovery action with
+  `sc.exe qfailure pipeline-runner`.
+- **macOS (launchd, LaunchAgent):** `RunAtLoad` + `KeepAlive` restart the
+  daemon on crash and at LOGIN, but explicitly **not at boot** before anyone
+  logs in — there is no root LaunchDaemon (`/Library/LaunchDaemons`) support
+  yet; that option is deferred. `service install` prints this caveat. A
+  headless Mac with auto-login is unaffected; one that waits at the login
+  window after a reboot will not run the runner until someone logs in.
+
+### Transcript retention (crash-resume requirement)
+
+Crash-resume below re-enters a pinned Claude Code step session mid-thought by
+reading its transcript. Claude Code prunes transcripts older than
+`cleanupPeriodDays` (default 30) at the startup of ANY `claude` process on the
+host — independent of this runner. On any machine that runs
+`pipeline-runner` as a service, set `cleanupPeriodDays >= 14` in Claude
+Code's settings: the control plane parks an unanswered `awaiting_input` run
+for up to 14 days before ending it `abandoned-needs-input`, so the transcript
+must outlive that whole window or a resumable crash silently becomes an
+UNRECOVERABLE one (record dropped, `run_status halted`) the next time the
+runner reconciles.
 
 ### Crash resume + workspace retention
 

@@ -45,8 +45,10 @@ export {
 } from './launchd';
 export {
   renderWindowsCreateCommand,
+  renderWindowsFailureCommand,
   createWindowsBackend,
   type WindowsCreateCommand,
+  type WindowsFailureCommand,
 } from './windows';
 
 /** The platforms with a service backend. */

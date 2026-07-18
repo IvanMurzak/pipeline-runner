@@ -85,6 +85,15 @@ describe('launchd install', () => {
     expect(result.definitionPath).toBe(PLIST_PATH);
     expect(result.backend).toBe('launchd');
   });
+
+  test('surfaces the explicit login-not-boot caveat (LaunchDaemon deferred)', () => {
+    const result = installService({ ...OPTS, exec: new FakeExec(), fs: new FakeServiceFs() });
+    const caveat = result.messages.find((m) => m.startsWith('caveat:'));
+    expect(caveat).toBeDefined();
+    expect(caveat).toContain('LOGIN, not boot');
+    expect(caveat).toContain('LaunchDaemon');
+    expect(caveat).toContain('not yet supported');
+  });
 });
 
 describe('launchd uninstall', () => {

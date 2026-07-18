@@ -98,6 +98,9 @@ describe('previewService (pure, touches nothing)', () => {
     });
     expect(preview.definitionPath).toBeNull();
     expect(preview.definition).toContain('sc.exe create pipeline-runner binPath=');
+    expect(preview.definition).toContain(
+      'sc.exe failure pipeline-runner reset= 86400 actions= restart/5000'
+    );
   });
 });
 
