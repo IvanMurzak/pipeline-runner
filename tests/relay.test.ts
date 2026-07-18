@@ -164,13 +164,29 @@ describe('rejection of stale / cross-run / duplicate / mismatched answers', () =
     expect(relay.pendingCount).toBe(0);
   });
 
-  test('an answer whose echoed correlation id MISMATCHES the pending frame is ignored', () => {
+  test('an answer with a SKEWED correlation id still delivers on the (run_id, question_id) match', () => {
+    // e7-p4 kill-drill finding: after a daemon restart the bridge's pending map
+    // is rebuilt with FRESH correlation ids, while the server's stored record —
+    // and any answer staged during the outage — echoes the ORIGINAL frame's id.
+    // (run_id, question_id) is drive's durable park identity (06.2.1); a skewed
+    // echo must not strand the run parked (the server has already retired the
+    // staged answer as delivered by the time the frame reaches us).
     const { client, drive, relay } = makeRelay();
-    relay.surface(question('run-1', 'q-1')); // corr-1
-    client.serverSend(answerFrame('run-1', 'q-1', 'nope', { id: 'corr-999' }));
+    relay.surface(question('run-1', 'q-1')); // fresh corr id in THIS process
+    client.serverSend(answerFrame('run-1', 'q-1', 'from before the restart', { id: 'corr-from-old-process' }));
 
-    expect(drive.calls).toHaveLength(0);
-    expect(relay.hasPending('run-1', 'q-1')).toBe(true); // stays open
+    expect(drive.calls).toEqual([{ runId: 'run-1', questionId: 'q-1', answerText: 'from before the restart' }]);
+    expect(relay.hasPending('run-1', 'q-1')).toBe(false); // resolved exactly once
+  });
+
+  test('a DUPLICATE with a skewed correlation id behind a delivered answer does not double-resume', () => {
+    const { client, drive, relay } = makeRelay();
+    const { id } = relay.surface(question('run-1', 'q-1'));
+    client.serverSend(answerFrame('run-1', 'q-1', 'once', { id }));
+    client.serverSend(answerFrame('run-1', 'q-1', 'again', { id: 'corr-stale' })); // no pending left
+
+    expect(drive.calls).toHaveLength(1);
+    expect(drive.calls[0]!.answerText).toBe('once');
   });
 
   test('a malformed answer frame (missing inner fields) is ignored, not thrown', () => {
