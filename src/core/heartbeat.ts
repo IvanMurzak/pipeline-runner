@@ -64,6 +64,10 @@ export interface HeartbeatOptions {
   /** ISO time the earliest provider-limit-paused job auto-resumes, or null
    *  when nothing is paused; absent ⇒ `null`. */
   pausedUntil?(): string | null;
+  /** c6: fired once per beat, BEFORE the frame is composed — the job
+   *  manager's heartbeat-tick record writer (renews each active job record's
+   *  `updated_at` so a live runner's records stay FRESH for the reconcile). */
+  onBeat?(): void;
   makeId?(): string;
   clock?: Clock;
   logger?: Logger;
@@ -148,6 +152,11 @@ export class HeartbeatLoop {
         // chose not to, keep beating — the socket may yet recover.
         if (!this.running) return;
       }
+    }
+    try {
+      this.options.onBeat?.();
+    } catch (err) {
+      this.logger.warn(`heartbeat onBeat hook failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     const id = this.makeId();
     this.pending.set(id, this.clock.now());

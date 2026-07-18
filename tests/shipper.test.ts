@@ -240,3 +240,36 @@ describe('EventShipper — .stats fold', () => {
     expect(transport.confirmedSeqs('run-B')).toEqual([1]);
   });
 });
+
+describe('EventShipper — c6 seq-base fencing (06.8.2, attempt fencing)', () => {
+  test('a lease-carried event_seq_base starts the run seq counter there', async () => {
+    const { fs, transport, shipper } = makeRig({ seqBase: { runId: 'run-A', base: 2_000_000 } });
+    fs.appendText(JOURNAL, journalLine('run.started', 'run-A') + journalLine('run.started', 'run-B'));
+    shipper.pollOnce();
+    shipper.flushNow();
+    await settle();
+    // Attempt window entered: first event lands ABOVE the base.
+    expect(transport.confirmedSeqs('run-A')).toEqual([2_000_001]);
+    // Other runs are unaffected.
+    expect(transport.confirmedSeqs('run-B')).toEqual([1]);
+  });
+
+  test('never LOWERS an existing counter (same-attempt resume keeps contiguity)', async () => {
+    const fs = new MemShipperFs();
+    // First shipper life: two events at seq 1..2.
+    {
+      const rig = makeRig({}, { fs });
+      fs.appendText(JOURNAL, journalLine('run.started', 'run-A') + journalLine('iteration.started', 'run-A', { iteration_path: 'a.md', index: 0 }));
+      rig.shipper.pollOnce();
+      rig.shipper.flushNow();
+      await settle();
+    }
+    // Restart with a base LOWER than the persisted counter: counter wins.
+    const rig2 = makeRig({ seqBase: { runId: 'run-A', base: 1 } }, { fs });
+    fs.appendText(JOURNAL, journalLine('iteration.completed', 'run-A', { iteration_path: 'a.md', outcome: 'completed' }));
+    rig2.shipper.pollOnce();
+    rig2.shipper.flushNow();
+    await settle();
+    expect(rig2.transport.confirmedSeqs('run-A')).toEqual([3]); // contiguous, not reset
+  });
+});

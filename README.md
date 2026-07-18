@@ -49,6 +49,35 @@ bun src/cli.ts service <install|uninstall|status> [--dry-run]
 `service install` supports `--dry-run` to print the generated systemd
 unit / launchd plist / `sc.exe create` command without touching the system.
 
+### Crash resume + workspace retention
+
+A daemon death never loses a run: every accepted job persists a durable
+record under the runner DATA dir (`%LOCALAPPDATA%\pipeline-runner\jobs\` on
+Windows, `$XDG_STATE_HOME/pipeline-runner/jobs/` elsewhere — no secrets, the
+job JWT is never written to disk). On `start` the runner reconciles those
+records BEFORE connecting: a record younger than its lease TTL resumes
+in-place (`pipeline drive --resume` in the recorded checkout — pause windows
+restored, parked questions re-surfaced); an older one is QUARANTINED and only
+resumed when the control plane re-offers the run (`resume_hint` lease →
+adoption in the recorded checkout) or discarded on `cancel`; a record whose
+resume substrate is gone (checkout / `next.json` / claude session transcript
+deleted) is dropped with a `run_status halted`. `SIGTERM`/`SIGINT` drain
+gracefully: stop accepting leases, persist records, terminate drive children
+(their per-step state is durable), flush the event spool, exit 0. (Windows:
+an SCM `stop` is a hard terminate — that is fine; hard death is the design's
+baseline assumption.)
+
+Terminal workspaces (completed / cleanly halted / cancelled runs) are deleted
+by default. Environment knobs:
+
+| Variable | Meaning |
+|---|---|
+| `PIPELINE_RUNNER_WORKSPACE_RETENTION=<dur>` | Keep terminal workspaces for a window (`30s`, `15m`, `12h`, `7d`, or plain seconds); a boot-time + hourly GC reaps expired ones. |
+| `PIPELINE_RUNNER_KEEP_WORKSPACES=1` | Never delete workspaces or job records (infinite retention, GC off). |
+
+Quarantined crash leftovers that no re-offer ever claims are reaped after
+14 days (or the configured retention window, whichever is longer).
+
 Identity is stored at `%APPDATA%\pipeline-runner\config.json` (Windows) or
 `$XDG_CONFIG_HOME/pipeline-runner/config.json` (elsewhere; `~/.config`
 fallback) with restrictive file permissions where the OS supports them. The

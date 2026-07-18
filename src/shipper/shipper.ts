@@ -91,6 +91,13 @@ export interface EventShipperOptions {
   spoolMaxEvents?: number;
   /** Bound on tracked per-run seq counters (G6). */
   maxTrackedRuns?: number;
+  /** c6 (06.8.2, attempt fencing): start this run's seq counter at `base`
+   *  (the lease's `event_seq_base`) so a re-attempt's events land in their
+   *  own seq window — a foreign/late attempt restarting at 1 would otherwise
+   *  be silently dedup-dropped against the previous attempt's ledger rows.
+   *  Never LOWERS an existing counter (a resumed same-attempt journal keeps
+   *  its contiguous seqs). */
+  seqBase?: { runId: string; base: number };
   backoff?: BackoffPolicy;
   rng?: () => number;
 }
@@ -173,6 +180,10 @@ export class EventShipper {
     const loaded = this.cursorStore.load();
     if (loaded.warning !== null) this.logger.warn(loaded.warning);
     this.cursor = loaded.cursor;
+    if (options.seqBase !== undefined) {
+      const { runId, base } = options.seqBase;
+      if ((this.cursor.perRunSeq[runId] ?? 0) < base) this.cursor.perRunSeq[runId] = base;
+    }
     this.tail = new JournalTail(this.fs, options.journalPath, this.cursor.byteOffset);
     this.pendingParseOffset = this.cursor.byteOffset;
     this.spool = new Spool(this.fs, join(options.stateDir, 'spool'), options.spoolMaxEvents ?? DEFAULT_SPOOL_MAX_EVENTS);

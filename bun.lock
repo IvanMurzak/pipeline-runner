@@ -5,7 +5,7 @@
     "": {
       "name": "@baizor/pipeline-runner",
       "dependencies": {
-        "@baizor/pipeline-protocol": "0.2.0",
+        "@baizor/pipeline-protocol": "0.3.0",
       },
       "devDependencies": {
         "@types/bun": "^1.2.0",
@@ -14,7 +14,7 @@
     },
   },
   "packages": {
-    "@baizor/pipeline-protocol": ["@baizor/pipeline-protocol@0.2.0", "", { "dependencies": { "zod": "^3.25.76" } }, "sha512-SeNBDFXMgfdW7I9FjnC7KcaF13SxfZiLfS47ER5ypQ8Bfu63RFwLDGyldZlPL5QJlzOTR4T4HjoTHCPgGufwMQ=="],
+    "@baizor/pipeline-protocol": ["@baizor/pipeline-protocol@0.3.0", "", { "dependencies": { "zod": "^3.25.76" } }, "sha512-nVxGq8cPhIRLXPLnmDCkfHk+IzMS+X0vMnlcJ9kWq4JPVjb//ZAlTG4YBF5kuIvIzZX1V/3jWl4nlYqy+cSHAQ=="],
 
     "@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

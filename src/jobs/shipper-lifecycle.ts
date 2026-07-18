@@ -69,18 +69,43 @@ export function journalPathFor(context: Pick<JobWorkspaceContext, 'dir'>): strin
   return join(context.dir, '.claude', 'pipeline', '.runtime', 'events.jsonl');
 }
 
+/** The lifecycle events PLUS the graceful-shutdown drain (c6). */
+export type ShipperLifecycle = Required<
+  Pick<JobManagerEvents, 'onWorkspaceReady' | 'onJobFinished' | 'onTerminalFlush'>
+> & {
+  /** c6 graceful shutdown: final flush + drain of EVERY active shipper. */
+  stopAll(): Promise<void>;
+};
+
 /**
- * Build the `onWorkspaceReady` / `onJobFinished` pair to pass as
- * `attachJobExecution(client, { events: createShipperLifecycle(...), ... })`.
- * One `EventShipper` per active job; a job that never reaches
+ * Build the `onWorkspaceReady` / `onTerminalFlush` / `onJobFinished` set to
+ * pass as `attachJobExecution(client, { events: createShipperLifecycle(...),
+ * ... })`. One `EventShipper` per active job; a job that never reaches
  * `onWorkspaceReady` (prep failure) never gets one — nothing to tail.
+ *
+ * c6 ordered completion (the c5 terminal-state race): `onTerminalFlush` is
+ * the executor's pre-run_status await — it STOPS this job's shipper (final
+ * poll + flush + drain attempt), so the terminal journal events are shipped
+ * (or durably spooled with retries pending) BEFORE the terminal `run_status`
+ * frame goes out and before the run leaves `active_run_ids`. `onJobFinished`
+ * remains as the safety net for paths that never flush (cancel, crash
+ * containment) — stopping an already-stopped job's shipper finds nothing.
  */
-export function createShipperLifecycle(
-  options: ShipperLifecycleOptions
-): Required<Pick<JobManagerEvents, 'onWorkspaceReady' | 'onJobFinished'>> {
+export function createShipperLifecycle(options: ShipperLifecycleOptions): ShipperLifecycle {
   const fs = options.fs ?? nodeShipperFs();
   const logger = options.logger ?? nullLogger;
   const shippers = new Map<string, EventShipper>();
+
+  const stopShipper = async (jobId: string): Promise<void> => {
+    const shipper = shippers.get(jobId);
+    if (shipper === undefined) return;
+    shippers.delete(jobId);
+    try {
+      await shipper.stop();
+    } catch (err) {
+      logger.warn(`shipper stop failed for job ${jobId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   return {
     onWorkspaceReady: (context: JobWorkspaceContext): void => {
@@ -101,6 +126,13 @@ export function createShipperLifecycle(
         clock: options.clock,
         logger,
         env: options.env,
+        // c6 (06.8.2): attempt fencing — a lease/record that carries an
+        // event_seq_base starts this run's seq counter there, so a new
+        // attempt's events land in their own window and can never collide
+        // with (or be dedup-dropped against) a prior attempt's.
+        ...(context.event_seq_base !== undefined
+          ? { seqBase: { runId: context.run_id, base: context.event_seq_base } }
+          : {}),
       });
       const previous = shippers.get(context.job_id);
       if (previous !== undefined) {
@@ -113,13 +145,12 @@ export function createShipperLifecycle(
       shipper.start();
       logger.info(`shipper started for job ${context.job_id} (run ${context.run_id}, journal ${journalPath})`);
     },
+    onTerminalFlush: (jobId: string): Promise<void> => stopShipper(jobId),
     onJobFinished: (result: JobResult): void => {
-      const shipper = shippers.get(result.job_id);
-      if (shipper === undefined) return; // no workspace ever readied (prep failure) — nothing to stop
-      shippers.delete(result.job_id);
-      void shipper.stop().catch((err: unknown) => {
-        logger.warn(`shipper stop failed for job ${result.job_id}: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      void stopShipper(result.job_id);
+    },
+    stopAll: async (): Promise<void> => {
+      await Promise.all([...shippers.keys()].map((jobId) => stopShipper(jobId)));
     },
   };
 }

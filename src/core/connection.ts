@@ -77,6 +77,9 @@ export interface AgentClientOptions {
   /** Heartbeat composition: earliest scheduled provider-limit auto-resume
    *  among paused jobs, or null. Absent ⇒ `null`. */
   pausedUntil?(): string | null;
+  /** c6: per-beat hook — the job manager's heartbeat-tick record writer
+   *  (`touchActiveRecords`). Absent ⇒ nothing. */
+  onBeat?(): void;
   events?: AgentClientEvents;
 }
 
@@ -266,6 +269,7 @@ export class AgentClient {
       status: (): RunnerStatus => (this.draining_ ? 'draining' : (this.options.runnerStatus?.() ?? 'online')),
       activeRunIds: () => this.options.activeRunIds?.() ?? [],
       pausedUntil: () => this.options.pausedUntil?.() ?? null,
+      onBeat: () => this.options.onBeat?.(),
       onDirective: (directive) => {
         if (directive === 'drain') {
           this.draining_ = true;

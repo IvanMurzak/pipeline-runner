@@ -37,6 +37,10 @@ export interface JobExecOptions {
   cwd?: string;
   /** EXTRA environment entries merged over the parent env. */
   env?: Record<string, string | undefined>;
+  /** c6: abort → the child is killed (server `cancel` / graceful-shutdown
+   *  drain). The result resolves through the normal path with a null code.
+   *  An already-aborted signal skips the spawn entirely. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -74,6 +78,11 @@ export function nodeJobExec(): JobExec {
         };
         let stdout = '';
         let stderr = '';
+        // c6: cancel/shutdown abort — never spawn on an already-dead signal.
+        if (opts.signal?.aborted) {
+          settle({ code: null, stdout, stderr, error: 'aborted before spawn' });
+          return;
+        }
         try {
           const child = spawn(cmd, args, {
             cwd: opts.cwd,
@@ -81,6 +90,17 @@ export function nodeJobExec(): JobExec {
             stdio: ['ignore', 'pipe', 'pipe'],
             windowsHide: true,
           });
+          // c6: abort → kill the child (SIGTERM; TerminateProcess on Windows —
+          // drive's per-step state is durable, so a killed child is exactly
+          // the crash case the resume machinery already covers).
+          const onAbort = (): void => {
+            try {
+              child.kill();
+            } catch {
+              /* already gone */
+            }
+          };
+          opts.signal?.addEventListener('abort', onAbort, { once: true });
           child.stdout.on('data', (chunk: Buffer) => {
             stdout += chunk.toString('utf8');
           });
@@ -89,9 +109,11 @@ export function nodeJobExec(): JobExec {
           });
           child.on('error', (err) => {
             const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : null;
+            opts.signal?.removeEventListener('abort', onAbort);
             settle({ code, stdout, stderr, error: err.message });
           });
           child.on('close', (code) => {
+            opts.signal?.removeEventListener('abort', onAbort);
             settle({ code, stdout, stderr });
           });
         } catch (err) {

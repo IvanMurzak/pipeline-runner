@@ -186,3 +186,32 @@ describe('HeartbeatLoop liveness', () => {
     loop.stop();
   });
 });
+
+describe('HeartbeatLoop onBeat hook (c6 record-touch writer)', () => {
+  test('fires once per beat, before the frame is composed', () => {
+    const beats: number[] = [];
+    const { loop, clock, sent } = makeLoop({
+      onBeat: () => beats.push(sent.length), // captured length BEFORE the frame is pushed
+    });
+    loop.start();
+    clock.advance(10_000);
+    loop.handleAck({ type: 'heartbeat_ack', id: 'hb-1' });
+    clock.advance(10_000);
+    expect(sent).toHaveLength(2);
+    expect(beats).toEqual([0, 1]); // one hook call per beat, each before its send
+    loop.stop();
+  });
+
+  test('a throwing onBeat never blocks the beat itself', () => {
+    const { loop, clock, sent, logger } = makeLoop({
+      onBeat: () => {
+        throw new Error('store on fire');
+      },
+    });
+    loop.start();
+    clock.advance(10_000);
+    expect(sent).toHaveLength(1); // beat went out regardless
+    expect(logger.joined()).toContain('onBeat hook failed');
+    loop.stop();
+  });
+});

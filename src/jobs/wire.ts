@@ -29,8 +29,14 @@
  * frame BUILDERS are runner-local helpers the package does not provide.
  */
 
-import { LeaseMessageSchema } from '@baizor/pipeline-protocol';
-import type { AcceptMessage, LeaseMessage, RunStatusMessage, RunStatusPhase } from '@baizor/pipeline-protocol';
+import { CancelMessageSchema, LeaseMessageSchema } from '@baizor/pipeline-protocol';
+import type {
+  AcceptMessage,
+  CancelMessage,
+  LeaseMessage,
+  RunStatusMessage,
+  RunStatusPhase,
+} from '@baizor/pipeline-protocol';
 import type { WireFrame } from '../core/wire';
 
 // ── Protocol surface re-exported from the published package ─────────────────
@@ -39,6 +45,7 @@ export { RUN_STATUS_PHASES, TASK_PIPELINE_UNRESOLVED } from '@baizor/pipeline-pr
 
 export type {
   AcceptMessage,
+  CancelMessage,
   ExecutionOverrides,
   LeaseMessage,
   LeaseTask,
@@ -61,6 +68,15 @@ export type {
  */
 export function isLeaseMessage(frame: WireFrame): frame is LeaseMessage {
   return LeaseMessageSchema.safeParse(frame).success;
+}
+
+/**
+ * Narrow a frame to a well-formed `cancel` (c6 — the runner-side cancel
+ * HANDLER; previously RESERVED_UNHANDLED). Same guard pattern as the lease:
+ * boolean over the ORIGINAL frame, extras ride through.
+ */
+export function isCancelMessage(frame: WireFrame): frame is CancelMessage {
+  return CancelMessageSchema.safeParse(frame).success;
 }
 
 // ── Frame builders (runner-local; the package ships schemas, not builders) ──

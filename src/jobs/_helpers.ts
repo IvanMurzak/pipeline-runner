@@ -6,6 +6,8 @@
  */
 
 import type { WireFrame } from '../core/wire';
+import type { JobRecord } from './job-store';
+import type { SubstrateProbe } from './reconcile';
 import type { JobExec, JobExecOptions, JobExecResult } from './types';
 import type { JobFs } from './types';
 import { TASK_PIPELINE_UNRESOLVED, type LeaseMessage, type LeaseTask } from './wire';
@@ -193,3 +195,65 @@ export const DRIVE_PROVIDER_LIMIT: JobExecResult = {
   stdout: '',
   stderr: 'claude: usage limit reached — resets later',
 };
+
+// ── c6: job-record + reconcile fixtures ─────────────────────────────────────
+
+/** A well-formed recoverable job record (phase `running`); override per test.
+ *  Paths deliberately mirror the makeLease fixture's derived workspace. */
+export function makeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
+  const checkout = overrides.checkout_dir ?? '/w/job-old';
+  return {
+    job_id: 'job-old',
+    run_id: 'run-1',
+    attempt: 1,
+    pipeline_ref: { repo: 'git@example.com:acme/api.git', ref: 'main', pipeline: 'release', content_hash: null },
+    checkout_dir: checkout,
+    pipeline_root: `${checkout}/.claude/pipeline/release`,
+    start_iteration: 'steps/01-plan.md',
+    lease_ttl_s: 90,
+    secret_slugs: [],
+    phase: 'running',
+    paused_until: null,
+    consecutive_pauses: 0,
+    questions: [],
+    accepted_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+/** A substrate probe scripted per test (everything present by default). */
+export function makeProbe(overrides: Partial<SubstrateProbe> = {}): SubstrateProbe {
+  return {
+    checkoutExists: () => true,
+    nextJsonExists: () => true,
+    transcriptsPresent: () => true,
+    ...overrides,
+  };
+}
+
+/**
+ * An exec whose non-git commands HANG until the c6 abort signal fires (the
+ * cancel/suspend seam) — resolves `{code:null, error:'aborted'}` on abort,
+ * exactly like a killed child through `nodeJobExec`.
+ */
+export class AbortableHangExec implements JobExec {
+  calls: RanJobCommand[] = [];
+
+  async run(cmd: string, args: string[], opts: JobExecOptions = {}): Promise<JobExecResult> {
+    this.calls.push({ cmd, args, opts });
+    if (cmd === 'git') return GIT_OK;
+    return new Promise((resolve) => {
+      const settle = (): void => resolve({ code: null, stdout: '', stderr: '', error: 'aborted' });
+      if (opts.signal?.aborted) {
+        settle();
+        return;
+      }
+      opts.signal?.addEventListener('abort', settle, { once: true });
+    });
+  }
+
+  of(cmd: string): RanJobCommand[] {
+    return this.calls.filter((call) => call.cmd === cmd);
+  }
+}

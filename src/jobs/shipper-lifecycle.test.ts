@@ -244,3 +244,106 @@ describe('createShipperLifecycle — default transport (WireUploadTransport over
     await settle();
   });
 });
+
+describe('createShipperLifecycle — c6 ordered completion + shutdown drain', () => {
+  test('onTerminalFlush ships the terminal journal events BEFORE resolving (the c5 race closer)', async () => {
+    const fs = new MemShipperFs();
+    const transport = new FakeUploadTransport();
+    const clock = new FakeClock();
+    const context = makeContext();
+    const journalPath = journalPathFor(context);
+    const lifecycle = createShipperLifecycle({
+      send: () => true,
+      dispatcher: new Dispatcher(),
+      fs,
+      clock,
+      transport,
+      stateDirFor: () => 'state/job-1',
+    });
+    lifecycle.onWorkspaceReady(context);
+
+    // Terminal events land in the journal; NO timers have fired yet.
+    fs.appendText(
+      journalPath,
+      journalLine('run.started', 'run-1') + journalLine('run.completed', 'run-1', { outcome: 'completed' })
+    );
+    await lifecycle.onTerminalFlush('job-1');
+    // The flush await alone (no clock advance) got the terminal events out.
+    // No .stats record was seeded, so there is no stats fold — just the two
+    // journal events, both shipped before onTerminalFlush resolved.
+    expect(transport.confirmedSeqs('run-1')).toEqual([1, 2]);
+  });
+
+  test('onTerminalFlush for a job with no shipper resolves immediately (prep failure path)', async () => {
+    const lifecycle = createShipperLifecycle({
+      send: () => true,
+      dispatcher: new Dispatcher(),
+      fs: new MemShipperFs(),
+      clock: new FakeClock(),
+      transport: new FakeUploadTransport(),
+      stateDirFor: () => 'state/x',
+    });
+    await lifecycle.onTerminalFlush('never-readied'); // no throw, no hang
+  });
+
+  test('onJobFinished after onTerminalFlush is a no-op (already flushed + removed)', async () => {
+    const fs = new MemShipperFs();
+    const transport = new FakeUploadTransport();
+    const lifecycle = createShipperLifecycle({
+      send: () => true,
+      dispatcher: new Dispatcher(),
+      fs,
+      clock: new FakeClock(),
+      transport,
+      stateDirFor: () => 'state/job-1',
+    });
+    lifecycle.onWorkspaceReady(makeContext());
+    await lifecycle.onTerminalFlush('job-1');
+    const uploads = transport.attempts.length;
+    lifecycle.onJobFinished({ job_id: 'job-1', run_id: 'run-1', ok: true, outcome: 'completed' });
+    await settle();
+    expect(transport.attempts.length).toBe(uploads); // nothing re-shipped
+  });
+
+  test('stopAll drains every active shipper (graceful shutdown)', async () => {
+    const fs = new MemShipperFs();
+    const transport = new FakeUploadTransport();
+    const clock = new FakeClock();
+    const contextA = makeContext({ dir: join('/w', 'job-A'), job_id: 'job-A', run_id: 'run-A' });
+    const contextB = makeContext({ dir: join('/w', 'job-B'), job_id: 'job-B', run_id: 'run-B' });
+    const lifecycle = createShipperLifecycle({
+      send: () => true,
+      dispatcher: new Dispatcher(),
+      fs,
+      clock,
+      transport,
+      stateDirFor: (journal) => `state/${journal.includes('job-A') ? 'a' : 'b'}`,
+    });
+    lifecycle.onWorkspaceReady(contextA);
+    lifecycle.onWorkspaceReady(contextB);
+    fs.appendText(journalPathFor(contextA), journalLine('run.started', 'run-A'));
+    fs.appendText(journalPathFor(contextB), journalLine('run.started', 'run-B'));
+
+    await lifecycle.stopAll();
+    expect(transport.confirmedSeqs('run-A')).toEqual([1]);
+    expect(transport.confirmedSeqs('run-B')).toEqual([1]);
+  });
+
+  test('a context-carried event_seq_base fences the shipper seqs (06.8.2)', async () => {
+    const fs = new MemShipperFs();
+    const transport = new FakeUploadTransport();
+    const context = makeContext({ event_seq_base: 3_000_000 });
+    const lifecycle = createShipperLifecycle({
+      send: () => true,
+      dispatcher: new Dispatcher(),
+      fs,
+      clock: new FakeClock(),
+      transport,
+      stateDirFor: () => 'state/job-1',
+    });
+    lifecycle.onWorkspaceReady(context);
+    fs.appendText(journalPathFor(context), journalLine('run.started', 'run-1'));
+    await lifecycle.onTerminalFlush('job-1');
+    expect(transport.confirmedSeqs('run-1')).toEqual([3_000_001]);
+  });
+});
