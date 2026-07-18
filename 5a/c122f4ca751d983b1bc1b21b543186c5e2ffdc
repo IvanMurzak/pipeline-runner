@@ -1,0 +1,77 @@
+README.md
+  s_c674308ae269e9::t_cc2d0c4f50924d 52-80
+bun.lock
+  s_c674308ae269e9::t_22756f209bdfe2 8,17
+package.json
+  s_c674308ae269e9::t_46294386d55430 33
+src/cli.ts
+  s_c674308ae269e9::t_851693f87bc7d9 16,24,28-39,158-161,175-180,185-188,212-222,227,234-237,239-272
+src/core/connection.ts
+  s_c674308ae269e9::t_dee7978bd2699d 80-82,272
+src/core/dispatcher.ts
+  s_c674308ae269e9::t_54320747edcb87 20-24
+src/core/heartbeat.ts
+  s_c674308ae269e9::t_090297b483c897 67-70,156-160
+src/jobs/_helpers.ts
+  s_c674308ae269e9::t_006c2540b0478f 9-10,198-259
+src/jobs/executor.test.ts
+  s_c674308ae269e9::t_7766f6c886d476 5,15,17-18,24,62-64,642-948
+src/jobs/executor.ts
+  s_c674308ae269e9::t_c5710ebc007e20 25-54,60,63-65,84-91,93,104-107,110,146-149,153-170,192-196,230-233,260-268,308-374,381-383,394,409,415-416,420-421,423,426-432,439,445-447,452,458,465-466,470-584,590,592-595,604,610-614,621-624,626,636-638,649,653-654,661-663,665-666,670,674,681-726,761-782
+src/jobs/index.ts
+  s_c674308ae269e9::t_e6b5f0290963c0 25-30
+src/jobs/job-store.test.ts
+  s_c674308ae269e9::t_4870833cbc2ade 1-121
+src/jobs/job-store.ts
+  s_c674308ae269e9::t_794b46d0e64caa 1-276
+src/jobs/manager.test.ts
+  s_c674308ae269e9::t_04e0aec3c816a8 5,7,16-17,21,23,286-751
+src/jobs/manager.ts
+  s_c674308ae269e9::t_e89b7498e0492d 2-3,5-28,34-39,42-43,46-47,49,55,63-66,68-69,76,80-86,116-124,131-132,137-138,140-149,155-164,167,169-174,177-180,189-192,208-351,376-377,394-405,409-524,526-538,558-560,564-567,569-570,574-575,579-580,583-586,588-622,624-655,666-668
+src/jobs/reconcile.test.ts
+  s_c674308ae269e9::t_a221c181f1a589 1-145
+src/jobs/reconcile.ts
+  s_c674308ae269e9::t_d282bf859f0e1b 1-147
+src/jobs/retention.test.ts
+  s_c674308ae269e9::t_e61353c14a0c21 1-62
+src/jobs/retention.ts
+  s_c674308ae269e9::t_4ed73a6aee54c9 1-92
+src/jobs/shipper-lifecycle.test.ts
+  s_c674308ae269e9::t_62e6d38e2a6b7b 247-349
+src/jobs/shipper-lifecycle.ts
+  s_c674308ae269e9::t_bed5f598ee99aa 72-79,81-83,85-92,94,99-109,129-135,148,150-153
+src/jobs/shutdown.test.ts
+  s_c674308ae269e9::t_5870fed4251377 1-75
+src/jobs/shutdown.ts
+  s_c674308ae269e9::t_2d27d01afc6472 1-88
+src/jobs/types.ts
+  s_c674308ae269e9::t_04e5d234473455 40-43,81-85,93-103,112,116
+src/jobs/wire.ts
+  s_c674308ae269e9::t_1ec820ede58f93 32-39,48,73-81
+src/jobs/workspace.ts
+  s_c674308ae269e9::t_76f655ec665922 269-272
+src/shipper/shipper.ts
+  s_c674308ae269e9::t_1948cb3cc6cc95 94-100,183-186
+tests/heartbeat.test.ts
+  s_c674308ae269e9::t_0409879fd0ee10 189-217
+tests/jobstate-integration.test.ts
+  s_c674308ae269e9::t_0cc57c710a6603 1-234
+tests/shipper.test.ts
+  s_c674308ae269e9::t_77750948780171 243-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "5ac122f4ca751d983b1bc1b21b543186c5e2ffdc",
+  "prompts": {},
+  "sessions": {
+    "s_c674308ae269e9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_c674308ae269e9",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
