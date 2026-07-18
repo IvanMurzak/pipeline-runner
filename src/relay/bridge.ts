@@ -213,10 +213,20 @@ export class NeedsInputRelay {
       return;
     }
     if (parsed.id !== undefined && parsed.id !== pending.id) {
-      // Correlation id echoed but does not match the frame we sent — treat as a
-      // mis-routed / stale echo and ignore (the pending question stays open).
-      this.logger.warn(`answer for run ${runId} question ${questionId} correlation id mismatch — ignored`);
-      return;
+      // Correlation-id skew is EXPECTED after a daemon restart: this pending
+      // map died with the old process, so the resume re-surfaced the question
+      // under a FRESH correlation id, while the server's stored record — and
+      // any answer staged against it while we were down — still echoes the
+      // ORIGINAL frame's id (the server's store keeps the first record on
+      // idempotent re-surface). (run_id, question_id) is the durable identity
+      // drive minted for the park (design 06.2.1) and the composite-key match
+      // above is authoritative — deliver, and log the skew for observability.
+      // Dropping here strands the run parked forever: the server has already
+      // retired the staged answer as delivered (e7-p4 kill-drill finding).
+      this.logger.info(
+        `answer for run ${runId} question ${questionId} carries a stale correlation id ` +
+          `(daemon restarted since the question was first surfaced) — accepted on the (run_id, question_id) match`
+      );
     }
 
     // Resolve exactly once: remove BEFORE delivery so a duplicate answer racing
