@@ -22,21 +22,47 @@
  *     (never fails it), schedules a resume through the injectable clock, and
  *     re-enters drive with `--resume`. Heartbeats (owned by the connection)
  *     keep the lease alive throughout; `pausedUntil` is exposed for the
- *     heartbeat `paused_until` field (composition is a follow-up).
+ *     heartbeat `paused_until` field.
+ *
+ * c6 (design 04 — D1) additions:
+ *   - RESUME MODE (`options.resume`): skip prep entirely and re-enter
+ *     `pipeline drive --resume` in the RECORDED checkout — the startup
+ *     reconcile's FRESH path (silent: no `run_status started`, F1 "no cloud
+ *     state change at all") and the ADOPTION path (`announce: true` — a new
+ *     job_id the server just offered, so its `started` is reported). Phase-
+ *     specific re-entry: a `paused_provider_limit` record with a future
+ *     `paused_until` re-enters the pause window (no hammering); an
+ *     `awaiting_input` record does NOT spawn — it re-surfaces the stored
+ *     question through the relay and waits. A pinned `content_hash` is
+ *     RE-VERIFIED (c4's verifier) before any resume — a workspace that no
+ *     longer matches halts instead of resuming.
+ *   - DURABLE RECORD writes through the `record` port (the manager hands a
+ *     store-bound closure): phase transitions, pause windows, parked
+ *     questions — the substrate the reconcile classifies after a daemon death.
+ *   - ORDERED COMPLETION (c5 live finding: a run that COMPLETED runner-side
+ *     was clobbered to `crashed` because its heartbeat listing dropped before
+ *     the terminal events landed): every terminal path awaits
+ *     `events.onTerminalFlush` (the shipper's final flush + drain) BEFORE
+ *     sending the terminal `run_status`, and the manager only unlists the run
+ *     AFTER `start()` resolves — flush terminal events → send run_status →
+ *     release/stop listing.
+ *   - CANCEL (D8) / SUSPEND (graceful shutdown): `cancel()` aborts the drive
+ *     child, unblocks any pause/question wait, and settles WITHOUT a
+ *     `run_status` frame (the server initiated — it already disposed of the
+ *     run); the manager then deletes record + workspace. `suspend()` likewise
+ *     interrupts, but the record is LEFT INTACT (phase current) so the next
+ *     boot's reconcile resumes exactly there.
  *
  * NOT this module's job:
  *   - event shipping — the shipper tails the run's events independently; the
  *     `onWorkspaceReady` callback is the composition seam that tells it WHERE
  *     (workspace dir, pipeline root, run id, job JWT for ingest auth).
- *   - the needs-input WSS relay (T1-13) — `NeedsInputRelay` is the seam. The
- *     default auto-fails a parked question (no relay is attached yet); the
- *     relay task plugs in an implementation that round-trips the question to
- *     the control plane and resolves with the user's answer.
+ *   - the needs-input WSS relay (T1-13) — `NeedsInputRelay` is the seam.
  *
  * SECRETS: the lease's `job_jwt` is surfaced ONLY via `onWorkspaceReady` (the
- * shipper's ingest credential) and never logged; secret VALUES are not
- * delivered here at all (`secret_slugs` is names-only — delivery is a
- * follow-up task).
+ * shipper's ingest credential) and never logged OR PERSISTED (the job record
+ * carries no JWT — 04); secret VALUES are not delivered here at all
+ * (`secret_slugs` is names-only — delivery is a follow-up task).
  */
 
 import type { Clock } from '../core/clock';
@@ -55,9 +81,16 @@ import {
   type ProviderLimit,
   type ProviderLimitDetector,
 } from './drive';
-import { prepareWorkspace, type ContentHashVerifier, type PreparedWorkspace, type StartIterationResolver } from './workspace';
+import type { JobRecord, RecordedQuestion } from './job-store';
+import {
+  cliContentHashVerifier,
+  prepareWorkspace,
+  type ContentHashVerifier,
+  type PreparedWorkspace,
+  type StartIterationResolver,
+} from './workspace';
 import { buildRunStatusFrame, TASK_PIPELINE_UNRESOLVED, type LeaseMessage, type LeaseTask } from './wire';
-import type { JobExec, JobFs } from './types';
+import { JobError, type JobExec, type JobFs } from './types';
 
 export type JobState =
   | 'pending'
@@ -68,10 +101,13 @@ export type JobState =
   | 'completed'
   | 'failed';
 
-/** Terminal result of one job. */
+/** Terminal result of one job. `cancelled` marks a server-initiated cancel
+ *  (no run_status was sent; the manager deletes record + workspace);
+ *  `suspended` marks a graceful-shutdown interrupt (record left intact for
+ *  the next boot's reconcile). */
 export type JobResult =
   | { job_id: string; run_id: string; ok: true; outcome: string }
-  | { job_id: string; run_id: string; ok: false; reason: string };
+  | { job_id: string; run_id: string; ok: false; reason: string; cancelled?: boolean; suspended?: boolean };
 
 /** A parked needs-input question surfaced to the relay seam. */
 export interface ParkedQuestion {
@@ -107,10 +143,31 @@ export const autoFailNeedsInputRelay: NeedsInputRelay = {
 export interface JobWorkspaceContext extends PreparedWorkspace {
   job_id: string;
   run_id: string;
-  /** Ingest credential for job-scoped HTTPS calls. SECRET — never log. */
+  /** Ingest credential for job-scoped HTTPS calls. SECRET — never log.
+   *  EMPTY STRING on a reconcile (FRESH) resume: the in-memory JWT died with
+   *  the previous daemon and is never persisted (04) — the WSS upload
+   *  transport authenticates via the runner token, so shipping still works. */
   job_jwt: string;
   /** Declared secret NAMES (values are a follow-up delivery task). */
   secret_slugs: string[];
+  /** Attempt-fencing seq base (06.8.2): when the lease/record carries one,
+   *  the shipper starts this run's seq counter here. */
+  event_seq_base?: number;
+}
+
+/** The durable-record port (c6): a store-bound closure the manager hands the
+ *  executor so phase transitions persist without the executor knowing the
+ *  store. Absent ⇒ nothing persists (standalone/test use). */
+export interface JobRecordPort {
+  update(patch: Partial<JobRecord>): void;
+}
+
+/** Resume-mode input (c6): the durable record to re-enter, and whether to
+ *  announce a `run_status started` (adoption: yes — new job_id; reconcile
+ *  FRESH resume: no — F1 "no cloud state change at all"). */
+export interface ResumeContext {
+  record: JobRecord;
+  announce: boolean;
 }
 
 /** Default pause before the first provider-limit resume attempt. */
@@ -132,6 +189,11 @@ export interface JobExecutorEvents {
   onStateChange?(state: JobState): void;
   /** The shipper-composition seam: fired once the workspace is prepared. */
   onWorkspaceReady?(context: JobWorkspaceContext): void;
+  /** ORDERED COMPLETION (c6, c5 race): awaited BEFORE any terminal
+   *  `run_status` is sent — the shipper lifecycle implements it as the final
+   *  flush + drain of this job's journal, so the terminal events reach the
+   *  server before the frame that lets the cloud stop expecting them. */
+  onTerminalFlush?(jobId: string): Promise<void> | void;
   onFinished?(result: JobResult): void;
 }
 
@@ -165,6 +227,10 @@ export interface JobExecutorOptions {
    *  seam (`cliTaskPipelineResolver` — same binary as drive, so tests script
    *  it and never spawn). Non-task leases NEVER invoke it. */
   resolveTaskPipeline?: TaskPipelineResolver;
+  /** c6: the durable-record port (phase transitions persist through it). */
+  record?: JobRecordPort;
+  /** c6: resume mode — re-enter the recorded state instead of preparing. */
+  resume?: ResumeContext;
   clock?: Clock;
   logger?: Logger;
   makeId?(): string;
@@ -190,6 +256,15 @@ export class JobExecutor {
   private resumeEarly: (() => void) | null = null;
   private consecutivePauses = 0;
   private questions = 0;
+
+  // c6 interruption plumbing: `cancel()` (server cancel — no run_status) and
+  // `suspend()` (graceful shutdown — record kept) share one mechanism: abort
+  // the in-flight drive child, fire any pause/question waiter, and let the
+  // drive loop observe the flag at its next await boundary.
+  private cancelled_ = false;
+  private suspended_ = false;
+  private readonly abort = new AbortController();
+  private interruptWaiters: Array<() => void> = [];
 
   constructor(private readonly options: JobExecutorOptions) {
     this.clock = options.clock ?? systemClock;
@@ -230,11 +305,81 @@ export class JobExecutor {
     this.resumeEarly?.();
   }
 
+  /** Server `cancel` (c6, D8): kill the drive child, unblock any wait, settle
+   *  WITHOUT a run_status frame. The manager deletes record + workspace. */
+  cancel(): void {
+    if (this.cancelled_ || this.suspended_) return;
+    this.cancelled_ = true;
+    this.interruptNow();
+  }
+
+  /** Graceful-shutdown interrupt (c6): kill the drive child (its state is
+   *  durable per step), settle without reporting, LEAVE the record intact —
+   *  the next boot's reconcile resumes exactly here. */
+  suspend(): void {
+    if (this.cancelled_ || this.suspended_) return;
+    this.suspended_ = true;
+    this.interruptNow();
+  }
+
+  private interruptNow(): void {
+    this.abort.abort();
+    this.resumeEarly?.();
+    const waiters = this.interruptWaiters;
+    this.interruptWaiters = [];
+    for (const waiter of waiters) waiter();
+  }
+
+  /** A promise that resolves (with null) when cancel/suspend fires — raced
+   *  against the needs-input await so a parked job can be interrupted. */
+  private interrupted(): Promise<null> {
+    return new Promise((resolve) => {
+      if (this.cancelled_ || this.suspended_) {
+        resolve(null);
+        return;
+      }
+      this.interruptWaiters.push(() => resolve(null));
+    });
+  }
+
+  /** The pending interrupt's terminal result, or null when none fired. */
+  private interruptResult(): JobResult | null {
+    if (this.suspended_) {
+      const result: JobResult = {
+        job_id: this.jobId,
+        run_id: this.runId,
+        ok: false,
+        reason: 'suspended for shutdown',
+        suspended: true,
+      };
+      this.options.events?.onFinished?.(result);
+      this.logger.info(`job ${this.jobId}: suspended for shutdown (record kept)`);
+      return result;
+    }
+    if (this.cancelled_) {
+      this.setState('failed');
+      const result: JobResult = {
+        job_id: this.jobId,
+        run_id: this.runId,
+        ok: false,
+        reason: 'cancelled by server',
+        cancelled: true,
+      };
+      this.options.events?.onFinished?.(result);
+      this.logger.info(`job ${this.jobId}: cancelled by server`);
+      return result;
+    }
+    return null;
+  }
+
   /** Run the job to a terminal state. Resolves (never rejects) with the result. */
   async start(): Promise<JobResult> {
     if (this.state_ !== 'pending') {
       // Double-start guard: report the error without disturbing the live run.
       return { job_id: this.jobId, run_id: this.runId, ok: false, reason: 'executor already started' };
+    }
+    if (this.options.resume !== undefined) {
+      return this.startResume(this.options.resume);
     }
     const lease = this.options.lease;
     this.setState('preparing');
@@ -246,7 +391,7 @@ export class JobExecutor {
     const task = lease.task;
     if (task === undefined && lease.pipeline_ref.pipeline === TASK_PIPELINE_UNRESOLVED) {
       const reason = `lease pipeline is the task sentinel '${TASK_PIPELINE_UNRESOLVED}' but the lease carries no task payload`;
-      this.report('halted', { halt_reason: reason });
+      await this.reportTerminal('halted', { halt_reason: reason });
       return this.fail(reason);
     }
 
@@ -261,77 +406,193 @@ export class JobExecutor {
         gitBin: this.options.gitBin,
         // c4: the SAME binary drive shells out to — the DEFAULT hash-verify /
         // start-iteration resolvers (workspace.ts) use it to shell `pipeline
-        // hash`/`pipeline plan` when `verifyContentHash`/`resolveStartIteration`
-        // below are absent (previously unwired: prep always fell through to
-        // the warn-unverified / lexical-only defaults regardless of this
-        // field).
+        // hash`/`pipeline plan` when the seams below are absent.
         pipelineBin: this.pipelineBin,
         logger: this.logger,
         verifyContentHash: this.options.verifyContentHash,
         resolveStartIteration: this.options.resolveStartIteration,
         // T2-05 ADDITIVE: a task lease resolves its pipeline AFTER checkout
-        // via the dispatch matcher; a resolution failure (no match, matcher
-        // error) throws JobError and is reported through the SAME prep-failure
-        // path below (run_status halted → run FAILED — no new signaling). The
-        // seam only ever fires on the `@task` sentinel, so a non-task lease
-        // behaves exactly as T2-03.
+        // via the dispatch matcher; a resolution failure throws JobError and
+        // is reported through the SAME prep-failure path below.
         resolvePipeline: task === undefined ? undefined : (checkoutDir) => this.dispatchTask(checkoutDir, task),
       });
     } catch (err) {
+      const interrupted = this.interruptResult();
+      if (interrupted !== null) return interrupted;
       const reason = `workspace prep failed: ${err instanceof Error ? err.message : String(err)}`;
-      this.report('halted', { halt_reason: reason });
+      await this.reportTerminal('halted', { halt_reason: reason });
       return this.fail(reason);
     }
+    {
+      const interrupted = this.interruptResult();
+      if (interrupted !== null) return interrupted;
+    }
+    // c6: the record gains its resume substrate the moment it exists —
+    // pipeline_root + start_iteration are what the reconcile drives from.
+    this.options.record?.update({ pipeline_root: workspace.pipelineRoot, start_iteration: workspace.startIteration });
     this.options.events?.onWorkspaceReady?.({
       ...workspace,
       job_id: lease.job_id,
       run_id: lease.run_id,
       job_jwt: lease.job_jwt,
       secret_slugs: lease.secret_slugs,
+      ...(lease.event_seq_base !== undefined ? { event_seq_base: lease.event_seq_base } : {}),
     });
 
     // The `variables_applied` echo (names only, NEVER values — [06 §5]): the
     // ONLY way cloud can detect a pre-d1 runner silently dropping the lease's
     // `variables` field. Present (even as `[]`) iff the lease carries the
-    // field at all (`!== undefined`, the SAME presence check `driveTarget`
-    // uses below for this lease field); a lease predating it omits
-    // `variables_applied` entirely, keeping the `started` frame byte-identical
-    // to today. Sorted for the same determinism reason as buildDriveArgs's
-    // `--var` ordering. Computed and reported HERE — immediately after
-    // `onWorkspaceReady`, exactly where `setState('running')`/`report('started')`
-    // have always fired — rather than after the drive-target assembly below,
-    // so a future bug in THAT assembly can never delay or swallow this report
-    // (`start()` never rejects by contract).
+    // field at all; a lease predating it omits `variables_applied` entirely,
+    // keeping the `started` frame byte-identical to today. Sorted for the
+    // same determinism reason as buildDriveArgs's `--var` ordering.
     const variablesApplied =
       lease.variables !== undefined ? Object.keys(lease.variables).sort((a, b) => a.localeCompare(b)) : undefined;
 
     this.setState('running');
+    this.options.record?.update({ phase: 'running' });
     this.report('started', { variables_applied: variablesApplied });
     this.logger.info(`job ${lease.job_id}: drive starting (run ${lease.run_id})`);
 
     // T3-06: a matrix cell's execution_overrides become RUN-LEVEL drive
     // defaults, derived ONCE so every invocation (start / resume / answer)
-    // carries the same model + effort. An absent/empty override yields a target
-    // with no default fields ⇒ buildDriveArgs emits no extra flags (unchanged).
+    // carries the same model + effort.
     const overrides = lease.execution_overrides;
-    // env-variables design (task d1): the lease's frozen `PP_*` map, if any —
-    // mapped to `--var` on the START invocation ONLY (buildDriveArgs enforces
-    // this structurally; see its doc). Absent ⇒ no field ⇒ no flags, ever.
     const driveTarget: DriveTarget = {
       pipelineRoot: workspace.pipelineRoot,
       runId: lease.run_id,
       ...(overrides?.model ? { defaultModel: overrides.model } : {}),
       ...(overrides?.effort ? { defaultEffort: overrides.effort } : {}),
+      // env-variables d1: the lease's frozen `PP_*` map — `--var` on the START
+      // invocation ONLY (buildDriveArgs enforces this structurally).
       ...(lease.variables !== undefined ? { variables: lease.variables } : {}),
     };
 
-    let mode: DriveMode = { kind: 'start', startIteration: workspace.startIteration };
+    return this.driveLoop(workspace, driveTarget, { kind: 'start', startIteration: workspace.startIteration });
+  }
+
+  /**
+   * c6 resume mode: re-enter a recorded run in its RECORDED checkout. No
+   * prep, no wipe; a pinned `content_hash` is re-verified first (04 reconcile
+   * step 4 / 06.4); phase-specific re-entry for pause windows and parked
+   * questions. `announce` (adoption) sends the new job's `run_status started`;
+   * a reconcile FRESH resume stays silent (F1).
+   */
+  private async startResume(resume: ResumeContext): Promise<JobResult> {
+    const lease = this.options.lease;
+    const record = resume.record;
+    if (record.pipeline_root === null || record.start_iteration === null) {
+      // Callers only resume classified-recoverable records; this is a guard.
+      const reason = 'resume state incomplete (no recorded pipeline root)';
+      await this.reportTerminal('halted', { halt_reason: reason });
+      return this.fail(reason);
+    }
+    const workspace: PreparedWorkspace = {
+      dir: record.checkout_dir,
+      pipelineRoot: record.pipeline_root,
+      startIteration: record.start_iteration,
+    };
+
+    // Re-verify a pinned content hash before ANY resume (04: "a workspace
+    // that no longer matches halts instead of resuming").
+    const pinned = record.pipeline_ref.content_hash;
+    if (pinned !== undefined && pinned !== null) {
+      const verify =
+        this.options.verifyContentHash ??
+        cliContentHashVerifier({ exec: this.options.exec, pipelineBin: this.pipelineBin, logger: this.logger });
+      try {
+        const ok = await verify(workspace.pipelineRoot, pinned);
+        if (!ok) throw new JobError(`pipeline content hash mismatch: workspace no longer matches pinned ${pinned}`);
+      } catch (err) {
+        const reason = `resume refused: ${err instanceof Error ? err.message : String(err)}`;
+        await this.reportTerminal('halted', { halt_reason: reason });
+        return this.fail(reason);
+      }
+    }
+
+    // Restore the counters the record persisted (pause ladder position and
+    // question budget survive the daemon death).
+    this.consecutivePauses = record.consecutive_pauses;
+    this.questions = record.questions.length;
+
+    this.options.events?.onWorkspaceReady?.({
+      ...workspace,
+      job_id: lease.job_id,
+      run_id: lease.run_id,
+      job_jwt: lease.job_jwt,
+      secret_slugs: lease.secret_slugs,
+      ...(record.event_seq_base !== undefined ? { event_seq_base: record.event_seq_base } : {}),
+    });
+
+    if (resume.announce) {
+      // Adoption: the server just offered THIS job_id — report its lifecycle
+      // start (no variables echo: variables are frozen at run init and never
+      // re-sent on resume).
+      this.report('started');
+    }
+    this.logger.info(
+      `job ${lease.job_id}: resuming run ${lease.run_id} in recorded checkout ${record.checkout_dir} (phase ${record.phase})`
+    );
+
+    const overrides = lease.execution_overrides ?? record.execution_overrides;
+    const driveTarget: DriveTarget = {
+      pipelineRoot: workspace.pipelineRoot,
+      runId: lease.run_id,
+      ...(overrides?.model ? { defaultModel: overrides.model } : {}),
+      ...(overrides?.effort ? { defaultEffort: overrides.effort } : {}),
+      // NEVER variables on a resume: frozen at init (D11), structurally
+      // dropped by buildDriveArgs for non-start modes anyway.
+    };
+
+    // Phase-specific re-entry (04 reconcile step 3).
+    if (record.phase === 'awaiting_input' && record.questions.length > 0) {
+      // Do NOT spawn — re-surface the stored question and wait for the answer.
+      const stored = record.questions[record.questions.length - 1]!;
+      this.setState('awaiting_input');
+      const answered = await this.askRelay(this.parkedFromRecord(stored));
+      if (answered.settled !== null) return answered.settled;
+      this.setState('running');
+      this.options.record?.update({ phase: 'running', questions: [] });
+      return this.driveLoop(workspace, driveTarget, {
+        kind: 'answer',
+        startIteration: stored.iteration_path,
+        answer: answered.answer,
+      });
+    }
+
+    if (record.phase === 'paused_provider_limit' && record.paused_until !== null) {
+      const remaining = Date.parse(record.paused_until) - this.clock.now();
+      if (Number.isFinite(remaining) && remaining > 0) {
+        // Re-enter the pause window — no hammering the provider (F4).
+        this.pausedUntil_ = record.paused_until;
+        this.setState('paused_provider_limit');
+        this.logger.info(`job ${lease.job_id}: restoring provider-limit pause until ${record.paused_until}`);
+        await this.pause(remaining);
+        this.pausedUntil_ = null;
+        const interrupted = this.interruptResult();
+        if (interrupted !== null) return interrupted;
+      }
+    }
+
+    this.setState('running');
+    this.options.record?.update({ phase: 'running', paused_until: null });
+    return this.driveLoop(workspace, driveTarget, { kind: 'resume' });
+  }
+
+  /** The shared drive loop: invoke → detect limit → classify → repeat. */
+  private async driveLoop(workspace: PreparedWorkspace, driveTarget: DriveTarget, initial: DriveMode): Promise<JobResult> {
+    const lease = this.options.lease;
+    let mode: DriveMode = initial;
     for (;;) {
       const args = buildDriveArgs(driveTarget, mode);
       const result = await this.options.exec.run(this.pipelineBin, args, {
         cwd: workspace.dir,
         env: this.options.env,
+        signal: this.abort.signal,
       });
+      {
+        const interrupted = this.interruptResult();
+        if (interrupted !== null) return interrupted;
+      }
 
       // Provider limit takes precedence over exit-code classification: the job
       // PAUSES (auto-resume) instead of failing. Heartbeats keep the lease.
@@ -340,19 +601,29 @@ export class JobExecutor {
         this.consecutivePauses += 1;
         if (this.consecutivePauses > this.maxPauses) {
           const reason = `provider limit persisted through ${this.maxPauses} pauses: ${limit.reason}`;
-          this.report('halted', { halt_reason: reason });
+          await this.reportTerminal('halted', { halt_reason: reason });
           return this.fail(reason);
         }
         const pauseMs = this.pauseMsFor(this.consecutivePauses - 1, limit);
         this.pausedUntil_ = new Date(this.clock.now() + pauseMs).toISOString();
         this.setState('paused_provider_limit');
+        this.options.record?.update({
+          phase: 'paused_provider_limit',
+          paused_until: this.pausedUntil_,
+          consecutive_pauses: this.consecutivePauses,
+        });
         this.logger.info(
           `job ${lease.job_id}: provider limit (${limit.reason}) — paused until ${this.pausedUntil_} ` +
             `(pause ${this.consecutivePauses}/${this.maxPauses})`
         );
         await this.pause(pauseMs);
         this.pausedUntil_ = null;
+        {
+          const interrupted = this.interruptResult();
+          if (interrupted !== null) return interrupted;
+        }
         this.setState('running');
+        this.options.record?.update({ phase: 'running', paused_until: null });
         this.logger.info(`job ${lease.job_id}: resuming after provider-limit pause`);
         mode = { kind: 'resume' };
         continue;
@@ -362,7 +633,9 @@ export class JobExecutor {
       const outcome = classifyDriveOutcome(result);
       switch (outcome.kind) {
         case 'completed': {
-          this.report('completed', { outcome: outcome.outcome });
+          // ORDERED COMPLETION (c6): terminal events flush BEFORE run_status,
+          // and the manager unlists the run only after start() resolves.
+          await this.reportTerminal('completed', { outcome: outcome.outcome });
           this.setState('completed');
           const done: JobResult = { job_id: lease.job_id, run_id: lease.run_id, ok: true, outcome: outcome.outcome };
           this.options.events?.onFinished?.(done);
@@ -373,55 +646,84 @@ export class JobExecutor {
           this.questions += 1;
           if (this.questions > this.maxQuestions) {
             const reason = `needs-input question limit reached (${this.maxQuestions})`;
-            this.report('halted', { halt_reason: reason });
+            await this.reportTerminal('halted', { halt_reason: reason });
             return this.fail(reason);
           }
           this.setState('awaiting_input');
-          // 06.2.2: drive's park JSON carries the question_id (b2's
-          // `pipeline-cli` contract, 06.2.1) — use it verbatim so the relay
-          // and drive's OWN session file agree on the identity. An older CLI
-          // that predates the field reports `question_id: null`; the
-          // executor mints a fallback ONLY in that case (never overrides a
-          // drive-provided id).
+          // 06.2.2: drive's park JSON carries the question_id — use it
+          // verbatim; mint a fallback ONLY for an older CLI that omits it.
           const parked: ParkedQuestion = {
             job_id: lease.job_id,
             run_id: lease.run_id,
             ...outcome.parked,
             question_id: outcome.parked.question_id ?? this.makeId(),
           };
-          let answer: string | null;
-          try {
-            answer = await this.needsInput.onQuestion(parked);
-          } catch (err) {
-            const reason = `needs-input relay failed: ${err instanceof Error ? err.message : String(err)}`;
-            this.report('halted', { halt_reason: reason });
-            return this.fail(reason);
-          }
-          if (answer === null || answer.trim().length === 0) {
-            const reason = 'run parked on a needs-input question and no relay/answer is available (T1-13 not wired)';
-            this.report('halted', { halt_reason: reason });
-            return this.fail(reason);
-          }
+          this.options.record?.update({ phase: 'awaiting_input', questions: [this.recordedFromParked(parked)] });
+          const answered = await this.askRelay(parked);
+          if (answered.settled !== null) return answered.settled;
           this.setState('running');
-          mode = { kind: 'answer', startIteration: outcome.parked.iteration_path, answer };
+          this.options.record?.update({ phase: 'running', questions: [] });
+          mode = { kind: 'answer', startIteration: outcome.parked.iteration_path, answer: answered.answer };
           continue;
         }
         case 'halted': {
-          this.report('halted', { halt_reason: outcome.reason });
+          await this.reportTerminal('halted', { halt_reason: outcome.reason });
           return this.fail(outcome.reason);
         }
         case 'failed': {
-          this.report('halted', { halt_reason: outcome.reason });
+          await this.reportTerminal('halted', { halt_reason: outcome.reason });
           return this.fail(outcome.reason);
         }
       }
     }
   }
 
-  /** T2-05 ADDITIVE: resolve a task lease's pipeline (dispatch matcher seam).
-   *  Returns the resolved pipeline identity for workspace prep to continue
-   *  with; the resolved identity then flows to the server through the normal
-   *  event upload (the shipper tails the resolved pipeline root). */
+  /** Ask the relay for an answer, racing server cancel / shutdown suspend.
+   *  Returns either the answer text or the settled terminal result. */
+  private async askRelay(parked: ParkedQuestion): Promise<{ answer: string; settled: null } | { answer: null; settled: JobResult }> {
+    let answer: string | null;
+    try {
+      answer = await Promise.race([Promise.resolve(this.needsInput.onQuestion(parked)), this.interrupted()]);
+    } catch (err) {
+      const reason = `needs-input relay failed: ${err instanceof Error ? err.message : String(err)}`;
+      await this.reportTerminal('halted', { halt_reason: reason });
+      return { answer: null, settled: this.fail(reason) };
+    }
+    {
+      const interrupted = this.interruptResult();
+      if (interrupted !== null) return { answer: null, settled: interrupted };
+    }
+    if (answer === null || answer.trim().length === 0) {
+      const reason = 'run parked on a needs-input question and no relay/answer is available (T1-13 not wired)';
+      await this.reportTerminal('halted', { halt_reason: reason });
+      return { answer: null, settled: this.fail(reason) };
+    }
+    return { answer, settled: null };
+  }
+
+  private parkedFromRecord(stored: RecordedQuestion): ParkedQuestion {
+    return {
+      job_id: this.jobId,
+      run_id: this.runId,
+      question_id: stored.question_id,
+      step_id: stored.step_id,
+      iteration_path: stored.iteration_path,
+      session_id: stored.session_id,
+      question: stored.question,
+    };
+  }
+
+  private recordedFromParked(parked: ParkedQuestion): RecordedQuestion {
+    return {
+      question_id: parked.question_id,
+      step_id: parked.step_id,
+      iteration_path: parked.iteration_path,
+      session_id: parked.session_id,
+      question: parked.question,
+    };
+  }
+
+  /** T2-05 ADDITIVE: resolve a task lease's pipeline (dispatch matcher seam). */
   private async dispatchTask(checkoutDir: string, task: LeaseTask): Promise<string> {
     const resolution = await this.taskResolver({ checkoutDir, task });
     this.logger.info(
@@ -454,6 +756,28 @@ export class JobExecutor {
       // (shipper's transport retries); lifecycle frames are best-effort.
       this.logger.warn(`job ${this.jobId}: run_status '${phase}' not sent (connection not online)`);
     }
+  }
+
+  /**
+   * ORDERED COMPLETION (c6, closing the runner's side of the c5 race): await
+   * the shipper's terminal flush BEFORE the terminal `run_status` frame, so
+   * by the time the cloud sees the frame — and by the time this run drops out
+   * of `active_run_ids` (which only happens after `start()` resolves) — the
+   * terminal events are already on their way up. A flush failure is contained
+   * (logged): the frame still goes out; the spool retries in the background.
+   */
+  private async reportTerminal(
+    phase: 'completed' | 'halted',
+    detail?: { outcome?: string; halt_reason?: string }
+  ): Promise<void> {
+    try {
+      await this.options.events?.onTerminalFlush?.(this.jobId);
+    } catch (err) {
+      this.logger.warn(
+        `job ${this.jobId}: terminal event flush failed (${err instanceof Error ? err.message : String(err)}) — sending run_status anyway`
+      );
+    }
+    this.report(phase, detail);
   }
 
   /** Wait out a provider-limit pause on the injectable clock. */

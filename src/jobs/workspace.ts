@@ -266,7 +266,10 @@ export async function prepareWorkspace(options: PrepareWorkspaceOptions): Promis
   const dir = join(options.root, sanitizeJobId(options.jobId));
 
   // Fresh per-job directory: a stale one (crashed prior attempt) is removed —
-  // no cross-job (or cross-attempt) leakage.
+  // no cross-job (or cross-attempt) leakage. c6 (04 §lifecycle): this stale-
+  // wipe applies to NON-RESUME preps only, structurally — the resume/adoption
+  // paths never call prepareWorkspace at all (the recorded checkout IS the
+  // resume substrate; wiping it here would destroy exactly what D1 preserves).
   fs.mkdirp(options.root);
   if (fs.exists(dir)) {
     logger.info(`removing stale workspace at ${dir}`);

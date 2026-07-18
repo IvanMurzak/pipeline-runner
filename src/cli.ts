@@ -13,6 +13,7 @@
  *   status   Print the stored identity (token redacted).
  */
 
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { AGENT_VERSION, ConfigStore, defaultConfigDir, describeIdentity, detectOs, type AgentIdentity } from './core/config';
@@ -20,10 +21,22 @@ import { AgentClient } from './core/connection';
 import { consoleLogger } from './core/log';
 import { defaultTransports } from './core/transport';
 import type { RunnerStatus } from './core/wire';
+import { defaultDataDir, nodeShipperFs } from './shipper/fs';
 // T2-03: job execution (lease → accept → workspace → drive) lives in ./jobs.
 // c2: the event-shipper composition (onWorkspaceReady → EventShipper) also
 // lives there (./jobs/shipper-lifecycle) — see `createShipperLifecycle` below.
-import { attachJobExecution, createShipperLifecycle, type JobManager } from './jobs';
+// c6 (design 04 — D1): durable job records + startup reconcile + retention GC
+// + graceful shutdown; construction order in `runStart` is load-bearing.
+import {
+  attachJobExecution,
+  createGracefulShutdown,
+  createShipperLifecycle,
+  DEFAULT_RETENTION_SWEEP_INTERVAL_MS,
+  fsSubstrateProbe,
+  JobStore,
+  resolveRetentionPolicy,
+  type JobManager,
+} from './jobs';
 // c3 (T1-13): the needs-input relay bridge + its pull->push adapter — see
 // `runStart` below for the construction order. `NeedsInputRelay` is aliased
 // because `./jobs` exports a DIFFERENT interface of the same name (the
@@ -142,6 +155,10 @@ function runStart(): void {
   // forward reference is safe (mirrors the `manager` pattern above).
   let relayBridge: NeedsInputRelayBridge;
 
+  // c6: local drain flag — set by the graceful-shutdown routine below; the
+  // manager's `draining()` reads it alongside the server's drain directive.
+  let shuttingDown = false;
+
   const client = new AgentClient({
     store,
     transports: defaultTransports(identity.base_url, consoleLogger),
@@ -155,11 +172,20 @@ function runStart(): void {
       // NOT the same gap as E12/06.2.4 (an answer POSTed to the CLOUD while
       // the runner was offline needing cloud-side `redeliverQueuedAnswers`
       // on register/reconnect) — that is a separate, P4, cloud-side change.
-      onOnline: () => relayBridge.resurfacePending(),
+      // c6: also flush the reconcile's deferred `run_status halted` frames
+      // (UNRECOVERABLE drops happen pre-connect — best-effort, once online).
+      onOnline: () => {
+        relayBridge.resurfacePending();
+        manager?.flushDeferredReports();
+      },
     },
     activeRunIds: () => manager?.activeRunIds() ?? [],
     runnerStatus: (): RunnerStatus => manager?.runnerStatus() ?? 'online',
     pausedUntil: () => manager?.pausedUntil() ?? null,
+    // c6: the heartbeat-tick record writer (04) — each beat renews every
+    // active job record's `updated_at`, keeping a live runner's records
+    // FRESH for the reconcile.
+    onBeat: () => manager?.touchActiveRecords(),
   });
 
   // c3 (T1-13): construct ONE needs-input relay bridge + its pull->push
@@ -183,20 +209,67 @@ function runStart(): void {
     logger: consoleLogger,
   });
 
-  // T2-03: accept job leases (additive — attaches a `lease` handler only; the
-  // register/heartbeat/reconnect paths above are untouched).
+  // c6: the durable job-state store lives in the DATA dir (04: same root as
+  // the shipper state — NOT the config dir, NOT inside any checkout).
+  const shipperFs = nodeShipperFs();
+  const jobStore = new JobStore({
+    fs: shipperFs,
+    dir: join(defaultDataDir(), 'jobs'),
+    logger: consoleLogger,
+  });
+
+  // T2-03: accept job leases (additive — attaches `lease` + `cancel`
+  // handlers only; the register/heartbeat/reconnect paths are untouched).
   manager = attachJobExecution(client, {
     runnerId: () => store.load()?.runner_id ?? null,
     labels: () => store.load()?.labels ?? [],
     capacity: () => store.load()?.capacity ?? 1,
-    draining: () => client.draining,
+    draining: () => client.draining || shuttingDown,
     workspaceRoot: process.env.PIPELINE_RUNNER_JOBS_DIR ?? join(defaultConfigDir(), 'jobs'),
     logger: consoleLogger,
     // c3: the needs-input relay — every parked question now round-trips
     // through the bridge instead of hitting the default auto-fail seam.
     needsInput: relayAdapter,
     events: shipperLifecycle,
+    // c6: durable records + reconcile substrate + terminal retention (D15).
+    store: jobStore,
+    substrate: fsSubstrateProbe(shipperFs, homedir()),
+    retention: resolveRetentionPolicy(process.env, consoleLogger),
   });
+
+  // c6 ORDERING (04 §Startup reconcile — load-bearing): scan + classify the
+  // job records BEFORE connecting, so `activeRunIds()` is already seeded with
+  // the FRESH resumes when the first heartbeat fires (heartbeats start
+  // synchronously at register-ack). Quarantined records wait, capacity-free,
+  // for the server's resume_hint re-offer or cancel.
+  const summary = manager.reconcile();
+  if (summary.resumed.length + summary.quarantined.length + summary.dropped.length > 0) {
+    consoleLogger.info(
+      `reconcile: ${summary.resumed.length} resumed, ${summary.quarantined.length} quarantined, ${summary.dropped.length} unrecoverable`
+    );
+  }
+  // c6 retention GC (D15, E6): boot-time sweep + periodic re-arm.
+  manager.sweepRetention();
+  manager.startRetentionSweeps(DEFAULT_RETENTION_SWEEP_INTERVAL_MS);
+
+  // c6 graceful shutdown (04): drain → suspend jobs (records persisted,
+  // drive children terminated; their per-step state is durable) → flush the
+  // shipper spool → close the socket → exit 0. Windows note: SCM stop is a
+  // hard terminate and console-close delivers no signal — acceptable BECAUSE
+  // the whole design assumes hard death; this drain is an optimization.
+  const shutdown = createGracefulShutdown({
+    drain: () => {
+      shuttingDown = true;
+    },
+    suspendJobs: () => manager!.suspendAll(),
+    flushShippers: () => shipperLifecycle.stopAll(),
+    closeConnection: () => client.stop(),
+    exit: (code) => process.exit(code),
+    logger: consoleLogger,
+  });
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
+
   client.start();
   // Active timers/sockets keep the Bun event loop alive; nothing else to do.
 }

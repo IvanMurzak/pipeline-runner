@@ -22,3 +22,9 @@ export * from './drive';
 export * from './executor';
 export * from './manager';
 export * from './shipper-lifecycle';
+// c6 (design 04 — D1): durable job records, startup reconcile/quarantine,
+// retention GC, graceful shutdown.
+export * from './job-store';
+export * from './reconcile';
+export * from './retention';
+export * from './shutdown';

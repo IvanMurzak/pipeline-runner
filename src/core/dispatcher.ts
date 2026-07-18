@@ -17,7 +17,11 @@ import { nullLogger } from './log';
 
 export type FrameHandler = (frame: WireFrame) => void;
 
-/** Protocol-defined types this core routes but does not handle yet. */
+/** Protocol-defined types this CORE routes but does not handle itself. The
+ *  jobs/relay/shipper layers attach the real handlers via `on()` (`lease` +
+ *  `cancel` — jobs/manager.ts, c6; `answer` — relay/bridge.ts; `upload_ack` —
+ *  shipper/upload-transport.ts); a bare core (e.g. the `register` command's
+ *  validation connection) logs them at info instead of dropping silently. */
 export const RESERVED_UNHANDLED_TYPES = ['lease', 'answer', 'cancel', 'upload_ack'] as const;
 
 export class Dispatcher {

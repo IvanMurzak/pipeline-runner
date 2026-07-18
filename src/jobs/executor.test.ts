@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import {
+  AbortableHangExec,
   DRIVE_COMPLETED,
   DRIVE_HALTED,
   DRIVE_PROVIDER_LIMIT,
@@ -11,13 +12,16 @@ import {
   FrameSink,
   GIT_OK,
   makeLease,
+  makeRecord,
 } from './_helpers';
-import type { JobExecResult } from './types';
+import type { JobRecord } from './job-store';
+import { JobError, type JobExecResult } from './types';
 import {
   DEFAULT_PROVIDER_LIMIT_PAUSE_MS,
   defaultProviderLimitPauseMs,
   JobExecutor,
   type JobExecutorOptions,
+  type JobResult,
   type JobState,
   type ParkedQuestion,
 } from './executor';
@@ -55,7 +59,9 @@ interface World {
 }
 
 function makeWorld(queue: JobExecResult[], overrides: Partial<JobExecutorOptions> = {}): World {
-  const exec = overrides.exec instanceof FakeJobExec ? overrides.exec : driveExec(queue);
+  // Any injected exec wins (FakeJobExec or the c6 AbortableHangExec — both
+  // expose `calls`/`of()`); absent, the shift-queue drive fake applies.
+  const exec = overrides.exec !== undefined ? (overrides.exec as FakeJobExec) : driveExec(queue);
   const sink = new FrameSink();
   const clock = new FakeClock();
   const logger = new CaptureLogger();
@@ -631,5 +637,312 @@ describe('defaultProviderLimitPauseMs', () => {
 
   test('a provider-stated window wins', () => {
     expect(defaultProviderLimitPauseMs(3, { reason: 'x', retry_after_ms: 42 })).toBe(42);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// c6 (design 04 — D1): resume mode, durable-record port, ordered completion,
+// cancel/suspend interruption.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('JobExecutor — c6 resume mode', () => {
+  const RECORD_DIR = join('/w', 'job-old');
+
+  function resumeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
+    return makeRecord({
+      job_id: 'job-1',
+      run_id: 'run-1',
+      checkout_dir: RECORD_DIR,
+      pipeline_root: join(RECORD_DIR, '.claude', 'pipeline', 'release'),
+      start_iteration: 'steps/01-plan.md',
+      ...overrides,
+    });
+  }
+
+  test('FRESH resume: no prep, no wipe, `--resume` in the recorded checkout, NO started frame (F1)', async () => {
+    const record = resumeRecord();
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: false } });
+    const result = await world.executor.start();
+
+    expect(result.ok).toBe(true);
+    expect(world.exec.of('git')).toHaveLength(0); // never re-prepped
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(1);
+    expect(drive[0]!.args).toEqual(['drive', '--root', record.pipeline_root!, '--run-id', 'run-1', '--resume', '--json']);
+    expect(drive[0]!.opts.cwd).toBe(RECORD_DIR); // the RECORDED dir is the resume substrate
+    // F1 "no cloud state change at all": completed only, no `started`.
+    expect(world.sink.ofType('run_status').map((f) => f.phase)).toEqual(['completed']);
+  });
+
+  test('ADOPTION resume (announce): the new job announces `started` before driving', async () => {
+    const record = resumeRecord();
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: true } });
+    await world.executor.start();
+    expect(world.sink.ofType('run_status').map((f) => f.phase)).toEqual(['started', 'completed']);
+  });
+
+  test('recorded execution_overrides are re-applied on resume', async () => {
+    const record = resumeRecord({ execution_overrides: { model: 'opus', effort: 'max' } });
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: false } });
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).toEqual([
+      'drive',
+      '--root',
+      record.pipeline_root!,
+      '--run-id',
+      'run-1',
+      '--default-model',
+      'opus',
+      '--default-effort',
+      'max',
+      '--resume',
+      '--json',
+    ]);
+  });
+
+  test('paused-window restore: no drive spawn until the recorded paused_until passes', async () => {
+    const record = resumeRecord({
+      phase: 'paused_provider_limit',
+      paused_until: new Date(60_000).toISOString(),
+      consecutive_pauses: 3,
+    });
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: false } });
+    const done = world.executor.start();
+    await tick();
+    expect(world.exec.of('pipeline')).toHaveLength(0); // window restored, not hammered
+    expect(world.executor.state).toBe('paused_provider_limit');
+    expect(world.executor.pausedUntil).toBe(record.paused_until);
+
+    world.clock.advance(60_000);
+    const result = await done;
+    expect(result.ok).toBe(true);
+    expect(world.exec.of('pipeline')[0]!.args).toContain('--resume');
+  });
+
+  test('a paused record whose window already passed resumes immediately', async () => {
+    const record = resumeRecord({ phase: 'paused_provider_limit', paused_until: new Date(0).toISOString() });
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: false } });
+    world.clock.advance(1); // now > paused_until
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+    expect(world.exec.of('pipeline')).toHaveLength(1);
+  });
+
+  test('awaiting_input re-surface: NO spawn; the stored question goes to the relay; the answer drives `--answer`', async () => {
+    const stored = {
+      question_id: 'q-stored',
+      step_id: '02-deploy',
+      iteration_path: 'steps/02-deploy.md',
+      session_id: 'sess-1',
+      question: { text: 'Which host?', context: null, options: null },
+    };
+    const record = resumeRecord({ phase: 'awaiting_input', questions: [stored] });
+    const asked: ParkedQuestion[] = [];
+    const world = makeWorld([DRIVE_COMPLETED], {
+      resume: { record, announce: false },
+      needsInput: {
+        onQuestion: (parked) => {
+          asked.push(parked);
+          expect(world.exec.of('pipeline')).toHaveLength(0); // re-surfaced BEFORE any spawn
+          return 'prod-3';
+        },
+      },
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.question_id).toBe('q-stored'); // identity preserved across the daemon death
+    expect(world.exec.of('pipeline')[0]!.args).toEqual([
+      'drive',
+      '--root',
+      record.pipeline_root!,
+      '--run-id',
+      'run-1',
+      '--resume',
+      '--start',
+      'steps/02-deploy.md',
+      '--answer',
+      'prod-3',
+      '--json',
+    ]);
+  });
+
+  test('pinned content_hash is RE-VERIFIED before resume — mismatch halts instead of resuming', async () => {
+    const record = resumeRecord({
+      pipeline_ref: { repo: 'git@example.com:acme/api.git', ref: 'main', pipeline: 'release', content_hash: 'sha256:aaa' },
+    });
+    const world = makeWorld([DRIVE_COMPLETED], {
+      resume: { record, announce: false },
+      verifyContentHash: () => {
+        throw new JobError('content hash mismatch (expected sha256:aaa, got sha256:bbb)');
+      },
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain('resume refused');
+    expect(world.exec.of('pipeline')).toHaveLength(0); // never drove
+    const halted = world.sink.ofType('run_status');
+    expect(halted).toHaveLength(1);
+    expect(halted[0]!.phase).toBe('halted');
+    expect(String(halted[0]!.halt_reason)).toContain('content hash mismatch');
+  });
+
+  test('resume restores the pause ladder from the record', async () => {
+    // consecutive_pauses restored: one more limit pause uses attempt index 1
+    // of the pause policy (not 0), proving the ladder position survived.
+    const attempts: number[] = [];
+    const record = resumeRecord({ consecutive_pauses: 1 });
+    const world = makeWorld([DRIVE_PROVIDER_LIMIT, DRIVE_COMPLETED], {
+      resume: { record, announce: false },
+      providerLimitPauseMs: (attempt) => {
+        attempts.push(attempt);
+        return 1_000;
+      },
+    });
+    const done = world.executor.start();
+    await tick();
+    world.clock.advance(1_000);
+    await done;
+    expect(attempts).toEqual([1]);
+  });
+});
+
+describe('JobExecutor — c6 durable-record port', () => {
+  test('fresh path: prep substrate, then phase transitions, persist through the port', async () => {
+    const patches: Array<Partial<JobRecord>> = [];
+    const world = makeWorld([driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-7'), DRIVE_COMPLETED], {
+      record: { update: (patch) => patches.push(patch) },
+      needsInput: { onQuestion: () => 'prod' },
+    });
+    await world.executor.start();
+
+    expect(patches[0]).toEqual({ pipeline_root: PIPELINE_ROOT, start_iteration: 'steps/01-plan.md' });
+    expect(patches[1]).toEqual({ phase: 'running' });
+    expect(patches[2]!.phase).toBe('awaiting_input');
+    expect(patches[2]!.questions).toEqual([
+      {
+        question_id: 'q-7',
+        step_id: '02-deploy',
+        iteration_path: 'steps/02-deploy.md',
+        session_id: 'sess-1',
+        question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] },
+      },
+    ]);
+    expect(patches[3]).toEqual({ phase: 'running', questions: [] });
+  });
+
+  test('provider-limit pause persists paused_until + consecutive_pauses', async () => {
+    const patches: Array<Partial<JobRecord>> = [];
+    const world = makeWorld([DRIVE_PROVIDER_LIMIT, DRIVE_COMPLETED], {
+      record: { update: (patch) => patches.push(patch) },
+    });
+    const done = world.executor.start();
+    await tick();
+    const paused = patches.find((p) => p.phase === 'paused_provider_limit');
+    expect(paused).toBeDefined();
+    expect(paused!.consecutive_pauses).toBe(1);
+    expect(typeof paused!.paused_until).toBe('string');
+    world.clock.advance(DEFAULT_PROVIDER_LIMIT_PAUSE_MS);
+    await done;
+    expect(patches[patches.length - 1]).toEqual({ phase: 'running', paused_until: null });
+  });
+});
+
+describe('JobExecutor — c6 ordered completion (the c5 terminal-state race)', () => {
+  test('terminal events FLUSH before the terminal run_status frame goes out', async () => {
+    const order: string[] = [];
+    const world = makeWorld([DRIVE_COMPLETED], {
+      send: (frame) => {
+        order.push(`frame:${String(frame.type)}:${String((frame as { phase?: string }).phase)}`);
+        return true;
+      },
+      events: {
+        onTerminalFlush: async () => {
+          order.push('flush:start');
+          await tick(); // a real flush takes time — the frame must still wait
+          order.push('flush:end');
+        },
+      },
+    });
+    await world.executor.start();
+    const flushEnd = order.indexOf('flush:end');
+    const terminal = order.indexOf('frame:run_status:completed');
+    expect(flushEnd).toBeGreaterThanOrEqual(0);
+    expect(terminal).toBeGreaterThan(flushEnd); // flush → run_status, strictly ordered
+  });
+
+  test('halted paths flush first too, and a flush failure never swallows the frame', async () => {
+    const order: string[] = [];
+    const world = makeWorld([DRIVE_HALTED], {
+      send: (frame) => {
+        order.push(`frame:${String((frame as { phase?: string }).phase)}`);
+        return true;
+      },
+      events: {
+        onTerminalFlush: async () => {
+          order.push('flush');
+          throw new Error('spool exploded');
+        },
+      },
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(false);
+    expect(order).toEqual(['frame:started', 'flush', 'frame:halted']);
+  });
+});
+
+describe('JobExecutor — c6 cancel / suspend', () => {
+  test('cancel mid-drive: child aborted, NO terminal run_status, result flagged cancelled', async () => {
+    const exec = new AbortableHangExec();
+    const world = makeWorld([], { exec: exec as unknown as FakeJobExec });
+    const done = world.executor.start();
+    await tick(); // drive is in flight (hanging)
+    expect(exec.of('pipeline')).toHaveLength(1);
+
+    world.executor.cancel();
+    const result = await done;
+    expect(result).toEqual({ job_id: 'job-1', run_id: 'run-1', ok: false, reason: 'cancelled by server', cancelled: true });
+    // `started` only — the server initiated the cancel; no halted frame.
+    expect(world.sink.ofType('run_status').map((f) => f.phase)).toEqual(['started']);
+  });
+
+  test('suspend mid-drive: child aborted, result flagged suspended (record stays — manager contract)', async () => {
+    const exec = new AbortableHangExec();
+    const finished: JobResult[] = [];
+    const world = makeWorld([], {
+      exec: exec as unknown as FakeJobExec,
+      events: { onFinished: (r) => finished.push(r) },
+    });
+    const done = world.executor.start();
+    await tick();
+    world.executor.suspend();
+    const result = await done;
+    expect(result.ok).toBe(false);
+    expect((result as { suspended?: boolean }).suspended).toBe(true);
+    expect(finished).toHaveLength(1);
+    expect(world.sink.ofType('run_status').map((f) => f.phase)).toEqual(['started']);
+  });
+
+  test('cancel while parked on a question unblocks the relay await', async () => {
+    const world = makeWorld([driveAwaiting()], {
+      needsInput: { onQuestion: () => new Promise<string | null>(() => {}) }, // answer never comes
+    });
+    const done = world.executor.start();
+    await tick();
+    expect(world.executor.state).toBe('awaiting_input');
+    world.executor.cancel();
+    const result = await done;
+    expect((result as { cancelled?: boolean }).cancelled).toBe(true);
+  });
+
+  test('suspend during a provider-limit pause exits without another spawn', async () => {
+    const world = makeWorld([DRIVE_PROVIDER_LIMIT]);
+    const done = world.executor.start();
+    await tick();
+    expect(world.executor.state).toBe('paused_provider_limit');
+    world.executor.suspend();
+    const result = await done;
+    expect((result as { suspended?: boolean }).suspended).toBe(true);
+    expect(world.exec.of('pipeline')).toHaveLength(1); // no post-suspend resume spawn
   });
 });
