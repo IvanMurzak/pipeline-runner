@@ -3,6 +3,14 @@
  * root is required; it lives at `~/.config/systemd/user/pipeline-runner.service`
  * and is enabled into `default.target`.
  *
+ * A user unit alone does NOT survive logout/reboot — `install` also runs
+ * `loginctl enable-linger` so the user's systemd instance (and this unit)
+ * keeps running unattended (review B P0: "daemon restarts automatically" was
+ * false as shipped). Best-effort: a lingering failure warns with the exact
+ * remediation command rather than failing the whole install (the unit is
+ * already installed and running by that point). See the README for the
+ * root/system-unit alternative when lingering itself is unavailable.
+ *
  * `renderSystemdUnit` is PURE (plan → unit text) and unit-tested directly.
  */
 
@@ -19,6 +27,9 @@ import { type ServicePlan, systemdQuote, systemdUserDir } from './plan';
 
 const SYSTEMCTL = 'systemctl';
 const USER = '--user';
+const LOGINCTL = 'loginctl';
+/** `loginctl enable-linger` with no USER arg operates on the invoking user. */
+const ENABLE_LINGER_ARGS = ['enable-linger'];
 
 /** `pipeline-runner.service`. */
 export function systemdUnitName(plan: ServicePlan): string {
@@ -107,6 +118,28 @@ class SystemdBackend implements ServiceBackend {
       );
     }
 
+    // A `--user` unit only survives logout/reboot when lingering is on (the
+    // whole point of this step — review B P0). This is best-effort: unlike
+    // `daemon-reload`/`enable --now` above (required for the unit to exist at
+    // all), lingering can fail for reasons unrelated to the unit's own health
+    // (missing polkit/D-Bus permission in a locked-down or containerized
+    // session) even though the service is installed and running RIGHT NOW. We
+    // never let that block an otherwise-successful install; instead we surface
+    // it loudly with the exact remediation command, plus the system-unit
+    // alternative for hosts where lingering is unavailable entirely.
+    commands.push({ cmd: LOGINCTL, args: ENABLE_LINGER_ARGS });
+    const linger = ctx.exec.run(LOGINCTL, ENABLE_LINGER_ARGS);
+    const lingerMessages =
+      linger.code === 0
+        ? [`enabled lingering: loginctl enable-linger "$USER" (unit survives logout/reboot)`]
+        : [
+            `warning: \`${LOGINCTL} enable-linger\` failed (exit ${linger.code})` +
+              `${linger.stderr ? `: ${linger.stderr.trim()}` : ''}`,
+            `the unit will run while you are logged in, but will NOT survive logout/reboot until you run:`,
+            `  loginctl enable-linger "$USER"`,
+            `alternatively, install a SYSTEM unit instead (root, no lingering needed, starts at boot) — see README's system-unit alternative`,
+          ];
+
     return {
       action: 'install',
       backend: this.id,
@@ -117,6 +150,7 @@ class SystemdBackend implements ServiceBackend {
         `wrote systemd user unit: ${unitPath}`,
         `enabled + started ${unit}`,
         `check it: systemctl --user status ${unit}`,
+        ...lingerMessages,
       ],
     };
   }

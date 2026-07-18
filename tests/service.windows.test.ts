@@ -3,6 +3,7 @@ import {
   DEFAULT_IDENTITY,
   installService,
   renderWindowsCreateCommand,
+  renderWindowsFailureCommand,
   type ServicePlan,
   serviceStatus,
   ServiceError,
@@ -73,21 +74,43 @@ describe('renderWindowsCreateCommand (pure)', () => {
   });
 });
 
+describe('renderWindowsFailureCommand (pure)', () => {
+  test('args use sc.exe key=/value token pairs (space after =), 24h reset + 5s restart', () => {
+    const cmd = renderWindowsFailureCommand('pipeline-runner');
+    expect(cmd.args).toEqual([
+      'failure',
+      'pipeline-runner',
+      'reset=',
+      '86400',
+      'actions=',
+      'restart/5000',
+    ]);
+  });
+
+  test('commandLine is copy-pasteable', () => {
+    const cmd = renderWindowsFailureCommand('pipeline-runner');
+    expect(cmd.commandLine).toBe('sc.exe failure pipeline-runner reset= 86400 actions= restart/5000');
+  });
+});
+
 describe('windows install', () => {
-  test('best-effort stop+delete, then create/description/start (overwrite semantics)', () => {
+  test('best-effort stop+delete, then create/failure/description/start (overwrite semantics)', () => {
     const exec = new FakeExec();
     const result = installService({ ...OPTS, exec, fs: new FakeServiceFs() });
 
     expect(exec.calls[0]).toEqual({ cmd: 'sc.exe', args: ['stop', 'pipeline-runner'] });
     expect(exec.calls[1]).toEqual({ cmd: 'sc.exe', args: ['delete', 'pipeline-runner'] });
     expect(exec.calls[2]?.args).toEqual(renderWindowsCreateCommand(plan()).createArgs);
-    expect(exec.calls[3]).toEqual({
+    expect(exec.calls[3]?.args).toEqual(renderWindowsFailureCommand('pipeline-runner').args);
+    expect(exec.calls[4]).toEqual({
       cmd: 'sc.exe',
       args: ['description', 'pipeline-runner', DEFAULT_IDENTITY.description],
     });
-    expect(exec.calls[4]).toEqual({ cmd: 'sc.exe', args: ['start', 'pipeline-runner'] });
+    expect(exec.calls[5]).toEqual({ cmd: 'sc.exe', args: ['start', 'pipeline-runner'] });
     expect(result.definitionPath).toBeNull();
     expect(result.backend).toBe('windows');
+    expect(result.messages.some((m) => m.includes('crash recovery'))).toBe(true);
+    expect(result.messages.some((m) => m.includes('qfailure'))).toBe(true);
   });
 
   test('sc create failure throws a ServiceError with an elevation hint', () => {
@@ -101,6 +124,22 @@ describe('windows install', () => {
       expect(err).toBeInstanceOf(ServiceError);
       expect((err as Error).message).toContain('Administrator');
     }
+  });
+
+  test('sc failure (recovery-action config) failure throws a ServiceError with an elevation hint, and skips description/start', () => {
+    const exec = new FakeExec(({ args }) =>
+      args[0] === 'failure' ? { code: 5, stderr: 'Access is denied.' } : {}
+    );
+    try {
+      installService({ ...OPTS, exec, fs: new FakeServiceFs() });
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ServiceError);
+      expect((err as Error).message).toContain('Administrator');
+      expect((err as Error).message).toContain('failure actions');
+    }
+    expect(exec.calls.some((c) => c.args[0] === 'description')).toBe(false);
+    expect(exec.calls.some((c) => c.args[0] === 'start')).toBe(false);
   });
 });
 

@@ -3,6 +3,14 @@
  * `~/Library/LaunchAgents/com.ivanmurzak.pipeline-runner.plist` with
  * `RunAtLoad` + `KeepAlive` so it starts at login and restarts on crash.
  *
+ * CAVEAT (review B, not fixed here): a LaunchAgent starts at LOGIN, not boot —
+ * on a reboot with no interactive/auto login the runner stays down until
+ * someone logs in (unlike the Linux/Windows fixes in this backend's siblings,
+ * which reach true unattended-boot recovery). A root LaunchDaemon
+ * (`/Library/LaunchDaemons`, starts at boot, no login required) would close
+ * this gap but is explicitly DEFERRED — `install` surfaces the caveat instead
+ * of silently pretending boot-level recovery exists. See the README.
+ *
  * `renderLaunchdPlist` is PURE (plan → plist XML) and unit-tested directly.
  * ProgramArguments is an ARRAY, so argv is passed verbatim — no shell quoting,
  * only XML escaping.
@@ -114,6 +122,10 @@ class LaunchdBackend implements ServiceBackend {
         `wrote LaunchAgent plist: ${plistPath}`,
         `loaded ${plan.identity.launchdLabel} (RunAtLoad + KeepAlive)`,
         `check it: launchctl list ${plan.identity.launchdLabel}`,
+        'caveat: this LaunchAgent starts at LOGIN, not boot — after a reboot with no ' +
+          'interactive/auto login the runner stays down until someone logs in. A ' +
+          'root LaunchDaemon (starts at boot, no login required) is not yet supported ' +
+          'by this installer (deferred); see the README.',
       ],
     };
   }
