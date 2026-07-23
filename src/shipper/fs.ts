@@ -27,6 +27,10 @@ export interface ShipperFileSystem {
   mkdirp(path: string): void;
   /** File size in bytes, or null if the file does not exist. */
   statSize(path: string): number | null;
+  /** Last-modified time (epoch ms), or null if the file does not exist.
+   *  Used as a CHANGE DETECTOR (skip unchanged files), never as a clock —
+   *  equality is compared against a previously returned value only. */
+  statMtime(path: string): number | null;
   /** Read bytes [start, end) — short reads tolerated (returns what exists). */
   readRange(path: string, start: number, end: number): Uint8Array;
   /** Names of directory entries, or null when the dir does not exist. */
@@ -72,6 +76,14 @@ export function nodeShipperFs(): ShipperFileSystem {
     statSize: (path) => {
       try {
         return fs.statSync(path).size;
+      } catch (err) {
+        ignoreEnoent(err);
+        return null;
+      }
+    },
+    statMtime: (path) => {
+      try {
+        return fs.statSync(path).mtimeMs;
       } catch (err) {
         ignoreEnoent(err);
         return null;

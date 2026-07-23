@@ -58,16 +58,41 @@ describe('createShipperLifecycle — onWorkspaceReady / onJobFinished (fake tran
     // REAL default `DiskStatsSource` (not stubbed) — proves the production
     // wiring's conventional layout: <checkout>/.claude/pipeline/.stats/**/runs.jsonl.
     const statsDir = statsDirForJournal(journalPath);
+    // Wire-faithful: the shipper validates every record against
+    // `RunRecordStatsSchema` BEFORE spooling, so a stub missing required
+    // fields would (correctly) never ship — see the rejection test in
+    // tests/shipper-watcher.test.ts.
     fs.writeFileText(
       join(statsDir, 'runs.jsonl'),
       JSON.stringify({
         schema: 1,
         run_id: 'run-1',
         pipeline: 'release',
-        outcome: 'completed',
+        started_at: '2026-07-17T12:59:18.000Z',
         ended_at: '2026-07-17T13:00:00.000Z',
         duration_s: 42,
+        outcome: 'completed',
+        halt_reason: null,
+        runner: 'headless',
+        mode: 'sequential',
         steps_run: 1,
+        steps: [
+          {
+            id: '010-build',
+            started_at: '2026-07-17T12:59:18.000Z',
+            seconds: 42,
+            outcome: 'completed',
+            model: 'claude-sonnet-4-5-20250929',
+            effort: null,
+          },
+        ],
+        improver_runs: 0,
+        improver_applied: 0,
+        scripts_created: 0,
+        merges: 0,
+        merge_conflicts: 0,
+        llm_steps: 1,
+        tokens: null,
       }) + '\n'
     );
 
