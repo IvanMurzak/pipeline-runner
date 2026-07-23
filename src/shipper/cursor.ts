@@ -45,6 +45,10 @@ export const CURSOR_FILE_NAME = 'cursor.json';
 /** Default bound on tracked per-run seq counters + statsShipped entries. */
 export const DEFAULT_MAX_TRACKED_RUNS = 1000;
 
+/** Backstop bound on stats markers — see {@link pruneStatsMarkers}. Markers are
+ *  normally retained by RECORD AGE, not by count. */
+export const DEFAULT_MAX_STATS_MARKERS = 10_000;
+
 export interface ShipperCursor {
   byteOffset: number;
   perRunSeq: Record<string, number>;
@@ -62,6 +66,20 @@ export interface ShipperCursor {
    *  LOCAL record), oldest first — the eviction order for `perRunSeq`
    *  bounding. */
   endedRuns: string[];
+  /**
+   * run id → the `ended_at` (epoch ms) of its last shipped stats record.
+   *
+   * This is what keeps the stats markers alive for exactly as long as they can
+   * still matter. The rescan only ever considers records inside
+   * `STATS_RESCAN_WINDOW_MS`, so a marker whose record has aged out of that
+   * window can never cause a re-ship and is safe to drop — whereas dropping a
+   * marker for a record STILL in the window makes the rescan see an already
+   * shipped run as brand new and re-ship it, misattributed as
+   * `origin:"local"` (its perRunSeq/endedRuns evidence was pruned too).
+   * Eviction is therefore driven by this timestamp, NOT by the perRunSeq
+   * count bound, which exists for a different concern (seq allocation).
+   */
+  statsShippedAt: Record<string, number>;
 }
 
 export function emptyCursor(): ShipperCursor {
@@ -73,6 +91,7 @@ export function emptyCursor(): ShipperCursor {
     statsRevisionShipped: {},
     statsTokensShipped: [],
     endedRuns: [],
+    statsShippedAt: {},
   };
 }
 
@@ -102,7 +121,16 @@ export class CursorStore {
       }
       const strings = (value: unknown): string[] =>
         Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
-      // Tolerant load of the D13 revision map (an older cursor lacks it).
+      // Tolerant load of the numeric maps (an older cursor lacks them).
+      const numberMap = (raw: unknown): Record<string, number> => {
+        const out: Record<string, number> = {};
+        if (typeof raw !== 'object' || raw === null) return out;
+        for (const [runId, value] of Object.entries(raw)) {
+          const n = Number(value);
+          if (Number.isFinite(n)) out[runId] = n;
+        }
+        return out;
+      };
       const statsRevisionShipped: Record<string, number> = {};
       if (typeof parsed.statsRevisionShipped === 'object' && parsed.statsRevisionShipped !== null) {
         for (const [runId, revision] of Object.entries(parsed.statsRevisionShipped)) {
@@ -119,6 +147,7 @@ export class CursorStore {
           statsRevisionShipped,
           statsTokensShipped: strings(parsed.statsTokensShipped),
           endedRuns: strings(parsed.endedRuns),
+          statsShippedAt: numberMap(parsed.statsShippedAt),
         },
         warning: null,
       };
@@ -143,20 +172,65 @@ export class CursorStore {
  */
 export function pruneCursor(cursor: ShipperCursor, max = DEFAULT_MAX_TRACKED_RUNS): string[] {
   const evicted: string[] = [];
-  const dropFrom = (list: string[], runId: string): void => {
-    const index = list.indexOf(runId);
-    if (index >= 0) list.splice(index, 1);
-  };
   while (Object.keys(cursor.perRunSeq).length > max && cursor.endedRuns.length > 0) {
     const runId = cursor.endedRuns.shift()!;
     if (runId in cursor.perRunSeq) {
       delete cursor.perRunSeq[runId];
       evicted.push(runId);
     }
+  }
+  return evicted;
+}
+
+/**
+ * Evict stats markers that can no longer matter — the SEPARATE retention rule
+ * (see `ShipperCursor.statsShippedAt`).
+ *
+ * A marker is droppable exactly when its record has aged out of the rescan
+ * window, because the rescan will never look at that record again. Dropping
+ * one any earlier is what makes an already-shipped run look brand new: with
+ * its perRunSeq/endedRuns evidence gone too, `shipFirstFromRescan` classifies
+ * a dispatched run as LOCAL and ships it a second time.
+ *
+ * `hardMax` is a backstop against a pathological run volume inside one window
+ * (each entry is an id plus a number, so the normal case is a few tens of KB):
+ * once exceeded, the OLDEST records go first — they are the closest to leaving
+ * the window anyway, so they are the least likely to be re-shipped.
+ */
+export function pruneStatsMarkers(
+  cursor: ShipperCursor,
+  nowMs: number,
+  windowMs: number,
+  hardMax = DEFAULT_MAX_STATS_MARKERS,
+): string[] {
+  const dropFrom = (list: string[], runId: string): void => {
+    const index = list.indexOf(runId);
+    if (index >= 0) list.splice(index, 1);
+  };
+  const drop = (runId: string): void => {
     dropFrom(cursor.statsShipped, runId);
     dropFrom(cursor.localStatsShipped, runId);
     dropFrom(cursor.statsTokensShipped, runId);
     delete cursor.statsRevisionShipped[runId];
+    delete cursor.statsShippedAt[runId];
+  };
+
+  const dropped: string[] = [];
+  const cutoff = nowMs - windowMs;
+  for (const [runId, endedAtMs] of Object.entries(cursor.statsShippedAt)) {
+    if (endedAtMs < cutoff) {
+      drop(runId);
+      dropped.push(runId);
+    }
   }
-  return evicted;
+
+  const remaining = Object.entries(cursor.statsShippedAt);
+  if (remaining.length > hardMax) {
+    remaining.sort((a, b) => a[1] - b[1]); // oldest record first
+    for (const [runId] of remaining.slice(0, remaining.length - hardMax)) {
+      drop(runId);
+      dropped.push(runId);
+    }
+  }
+  return dropped;
 }

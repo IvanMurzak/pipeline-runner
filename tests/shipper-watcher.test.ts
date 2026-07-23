@@ -16,7 +16,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { EventShipper } from '../src/shipper/shipper';
-import { emptyCursor, pruneCursor } from '../src/shipper/cursor';
+import { emptyCursor, pruneCursor, pruneStatsMarkers } from '../src/shipper/cursor';
 import {
   DiskStatsSource,
   resolveSyncLocalStats,
@@ -336,21 +336,124 @@ describe('unified stats watcher — excerpt strip (D16 / G-sec-2)', () => {
   });
 });
 
-describe('cursor — new watcher fields', () => {
-  test('pruneCursor evicts the watcher bookkeeping together with the seq counter', () => {
+/**
+ * Marker retention is DELIBERATELY not tied to the seq bound. Evicting a stats
+ * marker while its record is still inside the rescan window is what makes an
+ * already-shipped dispatched run look brand new — the rescan then re-ships it
+ * as `origin:"local"`, because its perRunSeq/endedRuns evidence was pruned in
+ * the same pass.
+ */
+/**
+ * The regression this retention split exists for. Note how little it takes to
+ * reach: appending the NEXT run's record to the same runs.jsonl changes that
+ * file's mtime, so every earlier record in it becomes a rescan candidate
+ * again — no enrichment rewrite needed.
+ */
+describe('unified stats watcher — eviction must not resurrect a shipped run', () => {
+  test('a dispatched run whose SEQ counter was pruned is never re-shipped as local', async () => {
+    const { fs, transport, shipper } = makeRig({ maxTrackedRuns: 1 });
+
+    // A dispatched run ships through the terminal-event path.
+    appendRecord(fs, validRunRecord('run-D'));
+    fs.appendText(
+      JOURNAL,
+      journalLine('run.started', 'run-D') + journalLine('run.completed', 'run-D', { outcome: 'completed' }),
+    );
+    shipper.pollOnce();
+    shipper.flushNow();
+    await settle();
+    expect(shippedStatsData(transport, 'run-D')).toHaveLength(1);
+    expect(shippedStatsData(transport, 'run-D')[0]!.origin).toBe('dispatched');
+
+    // Enough other ended runs to push run-D past the seq bound.
+    for (const id of ['run-x', 'run-y']) {
+      fs.appendText(JOURNAL, journalLine('run.started', id) + journalLine('run.completed', id, { outcome: 'completed' }));
+    }
+    shipper.pollOnce();
+    shipper.flushNow();
+    await settle();
+    expect(shipper.cursorSnapshot.perRunSeq['run-D']).toBeUndefined(); // evicted
+
+    // The next run lands in the SAME runs.jsonl — its mtime changes, so run-D's
+    // record is a rescan candidate again.
+    appendRecord(fs, validRunRecord('run-N', { ended_at: '2026-07-11T14:00:00.000Z' }));
+    shipper.rescanStats();
+    shipper.flushNow();
+    await settle();
+
+    // run-D must NOT ship a second time, and certainly not as "local".
+    const dispatched = shippedStatsData(transport, 'run-D');
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]!.origin).toBe('dispatched');
+    // The new local run still ships normally.
+    expect(shippedStatsData(transport, 'run-N')).toHaveLength(1);
+  });
+});
+
+describe('cursor — stats marker retention', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = Date.parse('2026-07-22T12:00:00.000Z');
+  const WINDOW = 14 * DAY;
+
+  function seeded(): ReturnType<typeof emptyCursor> {
     const cursor = emptyCursor();
     cursor.perRunSeq = { 'run-1': 3, 'run-2': 5 };
     cursor.endedRuns = ['run-1'];
     cursor.statsShipped = ['run-1'];
-    cursor.localStatsShipped = ['run-1'];
+    cursor.localStatsShipped = ['run-2'];
     cursor.statsTokensShipped = ['run-1'];
-    cursor.statsRevisionShipped = { 'run-1': 2 };
+    cursor.statsRevisionShipped = { 'run-1': 2, 'run-2': 1 };
+    cursor.statsShippedAt = { 'run-1': NOW - 3 * DAY, 'run-2': NOW - 20 * DAY };
+    return cursor;
+  }
 
+  test('pruneCursor evicts the SEQ counter and leaves the stats markers alone', () => {
+    const cursor = seeded();
     expect(pruneCursor(cursor, 1)).toEqual(['run-1']);
     expect(cursor.perRunSeq).toEqual({ 'run-2': 5 });
-    expect(cursor.statsShipped).toEqual([]);
+    // The markers survive: run-1's record is 3 days old, still rescannable.
+    expect(cursor.statsShipped).toEqual(['run-1']);
+    expect(cursor.statsTokensShipped).toEqual(['run-1']);
+    expect(cursor.statsRevisionShipped['run-1']).toBe(2);
+    expect(cursor.statsShippedAt['run-1']).toBe(NOW - 3 * DAY);
+  });
+
+  test('pruneStatsMarkers drops only records that aged OUT of the rescan window', () => {
+    const cursor = seeded();
+    expect(pruneStatsMarkers(cursor, NOW, WINDOW)).toEqual(['run-2']); // 20 days old
     expect(cursor.localStatsShipped).toEqual([]);
-    expect(cursor.statsTokensShipped).toEqual([]);
-    expect(cursor.statsRevisionShipped).toEqual({});
+    expect(cursor.statsRevisionShipped).toEqual({ 'run-1': 2 });
+    expect(cursor.statsShippedAt).toEqual({ 'run-1': NOW - 3 * DAY });
+    // The in-window run keeps every marker.
+    expect(cursor.statsShipped).toEqual(['run-1']);
+  });
+
+  test('a record exactly at the window edge is kept (it is still scannable)', () => {
+    const cursor = emptyCursor();
+    cursor.statsShipped = ['edge'];
+    cursor.statsShippedAt = { edge: NOW - WINDOW };
+    expect(pruneStatsMarkers(cursor, NOW, WINDOW)).toEqual([]);
+    expect(cursor.statsShipped).toEqual(['edge']);
+  });
+
+  test('the hard cap evicts OLDEST-first as a backstop', () => {
+    const cursor = emptyCursor();
+    for (let i = 0; i < 5; i++) {
+      const id = `run-${i}`;
+      cursor.statsShipped.push(id);
+      cursor.statsShippedAt[id] = NOW - i * 60_000; // run-4 is the oldest
+    }
+    const dropped = pruneStatsMarkers(cursor, NOW, WINDOW, 3);
+    expect(dropped.sort()).toEqual(['run-3', 'run-4']);
+    expect(cursor.statsShipped.sort()).toEqual(['run-0', 'run-1', 'run-2']);
+  });
+
+  test('an older cursor without statsShippedAt loads and prunes without throwing', () => {
+    const cursor = emptyCursor();
+    cursor.statsShipped = ['legacy'];
+    // No statsShippedAt entry: nothing to age out, so the marker is kept
+    // rather than dropped on a guess.
+    expect(pruneStatsMarkers(cursor, NOW, WINDOW)).toEqual([]);
+    expect(cursor.statsShipped).toEqual(['legacy']);
   });
 });
