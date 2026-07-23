@@ -397,7 +397,11 @@ export class EventShipper {
    *     the terminal fold looked for it — ship as `origin:"dispatched"`.
    *   - UNSHIPPED record of a journal-UNKNOWN run → a LOCALLY started run
    *     (D18) — ship with `origin:"local"` when `sync_local_stats` allows;
-   *     skipped (unmarked, so a later flag flip still ships it) when not.
+   *     skipped without a marker when not, so turning the flag ON later still
+   *     ships it — but only from the NEXT PROCESS: the flag is resolved once
+   *     in the constructor, and the source's mtime gate would skip the
+   *     unchanged file anyway (its scanned-mtime map is in-memory, so a
+   *     restart re-reads everything once).
    *   - SHIPPED record whose `tokens` went null→non-null → re-ship with
    *     `revision`+1, exactly once (D13).
    *
