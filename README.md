@@ -154,6 +154,12 @@ your dashboards see your whole fleet's activity. Records are tagged
 enrichment is picked up by a periodic rescan (14-day window per record) and
 re-synced as a superseding revision of the same record.
 
+Retention note: the runner remembers which run records it has already sent for
+as long as those records stay inside the 14-day rescan window, and forgets them
+afterwards. That bookkeeping is deliberately independent of its other state
+bounds — forgetting a record the watcher can still see would make an
+already-synced run look brand new and send it a second time.
+
 Opt out of local-run sync at any time with `sync_local_stats=0` — set the
 environment variable `PIPELINE_SYNC_LOCAL_STATS=0` for the runner process
 (cloud-dispatched runs keep syncing; they are the product's job telemetry).

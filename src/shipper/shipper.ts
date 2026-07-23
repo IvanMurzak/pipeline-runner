@@ -38,7 +38,13 @@ import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
-import { CursorStore, DEFAULT_MAX_TRACKED_RUNS, pruneCursor, type ShipperCursor } from './cursor';
+import {
+  CursorStore,
+  DEFAULT_MAX_TRACKED_RUNS,
+  pruneCursor,
+  pruneStatsMarkers,
+  type ShipperCursor,
+} from './cursor';
 import { defaultDataDir, nodeShipperFs, type ShipperFileSystem } from './fs';
 import {
   DEFAULT_PRIVACY_TIER,
@@ -231,6 +237,11 @@ export class EventShipper {
     return this.spool.eventCount;
   }
 
+  /** Read-only view of the cursor — tests assert eviction/retention state. */
+  get cursorSnapshot(): Readonly<ShipperCursor> {
+    return this.cursor;
+  }
+
   // ── Follow mode ────────────────────────────────────────────────────────────
 
   /** Start polling + time-based flushing (tests may drive pollOnce/flushNow
@@ -379,9 +390,15 @@ export class EventShipper {
     return stamped;
   }
 
-  /** Shared post-ship bookkeeping: revision + tokens-synced marker. */
+  /** Shared post-ship bookkeeping: revision + tokens-synced + record age.
+   *  The age is what keeps this run's markers alive for exactly as long as the
+   *  rescan can still see its record (see cursor.ts#pruneStatsMarkers). */
   private finishStatsShip(runId: string, shippedRecord: Record<string, unknown>, revision: number): void {
     this.cursor.statsRevisionShipped[runId] = revision;
+    const endedMs = typeof shippedRecord.ended_at === 'string' ? Date.parse(shippedRecord.ended_at) : NaN;
+    // Unparseable ended_at ⇒ stamp NOW, so the marker still ages out normally
+    // instead of living forever or being dropped on the next pass.
+    this.cursor.statsShippedAt[runId] = Number.isFinite(endedMs) ? endedMs : this.clock.now();
     if (shippedRecord.tokens !== null && shippedRecord.tokens !== undefined && !this.cursor.statsTokensShipped.includes(runId)) {
       this.cursor.statsTokensShipped.push(runId);
     }
@@ -491,6 +508,10 @@ export class EventShipper {
       if (evicted.length > 0) {
         this.logger.warn(`seq state bound reached — evicted counters for ${evicted.length} ended run(s)`);
       }
+      // Stats markers retire on their OWN clock: a marker is dropped only once
+      // its record has aged out of the rescan window, so eviction can never
+      // resurrect an already-shipped run as a "new local" one.
+      pruneStatsMarkers(this.cursor, this.clock.now(), STATS_RESCAN_WINDOW_MS);
       this.cursorStore.save(this.cursor);
     }
     void this.drain();
