@@ -1,0 +1,25 @@
+README.md
+  s_428ab9782c8d79::t_bcfdb961f59c8b 157-162
+src/shipper/cursor.ts
+  s_428ab9782c8d79::t_1aa15412c810bf 48-51,69-82,94,124-133,150,181-210,215-224,226-235
+src/shipper/shipper.ts
+  s_428ab9782c8d79::t_1ee3faafadd9f2 41-47,240-244,393-395,398-401,511-514
+tests/shipper-watcher.test.ts
+  s_428ab9782c8d79::t_802ea95b6fe1b0 19,339-398,403,405-408,410-411,414-423,425-457
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "1a84ecf9a303c9df6bd9836115e886436553fe53",
+  "prompts": {},
+  "sessions": {
+    "s_428ab9782c8d79": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_428ab9782c8d79",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
