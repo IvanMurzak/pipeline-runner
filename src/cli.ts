@@ -45,6 +45,14 @@ import {
 import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './relay';
 // T1-15: service install/uninstall/status lives in ./service (its own module).
 import { runService } from './service';
+// department-mesh (task d1): a SECOND, PARALLEL admission surface for
+// department tasks (`department.offer`/`.message`/`.cancel`) — mirrors
+// attachJobExecution's construction shape without touching pipeline
+// dispatch. `parseDepartmentRuntimesEnv` is a placeholder until department
+// install/config_update (task c2) lands — see `./department/config.ts`.
+import { parseDepartmentRuntimesEnv } from './department/config';
+import { JsonlProcessAdapter } from './department/jsonl-process';
+import { DepartmentManager, nodeJournalWriter } from './department/manager';
 
 const REGISTER_ONCE_TIMEOUT_MS = 30_000;
 
@@ -236,6 +244,32 @@ function runStart(): void {
     substrate: fsSubstrateProbe(shipperFs, homedir()),
     retention: resolveRetentionPolicy(process.env, consoleLogger),
   });
+
+  // department-mesh (task d1): the adapter registry starts with just
+  // `jsonl-process` (the flagship) — `pipeline-drive` joins it when d4 ports
+  // the existing dispatch path onto the same abstraction. Runtime resolution
+  // is env-driven for now (see the import doc); a `department.offer` for an
+  // unresolvable department_id gets a `capability` reject, same as an
+  // offer this runner genuinely cannot serve.
+  //
+  // KNOWN GAP (deliberate, d1 scope): unlike `manager`/`shipperLifecycle`
+  // above, department executions are NOT yet wired into graceful shutdown's
+  // drain/suspend sequence below — real lease renewal, reject-with-reason,
+  // and process-group cancellation are task d2's job; draining new offers
+  // (via `client.draining || shuttingDown`) is wired today, in-flight
+  // executions are not yet suspended on SIGTERM/SIGINT.
+  const departmentRuntimes = parseDepartmentRuntimesEnv(process.env.PIPELINE_RUNNER_DEPARTMENTS, consoleLogger);
+  const departmentManager = new DepartmentManager({
+    adapters: [new JsonlProcessAdapter({ logger: consoleLogger })],
+    resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
+    send: (frame) => client.send(frame),
+    dispatcher: client.dispatcher,
+    journal: nodeJournalWriter(),
+    journalRoot: join(defaultDataDir(), 'department'),
+    draining: () => client.draining || shuttingDown,
+    logger: consoleLogger,
+  });
+  departmentManager.attach(client.dispatcher);
 
   // c6 ORDERING (04 §Startup reconcile — load-bearing): scan + classify the
   // job records BEFORE connecting, so `activeRunIds()` is already seeded with

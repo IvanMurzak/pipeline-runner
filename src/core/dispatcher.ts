@@ -20,9 +20,30 @@ export type FrameHandler = (frame: WireFrame) => void;
 /** Protocol-defined types this CORE routes but does not handle itself. The
  *  jobs/relay/shipper layers attach the real handlers via `on()` (`lease` +
  *  `cancel` — jobs/manager.ts, c6; `answer` — relay/bridge.ts; `upload_ack` —
- *  shipper/upload-transport.ts); a bare core (e.g. the `register` command's
- *  validation connection) logs them at info instead of dropping silently. */
-export const RESERVED_UNHANDLED_TYPES = ['lease', 'answer', 'cancel', 'upload_ack'] as const;
+ *  shipper/upload-transport.ts; `department.offer` / `department.message` /
+ *  `department.cancel` — department/manager.ts, department-mesh task d1); a
+ *  bare core (e.g. the `register` command's validation connection) logs them
+ *  at info instead of dropping silently.
+ *
+ *  The `department.*` types are NOT yet in the published wire protocol
+ *  (`@baizor/pipeline-protocol` 0.3.0 — the mesh schemas land at 0.4.0, the
+ *  `e1` gate). `WireFrame`'s tolerant passthrough envelope (`./wire.ts`)
+ *  accepts any `type` string regardless, so `DepartmentManager.attach()`
+ *  routes correctly today; listing them here is purely about the "not
+ *  handled yet" vs. "unknown" log level for a bare connection with no
+ *  department manager attached. */
+export const RESERVED_UNHANDLED_TYPES = [
+  'lease',
+  'answer',
+  'cancel',
+  'upload_ack',
+  'department.offer',
+  'department.message',
+  'department.cancel',
+  'department.lease_revoked',
+  'department.artifact_ack',
+  'department.config_update',
+] as const;
 
 export class Dispatcher {
   private readonly handlers = new Map<string, Set<FrameHandler>>();
