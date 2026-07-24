@@ -1,0 +1,21 @@
+src/core/mesh-oauth.test.ts
+  s_669cb8966c68fb::t_bb04e1defb06c5 1-249
+src/core/mesh-oauth.ts
+  s_669cb8966c68fb::t_b9ab165ed8e95e 1-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "a4c0791756c7bd4aa75a49f47fdb97becab74ddd",
+  "prompts": {},
+  "sessions": {
+    "s_669cb8966c68fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_669cb8966c68fb",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

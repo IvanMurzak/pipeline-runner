@@ -1,0 +1,60 @@
+src/shipper/privacy.ts
+  s_f9bd48b89a0af2::t_d85c5f142be4f0 227-239
+  s_f9bd48b89a0af2::t_dcf140f09b4ee5 324-328,332-347
+  s_f9bd48b89a0af2::t_a60f944890c294 13-16
+  s_f9bd48b89a0af2::t_0e407594e82c0a 348-349
+src/shipper/stats.ts
+  s_f9bd48b89a0af2::t_d8ad512c81d561 2-3,9-10,12-15,17-19,21-46,67-116,120-126,134-137,140-142,149-175,178-179,181-182,186,188,191,198-199,205-221
+  s_f9bd48b89a0af2::t_00d685f368a106 222
+tests/shipper.test.ts
+  s_f9bd48b89a0af2::t_e53b3e5e7dcdcc 206,221-223
+  s_f9bd48b89a0af2::t_eb1e97d66b969b 13
+tests/shipper-watcher.test.ts
+  s_f9bd48b89a0af2::t_c29cc983c716d3 1-356
+tests/_shipper-helpers.ts
+  s_f9bd48b89a0af2::t_4fed5d6ce1b7ed 104-106,114-117
+  s_f9bd48b89a0af2::t_f4b2d26cbac7e8 19-26,36,74
+  s_f9bd48b89a0af2::t_279554055cd520 155-183
+  s_f9bd48b89a0af2::t_ad97ba79a79ddd 46-48
+  s_f9bd48b89a0af2::t_84f3b8f8d2aaf3 57-59,70-73
+  s_f9bd48b89a0af2::t_f4594ae66e0ecd 75
+src/shipper/cursor.ts
+  s_f9bd48b89a0af2::t_123a7786e5d481 105-112,118-120
+  s_f9bd48b89a0af2::t_2b83fd57a85100 146-149,156-159
+  s_f9bd48b89a0af2::t_64a26708dbb833 53-63,68-76
+  s_f9bd48b89a0af2::t_e04998ef915d0f 20-32
+src/shipper/fs.ts
+  s_f9bd48b89a0af2::t_5b4c482b674c0a 84-88
+  s_f9bd48b89a0af2::t_3711a7880d4281 30-33,81-83
+src/shipper/wire-ingest.ts
+  s_f9bd48b89a0af2::t_bdf4a42671237c 49-53
+tests/shipper-stats.test.ts
+  s_f9bd48b89a0af2::t_8d274ec747ab73 38-67
+src/shipper/shipper.ts
+  s_f9bd48b89a0af2::t_4a6dac217d303e 47,51-59,63
+  s_f9bd48b89a0af2::t_42c817fabc8a63 22-29
+  s_f9bd48b89a0af2::t_868e9aaf89e7f4 337,339,341-347,349,351-431,435-450
+  s_f9bd48b89a0af2::t_6370d7e349ead2 173
+  s_f9bd48b89a0af2::t_a0f03580317c17 155
+  s_f9bd48b89a0af2::t_dd304ef12885cc 185
+  s_f9bd48b89a0af2::t_7c9656076b5a0a 204-210
+  s_f9bd48b89a0af2::t_53cb8ee60b472b 94-99,141-142,250-253,256,266-267,451
+README.md
+  s_f9bd48b89a0af2::t_574a523467f43a 137-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "627c87356f15964b645e845c23fe209cbb060114",
+  "prompts": {},
+  "sessions": {
+    "s_f9bd48b89a0af2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cac9d280-0593-447c-a8f5-2a3ff91785c5",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

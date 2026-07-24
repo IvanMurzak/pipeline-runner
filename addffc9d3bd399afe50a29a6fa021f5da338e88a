@@ -1,0 +1,46 @@
+src/jobs/shipper-lifecycle.test.ts
+  s_0437b8a8fbb7aa::t_162f784f572035 168,194,211
+  s_0437b8a8fbb7aa::t_540a2cafe66e06 1-20,27-167,169-193,195-210,212-246
+  s_0437b8a8fbb7aa::t_34ae819aa9ce16 21-26
+src/core/connection.ts
+  s_0437b8a8fbb7aa::t_35f8d8642270fa 70-79
+  s_0437b8a8fbb7aa::t_77b42781c09951 262-268
+src/jobs/index.ts
+  s_0437b8a8fbb7aa::t_c705e1443ab42d 11-15
+  s_0437b8a8fbb7aa::t_9b7ef59773e370 24
+tests/heartbeat.test.ts
+  s_0437b8a8fbb7aa::t_f7f59e22d903cc 51,61-62,70-88
+  s_0437b8a8fbb7aa::t_454fb63af2c2e4 89-91
+src/jobs/shipper-lifecycle.ts
+  s_0437b8a8fbb7aa::t_763e88bc3a2655 1-44,46-125
+  s_0437b8a8fbb7aa::t_57de5fbd34af0f 45
+src/core/heartbeat.ts
+  s_0437b8a8fbb7aa::t_458627ba3e1681 60,64-66
+  s_0437b8a8fbb7aa::t_296f2a87bf640b 160-163
+  s_0437b8a8fbb7aa::t_1a171f33d88d67 4-19
+tests/connection.test.ts
+  s_0437b8a8fbb7aa::t_a6e40436ead437 300-357
+src/jobs/manager.test.ts
+  s_0437b8a8fbb7aa::t_7f81516132ec2f 202-224,227-239
+  s_0437b8a8fbb7aa::t_a7d8c534a19876 225-226
+  s_0437b8a8fbb7aa::t_f4fc442207f814 8
+src/cli.ts
+  s_0437b8a8fbb7aa::t_fb0b513c13b257 126-133,141-153,155,158,165
+  s_0437b8a8fbb7aa::t_97bd67856e29e0 22,24-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "addffc9d3bd399afe50a29a6fa021f5da338e88a",
+  "prompts": {},
+  "sessions": {
+    "s_0437b8a8fbb7aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aca23227-fb01-4357-947a-d2d68329d5df",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
