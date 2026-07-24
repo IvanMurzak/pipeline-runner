@@ -284,6 +284,25 @@ export function nodeJobSpawn(): JobSpawn {
         null;
       let exited = false;
 
+      // `writeLine()`/`endStdin()` below already wrap their OWN write/end
+      // calls in try/catch for a SYNCHRONOUS throw — but a broken pipe (the
+      // child was just SIGKILLed/taskkill'd, e.g. by `killGroup()` racing a
+      // polite `task.cancel` write, department-mesh `e2` gate) typically
+      // fails ASYNCHRONOUSLY instead: Node delivers it as an `'error'` event
+      // on the writable stream, not a thrown exception from `.write()`. A
+      // stream with no `'error'` listener at all makes Node RETHROW that
+      // event as an uncaught exception (EventEmitter's documented default),
+      // which would crash this entire daemon process over a single closed
+      // pipe. A no-op listener is exactly right here: the write already
+      // failed silently-by-design (`writeLine` returns `false`, which no
+      // caller in this package currently even checks — the whole point of
+      // `terminateExecution`'s cancel-then-dispose sequence, `../department/
+      // manager.ts`, is to finalize regardless of whether the polite ask
+      // landed), so there is nothing further to do beyond not crashing.
+      child.stdin.on('error', () => {});
+      child.stdout.on('error', () => {});
+      child.stderr.on('error', () => {});
+
       const stdoutBuf = makeLineBuffer((line) => onLineCb?.(line));
       child.stdout.on('data', (chunk: Buffer) => stdoutBuf.feed(chunk));
       child.stdout.on('end', () => stdoutBuf.flush());
