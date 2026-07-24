@@ -48,4 +48,17 @@ describe('parseDepartmentRuntimesEnv', () => {
     const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd', lifecycle: 'forever' } }));
     expect(map.get('d')?.lifecycle).toBeUndefined();
   });
+
+  test('parkExpirySeconds parses alongside gracefulShutdownSeconds (d2)', () => {
+    const map = parseDepartmentRuntimesEnv(
+      JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd', gracefulShutdownSeconds: 20, parkExpirySeconds: 3600 } })
+    );
+    expect(map.get('d')?.gracefulShutdownSeconds).toBe(20);
+    expect(map.get('d')?.parkExpirySeconds).toBe(3600);
+  });
+
+  test('a non-numeric parkExpirySeconds is dropped, not passed through', () => {
+    const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd', parkExpirySeconds: 'a week' } }));
+    expect(map.get('d')?.parkExpirySeconds).toBeUndefined();
+  });
 });

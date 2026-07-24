@@ -10,9 +10,25 @@
  * for department tasks, mirroring the shape (adapter registry instead of one
  * hard-coded contract, `admitTask` instead of `handleLease`) without sharing
  * state. Porting `pipeline drive` itself onto the adapter abstraction is task
- * d4; real lease renewal/reject/process-group-kill/deadlines is task d2 —
- * this manager's `cancel`/`dispose` calls are honest about that limit (see
- * `./jsonl-process.ts`'s `dispose()` doc).
+ * d4.
+ *
+ * ── Real leases, reject, process-group kill, deadlines (d2) ─────────────────
+ * `department.lease_renew` is sent at TTL/3 on the EXISTING heartbeat cadence
+ * — `renewLeases()` is called from the connection's `onBeat` hook (`../cli.ts`,
+ * same seam `JobManager.touchActiveRecords()` already rides), never a second
+ * timer (07 §6). `department.lease_revoked` (cloud → runner) stops work and
+ * ships NOTHING further for that execution. Cancellation
+ * (`cancelExecution`/`terminateExecution`) always finalizes PROMPTLY — it
+ * politely asks (`adapter.cancel()` → `task.cancel`) and then immediately
+ * reports terminal, which disposes the handle; `./jsonl-process.ts`'s
+ * `dispose()` is what actually SIGTERMs the process GROUP and SIGKILLs it
+ * after `gracefulShutdownSeconds` (07 §7) — cancellation is never left
+ * waiting indefinitely on the runtime's cooperation. Every execution also
+ * carries a wall-clock DEADLINE (`offer.deadline_at`, armed at admission) and
+ * a PARK-EXPIRY timer (armed whenever the runtime asks `input_required`,
+ * cleared on answer/respawn/terminal) — both route through the same
+ * `terminateExecution` finalize-now path on expiry, so neither can wait
+ * forever.
  *
  * ── Wire frame shapes (e1 repin) ─────────────────────────────────────────────
  * `@baizor/pipeline-protocol` 0.4.0 carries the real mesh schemas (08-
@@ -129,6 +145,12 @@ export interface DepartmentOfferInput {
    *  direct `admitTask()` callers (tests; `makeOffer()`) that don't care about
    *  cross-attempt sequence collisions may omit it — defaults to 0. */
   eventSeqBase?: number;
+  /** Lease-scoped renewal credential (d2, 07 §6) — mirrors `job_jwt` on the
+   *  pipeline-dispatch `LeaseMessage`. Optional so direct `admitTask()`
+   *  callers that don't exercise renewal may omit it; renewal is simply
+   *  skipped for an execution with no lease token/ttl recorded. */
+  leaseToken?: string;
+  leaseTtlS?: number;
 }
 
 export type DepartmentRejectReason = 'busy' | 'capability' | 'policy' | 'broken_runtime';
@@ -160,6 +182,10 @@ export interface DepartmentManagerOptions {
 
 const DEFAULT_CAPACITY = 4;
 const DEFAULT_PER_CONTEXT_IDLE_MS = 15 * 60_000;
+/** Fallback park-expiry (d2, 07 §7) when neither the offer nor
+ *  `RuntimeConfig.parkExpirySeconds` states one — matches the design's own
+ *  `parkExpiry` example (`"7d"`, `08-protocol-delta.md` §4's `DeptLimits`). */
+const DEFAULT_PARK_EXPIRY_S = 7 * 24 * 60 * 60;
 
 interface ExecutionState {
   executionId: string;
@@ -187,6 +213,23 @@ interface ExecutionState {
    *  `event_seq_base` (08 §4 attempt-fencing), incremented per shipped event. */
   nextSeq: number;
   idleTimer: unknown;
+  // ── d2: leases, deadline, park-expiry ──────────────────────────────────
+  /** Null when this execution was admitted without lease info (direct
+   *  `admitTask()` callers) — `renewLeases()` simply skips it. */
+  leaseToken: string | null;
+  leaseTtlS: number | null;
+  /** Clock-ms of the last `department.lease_renew` actually sent (or of
+   *  admission, before the first renewal) — `renewLeases()` fires again once
+   *  `leaseTtlS/3` has elapsed since this. */
+  lastLeaseRenewalAt: number;
+  /** Wall-clock deadline this execution was offered (07 §7), or null when
+   *  admitted without one (direct `admitTask()` callers) — no timer armed. */
+  deadlineAtIso: string | null;
+  deadlineTimer: unknown;
+  /** Armed whenever the runtime reports `input_required`; cleared on answer
+   *  delivery, respawn, or terminal — the DoD's "a parked question expires
+   *  at the department's park expiry, not never". */
+  parkTimer: unknown;
 }
 
 export class DepartmentManager {
@@ -221,10 +264,12 @@ export class DepartmentManager {
     const offOffer = dispatcher.on('department.offer', (frame) => void this.handleOfferFrame(frame));
     const offMessage = dispatcher.on('department.message', (frame) => void this.handleMessageFrame(frame));
     const offCancel = dispatcher.on('department.cancel', (frame) => void this.handleCancelFrame(frame));
+    const offLeaseRevoked = dispatcher.on('department.lease_revoked', (frame) => this.handleLeaseRevokedFrame(frame));
     return () => {
       offOffer();
       offMessage();
       offCancel();
+      offLeaseRevoked();
     };
   }
 
@@ -306,11 +351,81 @@ export class DepartmentManager {
       journalPath,
       nextSeq: offer.eventSeqBase ?? 0,
       idleTimer: null,
+      leaseToken: offer.leaseToken ?? null,
+      leaseTtlS: offer.leaseTtlS ?? null,
+      lastLeaseRenewalAt: this.clock.now(),
+      deadlineAtIso: offer.deadlineAt ?? null,
+      deadlineTimer: null,
+      parkTimer: null,
     };
     this.executions.set(offer.executionId, state);
+    this.armDeadlineTimer(state);
 
     const started = await this.spawnAndStart(state);
     return started ? { accepted: true } : { accepted: false, reason: 'broken_runtime' };
+  }
+
+  // ── d2: lease renewal (called from the connection's heartbeat `onBeat`
+  //    hook, `../cli.ts` — rides the EXISTING cadence, never a 2nd timer,
+  //    07 §6) ────────────────────────────────────────────────────────────
+
+  /** Send `department.lease_renew` for every non-terminal execution whose
+   *  lease is due (TTL/3 since the last renewal, or since admission). A
+   *  failed send (runner offline) is retried on the next beat — never marked
+   *  renewed. */
+  renewLeases(): void {
+    const now = this.clock.now();
+    for (const state of this.executions.values()) {
+      if (state.terminal || state.leaseToken === null || state.leaseTtlS === null) continue;
+      const renewEveryMs = (state.leaseTtlS * 1000) / 3;
+      if (now - state.lastLeaseRenewalAt < renewEveryMs) continue;
+      const sent = this.options.send({
+        type: 'department.lease_renew',
+        execution_id: state.executionId,
+        lease_token: state.leaseToken,
+      });
+      if (sent) {
+        state.lastLeaseRenewalAt = now;
+      } else {
+        this.logger.warn(`department execution ${state.executionId}: lease_renew not sent — connection not online`);
+      }
+    }
+  }
+
+  // ── d2: lease revocation (cloud → runner) ───────────────────────────────
+
+  private handleLeaseRevokedFrame(frame: WireFrame): void {
+    const f = frame as Record<string, unknown>;
+    if (typeof f.execution_id !== 'string' || f.execution_id.length === 0) {
+      this.logger.warn('malformed department.lease_revoked ignored (missing execution_id)');
+      return;
+    }
+    this.handleLeaseRevoked(f.execution_id, typeof f.reason === 'string' && f.reason.length > 0 ? f.reason : 'lease revoked');
+  }
+
+  /** `department.lease_revoked` (07 §6): "stop; do not report further state".
+   *  Marks the execution terminal WITHOUT going through `reportTerminal` (that
+   *  would ship a final `department.event` — exactly the "further state" this
+   *  frame says not to report) and tears the runtime down locally,
+   *  best-effort. */
+  private handleLeaseRevoked(executionId: string, reason: string): void {
+    const state = this.executions.get(executionId);
+    if (state === undefined || state.terminal) return;
+    this.logger.warn(`department execution ${executionId}: lease revoked (${reason}) — stopping locally, reporting nothing further`);
+    state.terminal = true;
+    this.clearIdleTimer(state);
+    this.clearDeadlineTimer(state);
+    this.clearParkTimer(state);
+    const handle = state.handle;
+    state.handle = null;
+    if (handle !== null) {
+      void state.adapter.cancel(handle, reason).catch(() => {
+        /* best-effort — the lease is already gone either way */
+      });
+      void state.adapter.dispose(handle).catch((err) => {
+        this.logger.warn(`department execution ${executionId}: dispose() after lease_revoked failed: ${describeError(err)}`);
+      });
+    }
   }
 
   /** Deliver mid-task input. Live + capable ⇒ sent immediately. Otherwise
@@ -321,6 +436,10 @@ export class DepartmentManager {
     if (state === undefined || state.terminal) return { delivered: false, reason: 'unknown or terminal execution' };
     state.lastActivityAt = this.clock.now();
     state.messageHistory.push(message);
+
+    // An answer (or anything else fed in) ends the current parked wait — the
+    // park-expiry timer, if one is armed, no longer applies (d2).
+    this.clearParkTimer(state);
 
     if (state.handle !== null && state.handle.capabilities.midTaskInput) {
       await state.adapter.send(state.handle, { kind: 'message', message });
@@ -334,20 +453,32 @@ export class DepartmentManager {
     return { delivered: false, reason: 'runtime does not accept mid-task input — queued for the next task.start' };
   }
 
+  /**
+   * `department.cancel` (d2, 07 §7): politely ask (`adapter.cancel()` →
+   * `task.cancel`), then finalize IMMEDIATELY — never wait on the runtime's
+   * cooperation. Finalizing calls `reportTerminal`, which disposes the
+   * handle; `./jsonl-process.ts`'s `dispose()` is what actually SIGTERMs the
+   * process GROUP and SIGKILLs it after `gracefulShutdownSeconds` if it is
+   * still alive. Bounded, deterministic — not "wait for task.failed/exit".
+   */
   async cancelExecution(executionId: string, reason?: string): Promise<void> {
     const state = this.executions.get(executionId);
     if (state === undefined || state.terminal) return;
+    await this.terminateExecution(state, reason ?? 'canceled', false);
+  }
+
+  /** Shared finalize-now path for cancellation, a blown wall-clock deadline,
+   *  and an expired park (d2) — all three are "stop this execution, do not
+   *  wait for the runtime to agree", differing only in the reported reason. */
+  private async terminateExecution(state: ExecutionState, reason: string, retrySafe: boolean): Promise<void> {
     if (state.handle !== null) {
       try {
         await state.adapter.cancel(state.handle, reason);
       } catch (err) {
-        this.logger.warn(`department execution ${executionId}: cancel() failed: ${describeError(err)}`);
+        this.logger.warn(`department execution ${state.executionId}: cancel() failed: ${describeError(err)}`);
       }
-      return; // the runtime is expected to report task.failed/exit, which finalizes normally
     }
-    // No live process (evicted / never started) — nothing to signal; the
-    // cancellation itself is the terminal outcome.
-    await this.reportTerminal(state, { type: 'failed', reason: reason ?? 'canceled', retrySafe: false });
+    await this.reportTerminal(state, { type: 'failed', reason, retrySafe });
   }
 
   // ── Spawn / respawn ────────────────────────────────────────────────────
@@ -355,7 +486,14 @@ export class DepartmentManager {
   private async spawnAndStart(state: ExecutionState): Promise<boolean> {
     state.pendingQueue = []; // its contents are already IN messageHistory — see deliverMessage
     const task: DeptTaskSpec = { taskId: state.taskId, contextId: state.contextId, messages: state.messageHistory };
-    const invocation: InvocationEnvelope = { runtime: state.runtime, task };
+    const invocation: InvocationEnvelope = {
+      runtime: state.runtime,
+      task,
+      // Enforcement is THIS manager's job (armDeadlineTimer, d2, 07 §7) —
+      // surfaced here too only because an adapter MAY use it natively
+      // (adapter.ts's doc); jsonl-process does not read it.
+      ...(state.deadlineAtIso !== null ? { deadlineAt: state.deadlineAtIso } : {}),
+    };
     try {
       const handle = await state.adapter.start(invocation, (event) => this.handleRuntimeEvent(state, event));
       state.handle = handle;
@@ -380,6 +518,7 @@ export class DepartmentManager {
       state.respawnAttempted = true;
       state.handle = null;
       this.clearIdleTimer(state);
+      this.clearParkTimer(state); // the OLD process's parked wait is moot — the new one starts fresh
       this.logger.warn(
         `department execution ${state.executionId}: runtime gone (${event.reason}) — respawning with ${state.messageHistory.length} replayed message(s)`
       );
@@ -410,6 +549,13 @@ export class DepartmentManager {
       });
     }
 
+    // A parked question inherits the department's park expiry rather than
+    // waiting forever (d2, 07 §7) — armed whether or not the handle above
+    // was just evicted; `deliverMessage()`/respawn clear it.
+    if (event.type === 'input_required') {
+      this.armParkTimer(state);
+    }
+
     if (event.type === 'completed' || event.type === 'failed') {
       void this.reportTerminal(state, event);
       return;
@@ -422,6 +568,8 @@ export class DepartmentManager {
     if (state.terminal) return;
     state.terminal = true;
     this.clearIdleTimer(state);
+    this.clearDeadlineTimer(state);
+    this.clearParkTimer(state);
     this.journalRuntimeEvent(state, event);
     this.shipDepartmentEvent(state, event);
     if (state.handle !== null) {
@@ -505,6 +653,55 @@ export class DepartmentManager {
     // No re-arm: a future deliverMessage()/respawn re-establishes activity.
   }
 
+  // ── d2: wall-clock deadline (07 §7) ─────────────────────────────────────
+
+  /** Arm the execution's deadline timer from `state.deadlineAtIso` (the
+   *  offer's `deadline_at`) — a no-op when admitted without one (direct
+   *  `admitTask()` test callers). Armed ONCE, at admission; unaffected by
+   *  per-context respawns (the deadline bounds the whole EXECUTION, not any
+   *  one process instance). */
+  private armDeadlineTimer(state: ExecutionState): void {
+    if (state.deadlineAtIso === null) return;
+    const deadlineMs = Date.parse(state.deadlineAtIso);
+    if (!Number.isFinite(deadlineMs)) return;
+    const delay = Math.max(0, deadlineMs - this.clock.now());
+    state.deadlineTimer = this.clock.setTimeout(() => this.onDeadlineExceeded(state), delay);
+  }
+
+  private clearDeadlineTimer(state: ExecutionState): void {
+    if (state.deadlineTimer !== null) {
+      this.clock.clearTimeout(state.deadlineTimer);
+      state.deadlineTimer = null;
+    }
+  }
+
+  private onDeadlineExceeded(state: ExecutionState): void {
+    if (state.terminal) return;
+    this.logger.warn(`department execution ${state.executionId}: wall-clock deadline (${state.deadlineAtIso ?? '?'}) exceeded — cancelling`);
+    void this.terminateExecution(state, 'wall-clock deadline exceeded', false);
+  }
+
+  // ── d2: park expiry (07 §7 — "a parked question inherits the department's
+  //    park expiry rather than waiting forever") ──────────────────────────
+
+  private armParkTimer(state: ExecutionState): void {
+    this.clearParkTimer(state);
+    const seconds = state.runtime.parkExpirySeconds ?? DEFAULT_PARK_EXPIRY_S;
+    state.parkTimer = this.clock.setTimeout(() => this.onParkExpired(state), seconds * 1000);
+  }
+
+  private clearParkTimer(state: ExecutionState): void {
+    if (state.parkTimer !== null) {
+      this.clock.clearTimeout(state.parkTimer);
+      state.parkTimer = null;
+    }
+  }
+
+  private onParkExpired(state: ExecutionState): void {
+    if (state.terminal) return;
+    this.logger.warn(`department execution ${state.executionId}: parked question expired without an answer — cancelling`);
+    void this.terminateExecution(state, 'parked question expired without an answer', false);
+  }
 }
 
 function describeError(err: unknown): string {
@@ -587,6 +784,8 @@ function narrowOfferFrame(frame: WireFrame): DepartmentOfferInput | null {
     acceptedOutputModes: f.accepted_output_modes,
     deadlineAt: f.deadline_at,
     eventSeqBase: f.event_seq_base,
+    leaseToken: f.lease_token,
+    leaseTtlS: f.lease_ttl_s,
   };
 }
 

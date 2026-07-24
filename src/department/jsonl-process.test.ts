@@ -12,7 +12,7 @@ import { CaptureLogger, FakeClock } from '../../tests/_helpers';
 import type { RuntimeEvent } from './adapter';
 import { RuntimeAdapterError } from './adapter';
 import { FakeJobSpawn, makeInvocation, makeMessage } from './_test-helpers';
-import { INLINE_ARTIFACT_BYTES_LIMIT, JsonlProcessAdapter, narrowRuntimeEvent } from './jsonl-process';
+import { INLINE_ARTIFACT_BYTES_LIMIT, KILL_SETTLE_GRACE_MS, JsonlProcessAdapter, narrowRuntimeEvent } from './jsonl-process';
 
 function makeAdapter(): { adapter: JsonlProcessAdapter; spawner: FakeJobSpawn; clock: FakeClock; logger: CaptureLogger } {
   const spawner = new FakeJobSpawn();
@@ -262,7 +262,7 @@ describe('JsonlProcessAdapter — unexpected process exit', () => {
     expect(proc.written.some((l) => JSON.parse(l).type === 'shutdown')).toBe(true);
   });
 
-  test('dispose() force-kills after the grace window if the process never exits', async () => {
+  test('dispose() SIGTERMs the process GROUP immediately, then SIGKILLs the group after the grace window if it never exits (d2)', async () => {
     const { adapter, spawner, clock } = makeAdapter();
     const startPromise = adapter.start(
       makeInvocation({ runtime: { adapterId: 'jsonl-process', command: 'stuck-department', gracefulShutdownSeconds: 3 } }),
@@ -273,9 +273,34 @@ describe('JsonlProcessAdapter — unexpected process exit', () => {
     const handle = await startPromise;
 
     const disposePromise = adapter.dispose(handle);
-    clock.advance(3_000);
+    // SIGTERM is sent to the GROUP right away — not deferred until the grace
+    // window elapses (the pre-d2 behavior), and not the direct-child-only
+    // `kill()`.
+    expect(proc.killedGroupWith).toEqual(['SIGTERM']);
+    expect(proc.killedWith).toEqual([]);
+
+    clock.advance(3_000); // the grace window elapses — still no exit
+    expect(proc.killedGroupWith).toEqual(['SIGTERM', 'SIGKILL']);
+
+    clock.advance(KILL_SETTLE_GRACE_MS); // post-SIGKILL settle grace — dispose() gives up waiting
     await disposePromise;
-    expect(proc.killedWith).toContain('SIGTERM');
+  });
+
+  test('dispose() resolves as soon as the process actually exits, without waiting out the full grace window', async () => {
+    const { adapter, spawner, clock } = makeAdapter();
+    const startPromise = adapter.start(
+      makeInvocation({ runtime: { adapterId: 'jsonl-process', command: 'x', gracefulShutdownSeconds: 15 } }),
+      () => {}
+    );
+    const proc = spawner.last;
+    proc.emitJson({ type: 'ready', capabilities: { midTaskInput: true } });
+    const handle = await startPromise;
+
+    const disposePromise = adapter.dispose(handle);
+    clock.advance(500); // well short of the 15s grace window
+    proc.emitExit({ code: 0, signal: 'SIGTERM' });
+    await disposePromise; // resolves without the grace timer ever firing
+    expect(proc.killedGroupWith).toEqual(['SIGTERM']); // no SIGKILL — it exited first
   });
 });
 
@@ -288,6 +313,11 @@ describe('JsonlProcessAdapter — cancel()', () => {
     const handle = await startPromise;
     await adapter.cancel(handle, 'caller canceled');
     expect(proc.lastWrittenJson()).toEqual({ type: 'task.cancel', reason: 'caller canceled' });
+    // cancel() alone never touches the OS process — that escalation is
+    // dispose()'s job (d2), always invoked right after by the supervisor
+    // (`../manager.ts`'s `terminateExecution`).
+    expect(proc.killedGroupWith).toEqual([]);
+    expect(proc.killedWith).toEqual([]);
   });
 });
 

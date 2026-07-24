@@ -9,9 +9,16 @@
  * writes), so a fake would test nothing.
  */
 
+import { readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import type { ProcessHandle } from './types';
 import { nodeJobSpawn } from './types';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function waitForExit(proc: ProcessHandle): Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: string }> {
   return new Promise((resolve) => proc.onExit((info) => resolve(info)));
@@ -98,4 +105,61 @@ describe('nodeJobSpawn — real subprocess streaming', () => {
     expect(stdoutLines).toEqual(['ok']);
     expect(stderrChunks.join('')).toContain('oops');
   });
+});
+
+describe('nodeJobSpawn — killGroup() process-tree kill (department-mesh d2)', () => {
+  test('killGroup() reaches a GRANDCHILD the spawned process itself spawned — not just the direct child', async () => {
+    const spawner = nodeJobSpawn();
+    const heartbeatPath = join(tmpdir(), `pipeline-runner-d2-heartbeat-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+
+    // The grandchild: writes a fresh timestamp every 50ms and IGNORES
+    // SIGTERM, so it can ONLY be reaped by SIGKILL (POSIX) or an
+    // unconditional forceful terminate (Windows) — proving the kill reaches
+    // it directly, not merely because its parent happened to exit.
+    const grandchildScript =
+      "process.on('SIGTERM',()=>{});" +
+      "const fs=require('node:fs');" +
+      'const p=process.env.HEARTBEAT_PATH;' +
+      "const beat=()=>{try{fs.writeFileSync(p,String(Date.now()))}catch{}};" +
+      'beat();setInterval(beat,50);';
+
+    // The direct child: ALSO ignores SIGTERM, spawns the grandchild as an
+    // ordinary (non-detached) child of itself — inheriting this process's
+    // process group, exactly the tree `killGroup()` must reach — then idles.
+    const parentScript =
+      "process.on('SIGTERM',()=>{});" +
+      "const {spawn}=require('node:child_process');" +
+      `spawn(process.execPath,['-e',${JSON.stringify(grandchildScript)}],{stdio:'ignore',env:process.env,windowsHide:true});` +
+      'setTimeout(()=>{},30000);';
+
+    const proc = spawner.spawn(process.execPath, ['-e', parentScript], { env: { HEARTBEAT_PATH: heartbeatPath } });
+
+    try {
+      const readBeat = (): string | null => {
+        try {
+          return readFileSync(heartbeatPath, 'utf8');
+        } catch {
+          return null;
+        }
+      };
+
+      // Wait for the grandchild's first heartbeat (proves it's alive).
+      const spawnDeadline = Date.now() + 10_000;
+      while (readBeat() === null && Date.now() < spawnDeadline) await sleep(25);
+      expect(readBeat()).not.toBeNull();
+
+      proc.killGroup('SIGTERM'); // ignored by both on POSIX; unconditional on Windows
+      await sleep(300);
+      proc.killGroup('SIGKILL'); // the only signal neither process can ignore
+
+      // Give the (now-dead) grandchild a moment to prove it never beats again.
+      await sleep(500);
+      const afterKillA = readBeat();
+      await sleep(400);
+      const afterKillB = readBeat();
+      expect(afterKillA).toBe(afterKillB); // no further heartbeats — it's dead
+    } finally {
+      rmSync(heartbeatPath, { force: true });
+    }
+  }, 15_000);
 });

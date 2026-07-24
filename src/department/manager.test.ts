@@ -256,6 +256,250 @@ describe('DepartmentManager — idle eviction (per-context)', () => {
   });
 });
 
+describe('DepartmentManager — lease renewal (d2, 07 §6)', () => {
+  test('renewLeases() sends department.lease_renew at TTL/3, repeatedly, for a long-running execution', async () => {
+    const { manager, runtimes, clock, sink } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer({ leaseToken: 'lease-abc', leaseTtlS: 90 })); // TTL/3 = 30s
+
+    clock.advance(29_000);
+    manager.renewLeases();
+    expect(sink.frames.filter((f) => f.type === 'department.lease_renew')).toHaveLength(0);
+
+    clock.advance(1_000); // 30s total — due
+    manager.renewLeases();
+    expect(sink.frames.filter((f) => f.type === 'department.lease_renew')).toEqual([
+      { type: 'department.lease_renew', execution_id: 'dexec-1', lease_token: 'lease-abc' },
+    ]);
+
+    // A LONG task: renewal keeps firing every 30s, well past the original
+    // 90s TTL — the DoD's "lease renewal keeps a long task alive" (the cloud
+    // is what actually expires an unrenewed lease; this proves the runner
+    // side keeps feeding it).
+    clock.advance(30_000);
+    manager.renewLeases();
+    clock.advance(30_000);
+    manager.renewLeases();
+    expect(sink.frames.filter((f) => f.type === 'department.lease_renew')).toHaveLength(3);
+  });
+
+  test('an execution admitted without lease info is silently skipped, never renewed', async () => {
+    const { manager, runtimes, clock, sink } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer()); // no leaseToken/leaseTtlS
+    clock.advance(1_000_000);
+    manager.renewLeases();
+    expect(sink.frames.filter((f) => f.type === 'department.lease_renew')).toHaveLength(0);
+  });
+
+  test('a terminal execution is never renewed', async () => {
+    const { manager, adapter, runtimes, clock, sink } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer({ leaseToken: 'lease-abc', leaseTtlS: 90 }));
+    adapter.emitLatest({ type: 'completed', summary: 'done' });
+    clock.advance(1_000_000);
+    manager.renewLeases();
+    expect(sink.frames.filter((f) => f.type === 'department.lease_renew')).toHaveLength(0);
+  });
+
+  test('a failed send (runner offline) is retried on the next call, never marked renewed', async () => {
+    const clock = new FakeClock();
+    const adapter = new FakeAdapter();
+    const runtimes = new Map<string, RuntimeConfig>([['unity-department', { adapterId: 'fake', command: 'x' }]]);
+    let sendOk = true;
+    const sent: WireFrame[] = [];
+    const manager = new DepartmentManager({
+      adapters: [adapter],
+      resolveRuntimeConfig: (id) => runtimes.get(id) ?? null,
+      send: (frame) => {
+        if (frame.type === 'department.lease_renew' && !sendOk) return false;
+        sent.push(frame);
+        return true;
+      },
+      dispatcher: NULL_DISPATCHER,
+      journal: new MemJournal(),
+      journalRoot: '/data/department',
+      clock,
+      logger: new CaptureLogger(),
+    });
+    await manager.admitTask(makeOffer({ leaseToken: 'lease-abc', leaseTtlS: 90 }));
+
+    sendOk = false;
+    clock.advance(30_000);
+    manager.renewLeases();
+    expect(sent.filter((f) => f.type === 'department.lease_renew')).toHaveLength(0);
+
+    sendOk = true;
+    manager.renewLeases(); // retried right away — the miss was never marked renewed
+    expect(sent.filter((f) => f.type === 'department.lease_renew')).toHaveLength(1);
+  });
+});
+
+describe('DepartmentManager — lease revocation (d2, 07 §6)', () => {
+  function makeWiredForRevoke() {
+    const dispatcher = new Dispatcher();
+    const clock = new FakeClock();
+    const journal = new MemJournal();
+    const sink = new FrameSink();
+    const adapter = new FakeAdapter();
+    const runtimes = new Map<string, RuntimeConfig>([['unity-department', { adapterId: 'fake', command: 'x' }]]);
+    const manager = new DepartmentManager({
+      adapters: [adapter],
+      resolveRuntimeConfig: (id) => runtimes.get(id) ?? null,
+      send: sink.send,
+      dispatcher,
+      journal,
+      journalRoot: '/data/department',
+      clock,
+      logger: new CaptureLogger(),
+    });
+    manager.attach(dispatcher);
+    return { manager, dispatcher, adapter, sink };
+  }
+
+  test('department.lease_revoked stops the execution and ships NOTHING further', async () => {
+    const { manager, dispatcher, adapter, sink } = makeWiredForRevoke();
+    await manager.admitTask(makeOffer());
+    expect(manager.activeCount).toBe(1);
+
+    dispatcher.dispatch({ type: 'department.lease_revoked', execution_id: 'dexec-1', reason: 'reassigned to another runner' });
+    await tick();
+
+    expect(manager.activeCount).toBe(0);
+    expect(sink.frames.filter((f) => f.type === 'department.event')).toHaveLength(0);
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+    expect(adapter.calls.filter((c) => c.kind === 'dispose')).toHaveLength(1);
+
+    // A late runtime event after revocation must also ship nothing.
+    adapter.emitLatest({ type: 'completed', summary: 'too late' });
+    expect(sink.frames.filter((f) => f.type === 'department.event')).toHaveLength(0);
+  });
+
+  test('a malformed department.lease_revoked (missing execution_id) is ignored', async () => {
+    const { manager, dispatcher } = makeWiredForRevoke();
+    await manager.admitTask(makeOffer());
+    dispatcher.dispatch({ type: 'department.lease_revoked', reason: 'x' });
+    await tick();
+    expect(manager.activeCount).toBe(1); // untouched
+  });
+});
+
+describe('DepartmentManager — cancellation finalizes promptly, not on the runtime\'s cooperation (d2, 07 §7)', () => {
+  test('cancelExecution() finalizes immediately — no waiting on the runtime to self-report', async () => {
+    const { manager, adapter, runtimes, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer());
+    expect(manager.activeCount).toBe(1);
+
+    await manager.cancelExecution('dexec-1', 'caller canceled');
+
+    expect(manager.activeCount).toBe(0); // finalized synchronously
+    const cancelCalls = adapter.calls.filter((c) => c.kind === 'cancel');
+    expect(cancelCalls).toHaveLength(1);
+    expect(cancelCalls[0]!.reason).toBe('caller canceled');
+    expect(adapter.calls.filter((c) => c.kind === 'dispose')).toHaveLength(1);
+    const types = journal.parsedLines(journalPathFor('dexec-1')).map((l) => l.type);
+    expect(types).toContain('department.failed');
+  });
+
+  test('a late task.failed AFTER cancel is a no-op — no double-report, no respawn', async () => {
+    const { manager, adapter, runtimes, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', lifecycle: 'per-context' });
+    await manager.admitTask(makeOffer());
+    const handle = adapter.lastHandle;
+
+    await manager.cancelExecution('dexec-1');
+    expect(manager.activeCount).toBe(0);
+
+    // The runtime's own (stale) response arrives after the fact.
+    adapter.emit(handle, { type: 'failed', reason: 'late response', retrySafe: true });
+    expect(adapter.startCalls()).toHaveLength(1); // no respawn triggered
+    const types = journal.parsedLines(journalPathFor('dexec-1')).map((l) => l.type);
+    expect(types.filter((t) => t === 'department.failed')).toHaveLength(1); // exactly one, from the cancel
+  });
+});
+
+describe('DepartmentManager — wall-clock deadline (d2, 07 §7)', () => {
+  test('a deadline fires on a runtime that never exits', async () => {
+    const { manager, adapter, runtimes, clock, journal, sink } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    const deadlineAt = new Date(clock.now() + 3_600_000).toISOString(); // 1h out
+    await manager.admitTask(makeOffer({ deadlineAt }));
+    expect(manager.activeCount).toBe(1);
+
+    clock.advance(3_600_000);
+    await tick(); // onDeadlineExceeded's terminateExecution() is fire-and-forget
+
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+    expect(manager.activeCount).toBe(0);
+    const types = journal.parsedLines(journalPathFor('dexec-1')).map((l) => l.type);
+    expect(types).toContain('department.failed');
+    const shipped = sink.frames.find((f) => f.type === 'department.event');
+    expect(shipped).toMatchObject({ event: { type: 'failed', reason: 'wall-clock deadline exceeded' } });
+  });
+
+  test('completing before the deadline clears the timer — no spurious cancel afterward', async () => {
+    const { manager, adapter, runtimes, clock } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    const deadlineAt = new Date(clock.now() + 3_600_000).toISOString();
+    await manager.admitTask(makeOffer({ deadlineAt }));
+    adapter.emitLatest({ type: 'completed', summary: 'done early' });
+    expect(manager.activeCount).toBe(0);
+
+    clock.advance(3_600_000); // deadline would have fired — must be a no-op now
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(0);
+  });
+
+  test('an execution admitted without a deadline never gets cancelled by one', async () => {
+    const { manager, adapter, runtimes, clock } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer()); // no deadlineAt
+    clock.advance(100 * 3_600_000);
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(0);
+    expect(manager.activeCount).toBe(1);
+  });
+});
+
+describe('DepartmentManager — park expiry (d2, 07 §7 — "a parked question inherits the department\'s park expiry")', () => {
+  test('a parked question expires at the department park expiry, not never', async () => {
+    const { manager, adapter, runtimes, clock, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    clock.advance(60_000);
+    await tick(); // onParkExpired's terminateExecution() is fire-and-forget
+
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+    expect(manager.activeCount).toBe(0);
+    const types = journal.parsedLines(journalPathFor('dexec-1')).map((l) => l.type);
+    expect(types).toContain('department.failed');
+  });
+
+  test('an answer delivered before the park expiry clears the timer — no spurious expiry', async () => {
+    const { manager, adapter, runtimes, clock } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    await manager.deliverMessage('dexec-1', makeMessage({ messageId: 'answer-1' }));
+    clock.advance(60_000); // would have expired — must be a no-op now
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(0);
+    expect(manager.activeCount).toBe(1);
+  });
+
+  test('with no parkExpirySeconds configured, the default (7 days) applies — not never', async () => {
+    const { manager, adapter, runtimes, clock } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' }); // no parkExpirySeconds
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    clock.advance(7 * 24 * 60 * 60 * 1000);
+    await tick();
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+  });
+});
+
 describe('DepartmentManager — wire attachment (attach(), real protocol 0.4.0 frame shapes)', () => {
   function makeWiredManager() {
     const dispatcher = new Dispatcher();

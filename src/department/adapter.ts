@@ -79,6 +79,16 @@ export interface RuntimeConfig {
   startupTimeoutSeconds?: number;
   /** Grace window between `shutdown`/SIGTERM and a hard kill on dispose. */
   gracefulShutdownSeconds?: number;
+  /** How long a PARKED task (`input_required`, no answer yet) stays alive
+   *  before the supervisor expires it (department-mesh task d2; 07 §7 —
+   *  "a parked question inherits the department's park expiry rather than
+   *  waiting forever"). The real source is a department's manifest
+   *  (`department.config_update.limits.parkExpiry`, e.g. `"7d"`), which
+   *  install/config-caching (task c2) has not wired onto the runner yet —
+   *  this is the SAME placeholder env-driven seam `startupTimeoutSeconds`/
+   *  `gracefulShutdownSeconds` already use ahead of that. Default:
+   *  `./manager.ts`'s `DEFAULT_PARK_EXPIRY_S` (7 days). */
+  parkExpirySeconds?: number;
   lifecycle?: RuntimeLifecycle;
 }
 

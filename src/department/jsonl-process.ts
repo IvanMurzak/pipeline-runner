@@ -27,6 +27,20 @@
  *   - An unexpected process exit (no `task.completed`/`task.failed` seen, and
  *     not a deliberate `dispose()`) is surfaced as a synthetic
  *     `{type:'failed', retrySafe:true}` event, never silently dropped.
+ *
+ * ── Kill escalation (department-mesh, task d2; 07 §7) ───────────────────────
+ * `cancel()` stays a polite ask (`task.cancel` down the pipe) — real teardown
+ * lives entirely in `dispose()`, which EVERY termination path (`./manager.ts`'s
+ * `reportTerminal`) already calls exactly once. `dispose()` now SIGTERMs the
+ * whole process GROUP immediately (`ProcessHandle.killGroup()`,
+ * `../jobs/types.ts`), then SIGKILLs the group if it is still alive after
+ * `gracefulShutdownSeconds` — closing the "grandchildren survive, no SIGKILL
+ * escalation" gap the old direct-child-only `kill()` left open. The
+ * supervisor drives the SAME path for an explicit `department.cancel`: it
+ * calls `cancel()` for the polite ask, then immediately finalizes via
+ * `reportTerminal` → this `dispose()` — cancellation is bounded by
+ * `gracefulShutdownSeconds`, never left waiting indefinitely on the runtime's
+ * cooperation.
  */
 
 import type { Clock } from '../core/clock';
@@ -57,6 +71,10 @@ export const DEFAULT_GRACEFUL_SHUTDOWN_S = 15;
 export const DEFAULT_PROBE_TIMEOUT_S = 10;
 /** 07 §3: "Inline `bytes` are permitted only under 64 KiB." */
 export const INLINE_ARTIFACT_BYTES_LIMIT = 64 * 1024;
+/** d2 kill escalation: how long `dispose()` waits for a confirmed exit after
+ *  the group SIGKILL before giving up and resolving anyway — a safety net,
+ *  not a real-world expectation (SIGKILL/`taskkill /F` do not fail). */
+export const KILL_SETTLE_GRACE_MS = 2_000;
 
 export interface JsonlProcessAdapterOptions {
   spawn?: JobSpawn;
@@ -396,17 +414,44 @@ export class JsonlProcessAdapter implements AgentRuntimeAdapter {
     handle.disposing = true;
     writeDown(handle.proc, buildShutdownDown(handle.gracefulShutdownSeconds));
     handle.proc.endStdin();
-    // Best-effort grace then a direct-child SIGTERM (NOT a process-group
-    // kill — that escalation, and SIGKILL-after-grace, is task d2's scope;
-    // this mirrors today's `types.ts:96-103` limitation deliberately).
-    await new Promise<void>((resolve) => {
-      const timer = this.clock.setTimeout(() => {
-        handle.proc.kill('SIGTERM');
+    await this.terminateProcessGroup(handle);
+  }
+
+  /**
+   * The d2 kill escalation (07 §7): SIGTERM the whole process GROUP right
+   * away, then SIGKILL the group after `gracefulShutdownSeconds` if it is
+   * still alive. Resolves as soon as the process is confirmed exited, or
+   * after a short settle grace past the SIGKILL as a last-resort safety net
+   * (defends against a `killGroup()` seam — real or faked — that never
+   * surfaces an `onExit`).
+   *
+   * Re-registers `onExit` — safe here because `handle.disposing` is already
+   * `true` by the time this runs (set in `dispose()` just above), so the
+   * ORIGINAL handshake/active-phase exit handler (`runHandshakeThenStart`)
+   * would have no-op'd on this exit anyway (its own guard checks
+   * `handle.disposing`) — overwriting it loses nothing.
+   */
+  private terminateProcessGroup(handle: JsonlHandle): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      let settleTimer: unknown = null;
+      const settle = (): void => {
+        if (settled) return;
+        settled = true;
+        if (settleTimer !== null) this.clock.clearTimeout(settleTimer);
         resolve();
+      };
+
+      handle.proc.killGroup('SIGTERM');
+
+      const killTimer = this.clock.setTimeout(() => {
+        handle.proc.killGroup('SIGKILL');
+        settleTimer = this.clock.setTimeout(settle, KILL_SETTLE_GRACE_MS);
       }, handle.gracefulShutdownSeconds * 1000);
+
       handle.proc.onExit(() => {
-        this.clock.clearTimeout(timer);
-        resolve();
+        this.clock.clearTimeout(killTimer);
+        settle();
       });
     });
   }
