@@ -1,0 +1,61 @@
+src/cli.ts
+  s_ddab4fcf9dfea4::t_062d3c51aa7730 8,12-15
+  s_ddab4fcf9dfea4::t_a2a78cd0f18f7b 93
+  s_ddab4fcf9dfea4::t_f35e3aabc2dcc1 71-75
+  s_ddab4fcf9dfea4::t_05703a3a469446 116,126-144,156-160
+  s_ddab4fcf9dfea4::t_352e0b24e5d60b 30
+  s_ddab4fcf9dfea4::t_f226f54e75b3ca 338,350-356,364
+src/department/_adapter-conformance.ts
+  s_ddab4fcf9dfea4::t_47beb37f40f8a1 1-20,22-31,41-60,70-73,75-358
+  s_ddab4fcf9dfea4::t_23c556fe7a785e 21,32-40
+  s_ddab4fcf9dfea4::t_d95ffbf79cfef0 74
+  s_ddab4fcf9dfea4::t_caa015ed1a7ab7 61-69
+src/department/container.test.ts
+  s_ddab4fcf9dfea4::t_54724945006aa7 523-526
+  s_ddab4fcf9dfea4::t_767c6553d5e198 1-21,23-25,30-59,61-63,65-68,81-92,94-110,112-145,147-151,153-216,218-220,248-458
+  s_ddab4fcf9dfea4::t_30c4a1e60a0420 234-238,240
+  s_ddab4fcf9dfea4::t_c6e3bd98081fae 26-28
+  s_ddab4fcf9dfea4::t_78f159f5085458 22
+  s_ddab4fcf9dfea4::t_3e22731d4bb38d 29
+  s_ddab4fcf9dfea4::t_97c89949697217 60,64
+  s_ddab4fcf9dfea4::t_fbe6f70e95b957 217
+  s_ddab4fcf9dfea4::t_cc52fe16082a10 459-476,480-492,494-497,503-518,537-542
+  s_ddab4fcf9dfea4::t_322ecb3dc3764a 221-228,241,246-247
+  s_ddab4fcf9dfea4::t_88b3c23912f89d 229-232,242-245
+  s_ddab4fcf9dfea4::t_bfe60792c6ff27 111
+  s_ddab4fcf9dfea4::t_c4e8e2df27e7dd 477-479,493,498-502,521-522,527-528
+  s_ddab4fcf9dfea4::t_367b9e5fd3cc7f 69-80,93
+  s_ddab4fcf9dfea4::t_b0a128e8c62cdb 233,239
+  s_ddab4fcf9dfea4::t_9fa9efcc549ef2 146,152
+  s_ddab4fcf9dfea4::t_815cd7491dbd1d 519-520,529-536
+src/department/config.test.ts
+  s_ddab4fcf9dfea4::t_8258b3b588a17b 64-121
+src/department/container.ts
+  s_ddab4fcf9dfea4::t_6390a285872ef9 1-119,135-136,138-254,306-525
+  s_ddab4fcf9dfea4::t_71064ec529503c 255-305
+  s_ddab4fcf9dfea4::t_62050c36fce9de 120-134,137
+src/department/adapter.ts
+  s_ddab4fcf9dfea4::t_2b5d336139c893 93-96
+  s_ddab4fcf9dfea4::t_36f176c75000b2 108-183
+src/core/capabilities.ts
+  s_ddab4fcf9dfea4::t_b2a0d224317ec1 28-36
+src/department/config.ts
+  s_ddab4fcf9dfea4::t_31da15b48d7003 78-81
+  s_ddab4fcf9dfea4::t_0137bea740c296 15-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "c85d3ed941e61de5fe3beb653d1454ee9a1b632c",
+  "prompts": {},
+  "sessions": {
+    "s_ddab4fcf9dfea4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72ad2e76-6d1b-4b13-a97d-6977aca140cf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
