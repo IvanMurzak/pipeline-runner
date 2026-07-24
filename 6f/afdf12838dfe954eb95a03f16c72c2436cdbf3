@@ -1,0 +1,67 @@
+src/jobs/types.ts
+  s_ddab4fcf9dfea4::t_8bef27dd16472d 184-194
+  s_ddab4fcf9dfea4::t_0fcbac283fbc5d 30-42,45
+  s_ddab4fcf9dfea4::t_a1ab90ec776883 330-332
+  s_ddab4fcf9dfea4::t_81f62286b12b5d 234-269,278
+src/department/config.test.ts
+  s_ddab4fcf9dfea4::t_a59c4c76885fbd 51-63
+src/department/manager.ts
+  s_ddab4fcf9dfea4::t_1ee96788402fc9 148-153
+  s_ddab4fcf9dfea4::t_c0494f293e53d9 489-496
+  s_ddab4fcf9dfea4::t_79fa5ee168afad 571-572
+  s_ddab4fcf9dfea4::t_922d31e106c54a 440-443,456-463,467-473,478,481
+  s_ddab4fcf9dfea4::t_d6f1809f41a21b 185-188
+  s_ddab4fcf9dfea4::t_5505caf979e352 267,272
+  s_ddab4fcf9dfea4::t_50b4c17717c28f 216-232
+  s_ddab4fcf9dfea4::t_e4f859b7abe4e6 354-359,362,368-428
+  s_ddab4fcf9dfea4::t_f5e445f23ae887 521
+  s_ddab4fcf9dfea4::t_7b93d9d87870c4 552-558
+  s_ddab4fcf9dfea4::t_c429367057f74e 787-788
+  s_ddab4fcf9dfea4::t_4ff4c5bd0f3f48 429,656-704
+  s_ddab4fcf9dfea4::t_6c3e789bec64cc 13-31
+  s_ddab4fcf9dfea4::t_85c34a8b3e0eb2 430
+src/department/adapter.ts
+  s_ddab4fcf9dfea4::t_79dd87e31f8947 82-91
+src/cli.ts
+  s_ddab4fcf9dfea4::t_305b288f4300cd 202-207
+  s_ddab4fcf9dfea4::t_3941618366ed3b 266-273,277
+  s_ddab4fcf9dfea4::t_4d09f8099eaa9e 170-175
+src/jobs/types.test.ts
+  s_ddab4fcf9dfea4::t_c755453d5f5587 12-14,19-21
+  s_ddab4fcf9dfea4::t_49fbd8152f5a53 109-165
+  s_ddab4fcf9dfea4::t_3ba57fb5f77662 22
+src/department/manager.test.ts
+  s_ddab4fcf9dfea4::t_a0a1af81165a25 498
+  s_ddab4fcf9dfea4::t_d126ae1310bbba 431
+  s_ddab4fcf9dfea4::t_0f1933cb158899 471
+  s_ddab4fcf9dfea4::t_242ca6ffeca409 259-430,432-470,472-497,499-502
+src/department/config.ts
+  s_ddab4fcf9dfea4::t_60d0bd4a09a015 68-70
+src/department/_test-helpers.ts
+  s_ddab4fcf9dfea4::t_baed9092541b9d 56-59
+  s_ddab4fcf9dfea4::t_57008256975585 32-35
+src/department/jsonl-process.test.ts
+  s_ddab4fcf9dfea4::t_71a8d1aa2a5366 316-320
+  s_ddab4fcf9dfea4::t_029263cd5d182e 15
+  s_ddab4fcf9dfea4::t_8e350d4949d6df 265,276-285,287-303
+src/department/jsonl-process.ts
+  s_ddab4fcf9dfea4::t_c27cc0462aa543 417-441,443-449,451,453-454
+  s_ddab4fcf9dfea4::t_722cd5fd63c8e8 30-43
+  s_ddab4fcf9dfea4::t_8493d82088236d 74-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "6fafdf12838dfe954eb95a03f16c72c2436cdbf3",
+  "prompts": {},
+  "sessions": {
+    "s_ddab4fcf9dfea4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72ad2e76-6d1b-4b13-a97d-6977aca140cf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
