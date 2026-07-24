@@ -95,6 +95,11 @@ export interface RuntimeConfig {
    *  root/explicit-mounts/egress-allowlist spec. Every other adapter ignores
    *  this field entirely. */
   container?: ContainerSpec;
+  /** `pipeline-drive` adapter only (task d4, see the section below) — the
+   *  fields `../jobs/drive.ts`'s `DriveTarget`/`DriveMode('start')` need
+   *  beyond what `command`/`cwd`/`env` above already supply. Every other
+   *  adapter ignores this field entirely. */
+  pipelineDrive?: PipelineDriveSpec;
 }
 
 export interface ProbeResult {
@@ -104,6 +109,35 @@ export interface ProbeResult {
   capabilities?: RuntimeCapabilities;
   /** Present when `ok:false` — why the probe failed. */
   reason?: string;
+}
+
+// ── `pipeline-drive` adapter spec (department-mesh, task d4; 07 §2.1) ───────
+// Read by the `pipeline-drive` adapter ONLY (`./pipeline-drive.ts`) — mirrors
+// `../jobs/drive.ts`'s `DriveTarget` fields exactly (that file is NOT changed
+// by this task), so `buildDriveArgs` produces byte-identical argv whether
+// called from the untouched pipeline-dispatch path (`../jobs/executor.ts`) or
+// from this adapter — "one adapter abstraction serves both dispatch paths"
+// without a second implementation of the contract.
+
+/** One `pipeline-drive` department's static configuration — analogous to
+ *  `ContainerSpec` for the `container` adapter. Deliberately does NOT carry
+ *  `runId`: the adapter uses the invocation's own `DeptTaskSpec.taskId` for
+ *  that (one department task IS one drive run, the same relationship a
+ *  pipeline-dispatch lease's `run_id` has to its job). */
+export interface PipelineDriveSpec {
+  /** Absolute pipeline root inside the checkout (`--root`) — mirrors
+   *  `DriveTarget.pipelineRoot`. */
+  pipelineRoot: string;
+  /** Entry iteration for the initial `--start` (root-relative, e.g.
+   *  `steps/01-plan.md`) — mirrors `DriveMode`'s `start` variant. */
+  startIteration: string;
+  /** Mirrors `DriveTarget.defaultModel` (`--default-model`). */
+  defaultModel?: string;
+  /** Mirrors `DriveTarget.defaultEffort` (`--default-effort`). */
+  defaultEffort?: string;
+  /** Mirrors `DriveTarget.variables` (`--var NAME=value`, START invocation
+   *  only — `buildDriveArgs` itself enforces that, unchanged). */
+  variables?: Record<string, string>;
 }
 
 // ── `container` isolation-tier spec (department-mesh, task d8; 07 §2.1/§2.2,

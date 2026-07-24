@@ -119,4 +119,50 @@ describe('parseDepartmentRuntimesEnv', () => {
       expect('container' in (map.get('d') ?? {})).toBe(false);
     });
   });
+
+  // department-mesh d4: an `adapterId: "pipeline-drive"` entry carries its
+  // drive-target spec under `pipelineDrive` — parsed via
+  // `./pipeline-drive.ts`'s `narrowPipelineDriveSpec`.
+  describe('pipelineDrive spec (d4)', () => {
+    test('a well-formed pipelineDrive entry parses the full spec', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({
+          release: {
+            adapterId: 'pipeline-drive',
+            command: 'pipeline',
+            pipelineDrive: {
+              pipelineRoot: '/ws/.claude/pipeline/release',
+              startIteration: 'steps/01-plan.md',
+              defaultModel: 'opus',
+              defaultEffort: 'high',
+              variables: { PP_SERVICE: 'payments' },
+            },
+          },
+        })
+      );
+      expect(map.get('release')?.adapterId).toBe('pipeline-drive');
+      expect(map.get('release')?.pipelineDrive).toEqual({
+        pipelineRoot: '/ws/.claude/pipeline/release',
+        startIteration: 'steps/01-plan.md',
+        defaultModel: 'opus',
+        defaultEffort: 'high',
+        variables: { PP_SERVICE: 'payments' },
+      });
+    });
+
+    test('a pipelineDrive entry with no startIteration narrows to undefined — the whole entry still parses', () => {
+      const logger = new CaptureLogger();
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({ d: { adapterId: 'pipeline-drive', command: 'pipeline', pipelineDrive: { pipelineRoot: '/root' } } }),
+        logger
+      );
+      expect(map.get('d')?.adapterId).toBe('pipeline-drive');
+      expect(map.get('d')?.pipelineDrive).toBeUndefined();
+    });
+
+    test('an entry with no pipelineDrive key at all leaves RuntimeConfig.pipelineDrive unset', () => {
+      const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd' } }));
+      expect('pipelineDrive' in (map.get('d') ?? {})).toBe(false);
+    });
+  });
 });

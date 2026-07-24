@@ -82,6 +82,14 @@ import { ContainerAdapter, probeContainerRuntimeAvailable } from './department/c
 import { ExecutionTokenManager } from './department/execution-token-manager';
 import { JsonlProcessAdapter } from './department/jsonl-process';
 import { DepartmentManager, nodeJournalWriter } from './department/manager';
+// department-mesh d4 (P5 consolidation): `pipeline drive` ported onto the
+// SAME `AgentRuntimeAdapter` abstraction, wrapping `../jobs/drive.ts`'s
+// argv/outcome contract unchanged — an ADDITIONAL registry entry, resolved by
+// `RuntimeConfig.adapterId === 'pipeline-drive'` exactly like `container`
+// above. The pipeline-DISPATCH path (`JobExecutor`, wired further down this
+// file) is untouched and does NOT go through this adapter — see
+// `./department/pipeline-drive.ts`'s module doc for why.
+import { PipelineDriveAdapter } from './department/pipeline-drive';
 
 const REGISTER_ONCE_TIMEOUT_MS = 30_000;
 
@@ -343,11 +351,10 @@ function runStart(argv: string[] = []): void {
   });
 
   // department-mesh (task d1): the adapter registry starts with
-  // `jsonl-process` (the flagship) — `pipeline-drive` joins it when d4 ports
-  // the existing dispatch path onto the same abstraction. Runtime resolution
-  // is env-driven for now (see the import doc); a `department.offer` for an
-  // unresolvable department_id gets a `capability` reject, same as an
-  // offer this runner genuinely cannot serve.
+  // `jsonl-process` (the flagship). Runtime resolution is env-driven for now
+  // (see the import doc); a `department.offer` for an unresolvable
+  // department_id gets a `capability` reject, same as an offer this runner
+  // genuinely cannot serve.
   //
   // d2 (real leases, reject, process-group kill, deadlines) is wired here:
   // `renewLeases()` rides the heartbeat `onBeat` hook above; reject-with-
@@ -360,6 +367,12 @@ function runStart(argv: string[] = []): void {
   // every other department keeps running exactly as before. Registering the
   // adapter here does NOT itself advertise the `container` capability — that
   // is `register --container`'s job (above), gated on a live docker probe.
+  //
+  // d4 (P5 consolidation): `PipelineDriveAdapter` is registered the SAME way —
+  // a department only reaches it when its resolved `RuntimeConfig.adapterId
+  // === 'pipeline-drive'`; every other department (and, separately, the
+  // pipeline-DISPATCH path below, which never touches this registry at all)
+  // keeps running exactly as before.
   //
   // KNOWN GAP (deliberate, still open post-d2): unlike `manager`/
   // `shipperLifecycle` above, department executions are NOT yet wired into
@@ -379,7 +392,11 @@ function runStart(argv: string[] = []): void {
     logger: consoleLogger,
   });
   departmentManager = new DepartmentManager({
-    adapters: [new JsonlProcessAdapter({ logger: consoleLogger }), new ContainerAdapter({ logger: consoleLogger })],
+    adapters: [
+      new JsonlProcessAdapter({ logger: consoleLogger }),
+      new ContainerAdapter({ logger: consoleLogger }),
+      new PipelineDriveAdapter({ logger: consoleLogger }),
+    ],
     resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
     send: (frame) => client.send(frame),
     dispatcher: client.dispatcher,

@@ -19,7 +19,9 @@
  * stdin, and stdout/stderr only become visible once the process exits
  * (07-runtime-contract.md §1: "no stdin ⇒ no mid-task message ⇒ no multi-turn
  * while working"). That contract stays exactly as-is for `pipeline drive`
- * (untouched here; d4 later ports it onto the adapter abstraction unchanged).
+ * (untouched here; task d4 ports it onto the adapter abstraction unchanged —
+ * `../department/pipeline-drive.ts` — reusing this exact `JobExec` seam,
+ * unmodified, for the SAME reason: buffered is what the contract IS).
  *
  * `JobSpawn`/`ProcessHandle` below is the SIBLING, STREAMING seam a
  * bidirectional protocol needs: stdin as a live pipe the caller can write to
