@@ -13,6 +13,20 @@
  *
  * Import-inert: importing this module (and constructing the real seams) starts
  * no timers, spawns no processes, opens no sockets.
+ *
+ * ── The generalized spawn seam (department-mesh, task d1) ───────────────────
+ * `JobExec.run()` above is BUFFERED: `stdio: ['ignore','pipe','pipe']` — no
+ * stdin, and stdout/stderr only become visible once the process exits
+ * (07-runtime-contract.md §1: "no stdin ⇒ no mid-task message ⇒ no multi-turn
+ * while working"). That contract stays exactly as-is for `pipeline drive`
+ * (untouched here; d4 later ports it onto the adapter abstraction unchanged).
+ *
+ * `JobSpawn`/`ProcessHandle` below is the SIBLING, STREAMING seam a
+ * bidirectional protocol needs: stdin as a live pipe the caller can write to
+ * at any time, and stdout delivered incrementally, one COMPLETE line at a
+ * time, as it is produced — not buffered until close. This is the seam the
+ * `jsonl-process` runtime adapter (`../department/jsonl-process.ts`) spawns
+ * its child through; nothing about `JobExec` changes.
  */
 
 import { spawn } from 'node:child_process';
@@ -120,6 +134,149 @@ export function nodeJobExec(): JobExec {
           settle({ code: null, stdout, stderr, error: err instanceof Error ? err.message : String(err) });
         }
       });
+    },
+  };
+}
+
+// ── The streaming spawn seam (stdin pipe + incremental stdout lines) ────────
+
+/** Options for a streaming spawn — the same shape as `JobExecOptions` minus
+ *  `signal` (a streaming caller kills the handle directly instead). */
+export interface ProcessSpawnOptions {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * A live child process whose stdin is a WRITABLE PIPE and whose stdout is
+ * delivered as complete, already-split lines — the seam a streaming,
+ * bidirectional protocol needs. Unlike `JobExec.run()`, this returns
+ * SYNCHRONOUSLY with a live handle; nothing here waits for exit.
+ *
+ * Single-subscriber by design (deliberately tiny, mirrors `JobFs`): each
+ * `on*` setter stores exactly one callback, overwriting any previous one.
+ * That is enough for one adapter instance owning one handle — the only
+ * caller shape this seam exists for.
+ */
+export interface ProcessHandle {
+  readonly pid: number | null;
+  /** Write one line to stdin (a trailing '\n' is appended). Returns `false`
+   *  without throwing when stdin is already closed/errored/ended. */
+  writeLine(line: string): boolean;
+  /** Half-close stdin (EOF) without killing the process. */
+  endStdin(): void;
+  /** Signal the process. Windows ignores the signal name and terminates
+   *  unconditionally (Node's documented `child_process.kill()` behavior). */
+  kill(signal?: NodeJS.Signals): void;
+  /** Fires once per complete stdout line (split on '\n'; a trailing '\r' is
+   *  stripped). A final unterminated line is flushed on stdout end/close. */
+  onStdoutLine(cb: (line: string) => void): void;
+  /** Fires once per raw stderr chunk (not line-split — stderr is diagnostic
+   *  text, not a framed protocol). */
+  onStderr(cb: (chunk: string) => void): void;
+  /** Fires exactly once, when the process has fully exited. */
+  onExit(cb: (info: { code: number | null; signal: NodeJS.Signals | null; error?: string }) => void): void;
+}
+
+export interface JobSpawn {
+  spawn(cmd: string, args: string[], opts?: ProcessSpawnOptions): ProcessHandle;
+}
+
+/** Incremental line splitter: feed raw chunks, get complete lines out;
+ *  `flush()` emits a final unterminated trailing line, once, at stream end. */
+function makeLineBuffer(onLine: (line: string) => void): { feed(chunk: Buffer | string): void; flush(): void } {
+  let buf = '';
+  return {
+    feed(chunk) {
+      buf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      let idx: number;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        let line = buf.slice(0, idx);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        buf = buf.slice(idx + 1);
+        onLine(line);
+      }
+    },
+    flush() {
+      if (buf.length > 0) {
+        const line = buf.endsWith('\r') ? buf.slice(0, -1) : buf;
+        buf = '';
+        if (line.length > 0) onLine(line);
+      }
+    },
+  };
+}
+
+/** The real streaming spawner (`stdio: ['pipe','pipe','pipe']`, `windowsHide`). */
+export function nodeJobSpawn(): JobSpawn {
+  return {
+    spawn(cmd, args, opts = {}) {
+      const child = spawn(cmd, args, {
+        cwd: opts.cwd,
+        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+
+      let onLineCb: ((line: string) => void) | null = null;
+      let onStderrCb: ((chunk: string) => void) | null = null;
+      let onExitCb: ((info: { code: number | null; signal: NodeJS.Signals | null; error?: string }) => void) | null =
+        null;
+      let exited = false;
+
+      const stdoutBuf = makeLineBuffer((line) => onLineCb?.(line));
+      child.stdout.on('data', (chunk: Buffer) => stdoutBuf.feed(chunk));
+      child.stdout.on('end', () => stdoutBuf.flush());
+
+      child.stderr.on('data', (chunk: Buffer) => onStderrCb?.(chunk.toString('utf8')));
+
+      const settleExit = (info: { code: number | null; signal: NodeJS.Signals | null; error?: string }): void => {
+        if (exited) return;
+        exited = true;
+        stdoutBuf.flush();
+        onExitCb?.(info);
+      };
+      child.on('error', (err) => {
+        const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 127 : null;
+        settleExit({ code, signal: null, error: err.message });
+      });
+      child.on('close', (code, signal) => settleExit({ code, signal }));
+
+      return {
+        pid: child.pid ?? null,
+        writeLine(line) {
+          if (child.stdin.destroyed || child.stdin.writableEnded) return false;
+          try {
+            child.stdin.write(`${line}\n`);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        endStdin() {
+          try {
+            if (!child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.end();
+          } catch {
+            /* already gone */
+          }
+        },
+        kill(signal) {
+          try {
+            child.kill(signal ?? 'SIGTERM');
+          } catch {
+            /* already gone */
+          }
+        },
+        onStdoutLine(cb) {
+          onLineCb = cb;
+        },
+        onStderr(cb) {
+          onStderrCb = cb;
+        },
+        onExit(cb) {
+          onExitCb = cb;
+        },
+      };
     },
   };
 }

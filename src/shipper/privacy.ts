@@ -59,6 +59,12 @@ export const PRIVACY_SALT_ENV = 'PIPELINE_PRIVACY_SALT';
 /** Replaces `awaiting_input.question.text` at the metadata tier. */
 export const QUESTION_PLACEHOLDER = '[question content stripped: privacy tier metadata]';
 
+/** Replaces `department.message.parts` at the metadata tier (department-mesh,
+ *  task d1) — mirrors `QUESTION_PLACEHOLDER`'s stance: a department's message
+ *  content is authored task content, not metadata, so it is redacted by
+ *  default exactly like a pipeline question's text. */
+export const MESSAGE_PARTS_PLACEHOLDER = '[message content stripped: privacy tier metadata]';
+
 /** `summary` fields are truncated to this many characters at metadata tier. */
 export const SUMMARY_MAX_CHARS = 256;
 
@@ -95,7 +101,7 @@ export function fingerprintString(value: string, salt = ''): string {
 
 // ── The metadata-tier allowlists ─────────────────────────────────────────────
 
-type FieldRule = 'keep' | 'fingerprint' | 'summary' | 'question';
+type FieldRule = 'keep' | 'fingerprint' | 'summary' | 'question' | 'message_parts';
 
 /** Envelope fields kept at the metadata tier. Anything else on the envelope
  *  (a newer peer's passthrough addition) is dropped. */
@@ -108,6 +114,11 @@ const ENVELOPE_ALLOWLIST: Record<string, FieldRule> = {
   session_id: 'keep',
   project_root: 'fingerprint',
   worktree: 'fingerprint',
+  // department-mesh (task d1): a department event's `run_id` above IS its
+  // execution id (see `../department/events.ts`'s module doc); these two are
+  // its task/context identity, structural like `session_id`, not content.
+  task_id: 'keep',
+  context_id: 'keep',
 };
 
 /**
@@ -202,6 +213,22 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
   // filter runs first; the entry here lets the envelope-level walk pass the
   // already-filtered record through.
   'stats.run_record': {},
+
+  // ── department-mesh (task d1, 07-runtime-contract.md §8) ──────────────────
+  // One entry per `RuntimeEvent` variant (`../department/events.ts`'s
+  // `DEPARTMENT_JOURNAL_EVENT_TYPES` pins the exhaustive list; a coverage
+  // test in `tests/shipper-privacy-department.test.ts` fails if either side
+  // drifts). `department.message`/`department.artifact` carry the department's
+  // actual task content (not telemetry) — redacted/dropped by default at the
+  // metadata tier exactly like `awaiting_input.question`, never silently
+  // leaked just because a new event type showed up.
+  'department.status': { state: 'keep', message: 'summary' },
+  'department.progress': { note: 'summary' },
+  'department.input_required': { question_id: 'keep', question: 'question' },
+  'department.message': { parts: 'message_parts' },
+  'department.artifact': { name: 'keep', media_type: 'keep' }, // path/bytes_base64 are content — dropped
+  'department.completed': { summary: 'summary' },
+  'department.failed': { reason: 'summary', retry_safe: 'keep' },
 };
 
 /** The nested allowlists for the synthetic `.stats` run record (mirrors the
@@ -291,6 +318,13 @@ function applyRule(rule: FieldRule, value: unknown, salt: string): unknown {
         placeholder.question_id = value.question_id;
       }
       return placeholder;
+    }
+    case 'message_parts': {
+      if (!Array.isArray(value)) return undefined;
+      // A schema-valid single placeholder part, same spirit as `question`'s
+      // placeholder object: downstream consumers expecting `parts: Part[]`
+      // still get a well-formed array, just with zero authored content.
+      return [{ text: MESSAGE_PARTS_PLACEHOLDER, media_type: 'text/plain' }];
     }
   }
 }
