@@ -16,7 +16,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { CaptureLogger } from '../../tests/_helpers';
+import { CaptureLogger, FakeClock } from '../../tests/_helpers';
 import { DRIVE_COMPLETED, DRIVE_HALTED, DRIVE_PROVIDER_LIMIT, FakeJobExec, driveAwaiting } from '../jobs/_helpers';
 import type { JobExec, JobExecResult } from '../jobs/types';
 import type { DeptMessage, InvocationEnvelope, PipelineDriveSpec, RuntimeEvent } from './adapter';
@@ -331,6 +331,107 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     expect(exec.calls[2]!.args).toContain('steps/02-deploy.md');
     expect(exec.calls[2]!.args).not.toContain('steps/01-plan.md');
     expect(events3).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+});
+
+describe('PipelineDriveAdapter — bounding parked-resume state (leak fix: cancel() is never reached for a parked-then-terminated execution)', () => {
+  test('a park that is NEVER cancelled (park-expiry / deadline / lease-revoke style abandonment — cancel() never called) is reclaimed by the TTL sweep, triggered by another task parking', async () => {
+    let call = 0;
+    const exec = new FakeJobExec(() => {
+      call += 1;
+      // Task A parks on call 1; Task B parks on call 2; Task A's (too-late)
+      // answer attempt on call 3 should look like a FRESH start, not a resume.
+      if (call === 1) return driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-a');
+      if (call === 2) return driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-b');
+      return DRIVE_COMPLETED;
+    });
+    const clock = new FakeClock();
+    const adapter = new PipelineDriveAdapter({ exec, clock, parkedStateTtlMs: 1000 });
+
+    // Task A parks. NOTHING ever calls adapter.cancel() for it — exactly
+    // what happens today when `./manager.ts`'s park expiry / wall-clock
+    // deadline / explicit cancel / lease-revoked fire while a midTaskInput:
+    // false handle is null (the bug this test guards against).
+    await adapter.start(makeInvocation({ taskId: 'dtask-leak-a' }), () => {});
+    await flush();
+
+    // Time passes well beyond the TTL — Task A's execution is abandoned,
+    // but this adapter is never told so directly.
+    clock.advance(5000);
+
+    // An UNRELATED task (Task B) parks. Its own runOnce() call `prune()`s
+    // FIRST, before touching its own state — sweeping Task A's stale entry
+    // as a side effect of ordinary, unrelated activity.
+    await adapter.start(makeInvocation({ taskId: 'dtask-leak-b' }), () => {});
+    await flush();
+
+    // If Task A's answer somehow still arrives (a very late, stale answer),
+    // the adapter must NOT resume from the remembered — now evicted —
+    // iteration: it degrades safely to a fresh {kind:'start'}.
+    const staleAnswer = makeMessage({ messageId: 'answer-a', parts: [{ text: 'host-a' }] });
+    const eventsA: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-leak-a', messages: [makeMessage(), staleAnswer] }),
+      (e) => eventsA.push(e)
+    );
+    await flush();
+
+    expect(exec.calls).toHaveLength(3);
+    expect(exec.calls[2]!.args).toContain('steps/01-plan.md'); // the ORIGINAL configured start, not a resume
+    expect(exec.calls[2]!.args).not.toContain('--answer');
+    expect(exec.calls[2]!.args).not.toContain('--resume');
+    expect(eventsA).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+
+  test('a hard ceiling bounds the map even without any TTL elapsing — oldest-parked entry is evicted first', async () => {
+    const exec = new FakeJobExec(() => driveAwaiting('steps/02-deploy.md', 'Which host?', 'q'));
+    const adapter = new PipelineDriveAdapter({ exec, maxParkedEntries: 2 });
+
+    // Three DIFFERENT tasks park in sequence, none ever answered/cancelled.
+    await adapter.start(makeInvocation({ taskId: 'dtask-cap-1' }), () => {});
+    await flush();
+    await adapter.start(makeInvocation({ taskId: 'dtask-cap-2' }), () => {});
+    await flush();
+    await adapter.start(makeInvocation({ taskId: 'dtask-cap-3' }), () => {}); // pushes the map over the ceiling
+    await flush();
+
+    // Task 1 (the oldest) should have been evicted by the hard ceiling —
+    // its late answer looks like a fresh start, not a resume.
+    const staleAnswer = makeMessage({ messageId: 'answer-1', parts: [{ text: 'host-a' }] });
+    const events1: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-cap-1', messages: [makeMessage(), staleAnswer] }),
+      (e) => events1.push(e)
+    );
+    await flush();
+    expect(exec.calls[3]!.args).toContain('steps/01-plan.md');
+    expect(exec.calls[3]!.args).not.toContain('--answer');
+  });
+});
+
+describe('PipelineDriveAdapter — lifecycle validation (07 §2.1: per-task only)', () => {
+  test('an explicit lifecycle:"per-task" is accepted', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const adapter = new PipelineDriveAdapter({ exec });
+    const invocation = makeInvocation();
+    invocation.runtime.lifecycle = 'per-task';
+    await expect(adapter.start(invocation, () => {})).resolves.toBeTruthy();
+  });
+
+  test('lifecycle:"per-context" is rejected — this adapter never keeps a live process across a respawn', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const adapter = new PipelineDriveAdapter({ exec });
+    const invocation = makeInvocation();
+    invocation.runtime.lifecycle = 'per-context';
+    await expect(adapter.start(invocation, () => {})).rejects.toBeInstanceOf(RuntimeAdapterError);
+  });
+
+  test('lifecycle:"daemon" is rejected', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const adapter = new PipelineDriveAdapter({ exec });
+    const invocation = makeInvocation();
+    invocation.runtime.lifecycle = 'daemon';
+    await expect(adapter.start(invocation, () => {})).rejects.toBeInstanceOf(RuntimeAdapterError);
   });
 });
 

@@ -149,6 +149,8 @@
  * deliberately, with pipeline-dispatch regression coverage as its own gate.
  */
 
+import type { Clock } from '../core/clock';
+import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import {
@@ -196,13 +198,54 @@ export interface PipelineDriveAdapterOptions {
    *  (`../jobs/drive.ts`, unmodified) — see this module's doc's "Provider
    *  limits" section. */
   detectProviderLimit?: ProviderLimitDetector;
+  clock?: Clock;
+  /** Safety-net upper bound on how long a remembered park (`ParkedDriveState`)
+   *  is trusted — see "Bounding parked-resume state" below. Default
+   *  `DEFAULT_PARKED_STATE_TTL_MS`. */
+  parkedStateTtlMs?: number;
+  /** Hard ceiling on the number of remembered parks, oldest-touched evicted
+   *  first. Default `DEFAULT_MAX_PARKED_ENTRIES`. */
+  maxParkedEntries?: number;
 }
+
+/** 7 days — the same order of magnitude as `./manager.ts`'s own
+ *  `DEFAULT_PARK_EXPIRY_S`, duplicated here as a LOCAL constant rather than
+ *  imported: this adapter's sweep must not depend on the supervisor's own
+ *  policy ever being reachable (see "Bounding parked-resume state"). */
+export const DEFAULT_PARKED_STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Bounds memory even if the TTL is misconfigured absurdly large or a
+ *  pathological number of tasks park in a short window. */
+export const DEFAULT_MAX_PARKED_ENTRIES = 500;
 
 // ── Parked-question resume state (07 §5's respawn-on-answer contract) ───────
 // Keyed by `taskId`, which is stable across the whole execution (never
 // changes across a park/answer respawn, `./manager.ts`'s `spawnAndStart`) —
 // NOT by handle identity, since `DepartmentManager` disposes the handle that
 // reported `input_required` and mints a fresh one on the next `start()`.
+//
+// ── Bounding parked-resume state ─────────────────────────────────────────
+// `cancel()` clears an entry (above), but `cancel()` is NOT reliably reached
+// for a PARKED execution that later terminates: `midTaskInput:false` makes
+// `./manager.ts`'s `handleRuntimeEvent` null out `state.handle` the INSTANT
+// `input_required` fires, and every termination path that can fire while
+// parked — park expiry (`onParkExpired`), an explicit `department.cancel`
+// (`cancelExecution`), a blown wall-clock deadline (`onDeadlineExceeded`),
+// and `lease_revoked` — all gate their OWN `adapter.cancel()` call on
+// `state.handle !== null`. A parked task always has a null handle, so NONE
+// of these ever call `cancel()`; `state.terminal` is set and the map entry
+// would otherwise leak for the life of the daemon. Park expiry exists
+// PRECISELY for "the answer never comes" — this is the mainline unanswered-
+// park path, not a corner case.
+//
+// This adapter has no callback for "an execution ended silently" at all (the
+// interface has none to offer), so the fix cannot depend on ANY caller
+// telling it — `prune()` (on `PipelineDriveAdapter`) sweeps on its own, by
+// elapsed time and by a hard count ceiling, on every `runOnce()` call
+// (start OR resume), so ANY task's activity opportunistically reclaims
+// entries abandoned by OTHER tasks. A pruned entry, if an answer somehow
+// still arrives for it later, is simply treated as a fresh `{kind:'start'}`
+// (`runOnce`'s `parkedState === undefined` branch) — degrading safely rather
+// than ever resuming from a stale or fabricated target.
 
 interface ParkedDriveState {
   /** `DriveParked.iteration_path` (`../jobs/drive.ts`) — the ONLY field
@@ -214,6 +257,10 @@ interface ParkedDriveState {
    *  `buildDriveArgs`, which has no `--session-id`/`--step-id` flag. */
   sessionId: string | null;
   stepId: string | null;
+  /** `clock.now()` when this entry was (re)written — the basis for the TTL/
+   *  size-based eviction in `PipelineDriveAdapter.prune()`. Adapter-local
+   *  bookkeeping only; never drive or wire data. */
+  touchedAtMs: number;
 }
 
 /** The answer text for a resume: the LAST message's first text part. Reads
@@ -264,8 +311,14 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
   private readonly logger: Logger;
   private readonly makeId: () => string;
   private readonly detectLimit: ProviderLimitDetector;
+  private readonly clock: Clock;
+  private readonly parkedStateTtlMs: number;
+  private readonly maxParkedEntries: number;
   /** Parked-resume state, keyed by `taskId` — see the module doc's "Resuming
-   *  a parked question" section and `ParkedDriveState`'s own doc. */
+   *  a parked question" / "Bounding parked-resume state" sections and
+   *  `ParkedDriveState`'s own doc. Bounded by `prune()`, called on every
+   *  `runOnce()` — see that method's doc for why this cannot depend on
+   *  `cancel()` being reached. */
   private readonly parked = new Map<string, ParkedDriveState>();
 
   constructor(options: PipelineDriveAdapterOptions = {}) {
@@ -273,6 +326,38 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     this.logger = options.logger ?? nullLogger;
     this.makeId = options.makeId ?? (() => crypto.randomUUID());
     this.detectLimit = options.detectProviderLimit ?? defaultProviderLimitDetector;
+    this.clock = options.clock ?? systemClock;
+    this.parkedStateTtlMs = options.parkedStateTtlMs ?? DEFAULT_PARKED_STATE_TTL_MS;
+    this.maxParkedEntries = options.maxParkedEntries ?? DEFAULT_MAX_PARKED_ENTRIES;
+  }
+
+  /**
+   * Bound `this.parked` independently of any caller ever reaching `cancel()`
+   * (see the module doc's "Bounding parked-resume state") — called at the
+   * TOP of every `runOnce()`, before peeking this task's own entry, so a
+   * pruned entry (including this very task's, if it is old enough) is
+   * treated exactly like one that was never parked. Two mechanisms, both
+   * cheap:
+   *   - TTL sweep: an entry untouched for longer than `parkedStateTtlMs` is
+   *     dropped — its execution is presumed abandoned (park-expired,
+   *     deadline-blown, cancelled, or lease-revoked; this adapter has no
+   *     visibility into WHICH, only that nothing has touched it in a very
+   *     long time).
+   *   - Hard ceiling: oldest-touched-first eviction down to
+   *     `maxParkedEntries` (`Map` iterates in insertion order, and `runOnce`
+   *     deletes-then-reinserts on every touch so re-parking moves an entry
+   *     to the "freshest" end) — bounds memory even under pathological churn
+   *     or an absurdly large TTL.
+   */
+  private prune(now: number): void {
+    for (const [taskId, state] of this.parked) {
+      if (now - state.touchedAtMs > this.parkedStateTtlMs) this.parked.delete(taskId);
+    }
+    while (this.parked.size > this.maxParkedEntries) {
+      const oldest = this.parked.keys().next().value;
+      if (oldest === undefined) break;
+      this.parked.delete(oldest);
+    }
   }
 
   /**
@@ -313,6 +398,19 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     if (drive.startIteration.trim().length === 0) {
       throw new RuntimeAdapterError('pipeline-drive: pipelineDrive.startIteration must not be blank');
     }
+    // 07 §2.1: this adapter IS `lifecycle:'per-task'` only — it never keeps a
+    // live process across a respawn, so a department misconfigured with
+    // `RuntimeConfig.lifecycle: 'per-context'` would silently get NONE of
+    // what that lifecycle promises (idle-eviction reuse, real checkpoint
+    // continuity) while still flipping `./manager.ts`'s crash-recovery gate
+    // (`state.lifecycle === 'per-context'`) on for a `retrySafe:true`
+    // provider-limit failure it was never designed to receive. Refuse rather
+    // than silently behave as `per-task` under a `per-context` label.
+    if (runtime.lifecycle !== undefined && runtime.lifecycle !== 'per-task') {
+      throw new RuntimeAdapterError(
+        `pipeline-drive: RuntimeConfig.lifecycle must be 'per-task' (or omitted) — got '${runtime.lifecycle}' (07 §2.1)`
+      );
+    }
 
     const controller = new AbortController();
     const handle = new PipelineDriveHandle(task.taskId, task.contextId, controller);
@@ -324,7 +422,15 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     // handleRuntimeEvent` (journal write, wire `send()`) and an uncaught
     // throw from EITHER of those would otherwise surface as an unhandled
     // promise rejection — which crashes the whole runner daemon, not just
-    // this task (see the module doc).
+    // this task (see the module doc). RESIDUAL COST, accepted deliberately:
+    // if `sink()` itself is what throws, the terminal event this call was
+    // trying to deliver is LOST — only a `logger.warn` survives — so
+    // `DepartmentManager` never learns this execution ended and the task
+    // sits non-terminal until its wall-clock deadline (`armDeadlineTimer`)
+    // or park-expiry timer eventually fires and force-terminates it. That
+    // trade (one task stuck until its deadline vs. the ENTIRE daemon,
+    // every in-flight execution across every department, crashing outright)
+    // is the right one, but it is a real cost, not a free fix.
     void this.runOnce(runtime, drive, task, sink, handle).catch((err: unknown) => {
       this.logger.warn(
         `pipeline-drive[${task.taskId}]: runOnce failed unexpectedly (${err instanceof Error ? err.message : String(err)})`
@@ -384,6 +490,12 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     sink: RuntimeEventSink,
     handle: PipelineDriveHandle
   ): Promise<void> {
+    // Bound `this.parked` on EVERY invocation — not only when about to
+    // insert a new entry — so any task's activity (fresh start OR resume)
+    // opportunistically sweeps entries abandoned by OTHER tasks (module
+    // doc's "Bounding parked-resume state"; `prune()`'s own doc for why).
+    this.prune(this.clock.now());
+
     // Resuming a parked question (07 §5, module doc's "Resuming a parked
     // question"): a PEEK, not a consume — only actually removed from the map
     // once we know the outcome (below), so a provider limit hit while
@@ -461,21 +573,34 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     // `../jobs/drive.ts`'s module doc — the SAME rule `JobExecutor.driveLoop`
     // applies) — see the module doc's "Provider limits" section for why this
     // adapter surfaces it as `retrySafe:true` rather than pausing/retrying
-    // itself. `this.parked` is deliberately left UNTOUCHED here: if this
-    // invocation was itself an answer-resume, the iteration/answer target
-    // must survive for a future retry to use.
+    // itself. `this.parked` is deliberately left in place here (NOT deleted):
+    // if this invocation was itself an answer-resume, the iteration/answer
+    // target must survive for a future retry to use — but it IS re-touched
+    // (moved to the "freshest" end, TTL clock reset) so a task that keeps
+    // legitimately hitting the limit on retry never goes stale under
+    // `prune()` just because it has been parked a long time in wall-clock
+    // terms.
     const limit = this.detectLimit(result);
     if (limit !== null) {
+      if (parkedState !== undefined) {
+        this.parked.delete(task.taskId);
+        this.parked.set(task.taskId, { ...parkedState, touchedAtMs: this.clock.now() });
+      }
       sink({ type: 'failed', reason: `pipeline drive provider limit: ${limit.reason}`, retrySafe: true });
       return;
     }
 
     const outcome = classifyDriveOutcome(result);
     if (outcome.kind === 'awaiting_input') {
+      // Delete-then-set (not a plain overwriting `set()`) so a re-park moves
+      // this entry to the "freshest" end of the `Map`'s insertion order —
+      // `prune()`'s hard-ceiling eviction relies on that ordering.
+      this.parked.delete(task.taskId);
       this.parked.set(task.taskId, {
         iterationPath: outcome.parked.iteration_path,
         sessionId: outcome.parked.session_id,
         stepId: outcome.parked.step_id,
+        touchedAtMs: this.clock.now(),
       });
     } else {
       // completed / halted / failed — no future respawn will consume a park
