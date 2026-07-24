@@ -6,11 +6,14 @@
  * (`../shipper/shipper.ts`) via a runner-local journal (§8).
  *
  * Deliberately PARALLEL to `../jobs/manager.ts`, not a modification of it —
- * `pipeline drive` dispatch is untouched; this is a second admission surface
- * for department tasks, mirroring the shape (adapter registry instead of one
- * hard-coded contract, `admitTask` instead of `handleLease`) without sharing
- * state. Porting `pipeline drive` itself onto the adapter abstraction is task
- * d4.
+ * `pipeline drive` DISPATCH (`JobExecutor`) is untouched; this is a second
+ * admission surface for department tasks, mirroring the shape (adapter
+ * registry instead of one hard-coded contract, `admitTask` instead of
+ * `handleLease`) without sharing state. Task d4 ported `pipeline drive`
+ * ITSELF onto this same adapter registry as an ADDITIONAL entry
+ * (`./pipeline-drive.ts`, `PipelineDriveAdapter`) — a department whose
+ * resolved config names `adapterId: 'pipeline-drive'` now runs through this
+ * manager too, without the pipeline-dispatch path above changing at all.
  *
  * ── Real leases, reject, process-group kill, deadlines (d2) ─────────────────
  * `department.lease_renew` is sent at TTL/3 on the EXISTING heartbeat cadence

@@ -16,6 +16,9 @@ import type { RuntimeConfig, RuntimeLifecycle } from './adapter';
 // sandbox spec under a `container` key — parsed the same tolerant way every
 // other optional `RuntimeConfig` field here is.
 import { narrowContainerSpec } from './container';
+// department-mesh d4: an entry with `adapterId: "pipeline-drive"` carries its
+// drive-target spec under a `pipelineDrive` key — same tolerant parse.
+import { narrowPipelineDriveSpec } from './pipeline-drive';
 
 export const DEPARTMENT_RUNTIMES_ENV = 'PIPELINE_RUNNER_DEPARTMENTS';
 
@@ -78,6 +81,10 @@ function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   if (r.container !== undefined) {
     const containerSpec = narrowContainerSpec(r.container);
     if (containerSpec !== undefined) config.container = containerSpec;
+  }
+  if (r.pipelineDrive !== undefined) {
+    const pipelineDriveSpec = narrowPipelineDriveSpec(r.pipelineDrive);
+    if (pipelineDriveSpec !== undefined) config.pipelineDrive = pipelineDriveSpec;
   }
   return config;
 }
