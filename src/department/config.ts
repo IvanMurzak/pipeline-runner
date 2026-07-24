@@ -65,6 +65,9 @@ function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   if (typeof r.gracefulShutdownSeconds === 'number' && Number.isFinite(r.gracefulShutdownSeconds)) {
     config.gracefulShutdownSeconds = r.gracefulShutdownSeconds;
   }
+  if (typeof r.parkExpirySeconds === 'number' && Number.isFinite(r.parkExpirySeconds)) {
+    config.parkExpirySeconds = r.parkExpirySeconds;
+  }
   if (typeof r.lifecycle === 'string' && (LIFECYCLES as readonly string[]).includes(r.lifecycle)) {
     config.lifecycle = r.lifecycle as RuntimeLifecycle;
   }

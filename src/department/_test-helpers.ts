@@ -29,6 +29,10 @@ export class FakeProcessHandle implements ProcessHandle {
   written: string[] = [];
   ended = false;
   killedWith: NodeJS.Signals[] = [];
+  /** Every `killGroup()` call, in order — separate from `killedWith` so
+   *  tests can assert the d2 escalation targets the GROUP, not the direct
+   *  child (`../jsonl-process.ts`'s `dispose()`). */
+  killedGroupWith: NodeJS.Signals[] = [];
 
   private lineCb: ((line: string) => void) | null = null;
   private stderrCb: ((chunk: string) => void) | null = null;
@@ -47,6 +51,10 @@ export class FakeProcessHandle implements ProcessHandle {
 
   kill(signal?: NodeJS.Signals): void {
     this.killedWith.push(signal ?? 'SIGTERM');
+  }
+
+  killGroup(signal?: NodeJS.Signals): void {
+    this.killedGroupWith.push(signal ?? 'SIGTERM');
   }
 
   onStdoutLine(cb: (line: string) => void): void {

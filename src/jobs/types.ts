@@ -27,9 +27,22 @@
  * time, as it is produced — not buffered until close. This is the seam the
  * `jsonl-process` runtime adapter (`../department/jsonl-process.ts`) spawns
  * its child through; nothing about `JobExec` changes.
+ *
+ * ── Process-GROUP kill (department-mesh, task d2) ───────────────────────────
+ * `nodeJobSpawn()`'s child is spawned `detached: true` — on POSIX that makes
+ * it the LEADER of its own process group (its pgid equals its pid), which is
+ * what makes `killProcessTree()`'s `process.kill(-pid, signal)` target the
+ * whole tree instead of accidentally hitting an unrelated group (or this
+ * daemon's own). `ProcessHandle.killGroup()` is the seam
+ * `../department/jsonl-process.ts` escalates cancellation/disposal through
+ * (07-runtime-contract.md §7) — closing the historical gap where cancel was a
+ * plain SIGTERM to the direct child only, and grandchildren (e.g. a shelled-
+ * out tool the department runtime itself spawned) survived. This is additive
+ * to `ProcessHandle`; `JobExec`/`nodeJobExec` (the pipeline-dispatch seam
+ * above) is completely untouched.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 
 /** Actionable, non-crashing failure surfaced by any job-execution step. */
@@ -168,6 +181,17 @@ export interface ProcessHandle {
   /** Signal the process. Windows ignores the signal name and terminates
    *  unconditionally (Node's documented `child_process.kill()` behavior). */
   kill(signal?: NodeJS.Signals): void;
+  /** Signal the ENTIRE process tree rooted at this process — not just the
+   *  direct child (department-mesh, task d2; 07-runtime-contract.md §7). On
+   *  POSIX this is a real process-GROUP signal (`process.kill(-pid, signal)`
+   *  — requires the child to have been spawned `detached: true`, which
+   *  `nodeJobSpawn()` does). Windows has no process-group signal concept and
+   *  `child.kill()` already terminates unconditionally regardless of the
+   *  signal name, so there the whole TREE is walked and force-terminated via
+   *  `taskkill /T /F` for both 'SIGTERM' and 'SIGKILL' — see
+   *  `killProcessTree()`. Best-effort: a group/tree that is already gone is
+   *  silently ignored, never thrown. */
+  killGroup(signal?: NodeJS.Signals): void;
   /** Fires once per complete stdout line (split on '\n'; a trailing '\r' is
    *  stripped). A final unterminated line is flushed on stdout end/close. */
   onStdoutLine(cb: (line: string) => void): void;
@@ -207,7 +231,42 @@ function makeLineBuffer(onLine: (line: string) => void): { feed(chunk: Buffer | 
   };
 }
 
-/** The real streaming spawner (`stdio: ['pipe','pipe','pipe']`, `windowsHide`). */
+/**
+ * Best-effort kill of the WHOLE process tree rooted at `pid` (department-mesh,
+ * task d2 — 07-runtime-contract.md §7's process-GROUP kill). `pid` must be a
+ * process spawned `detached: true` (`nodeJobSpawn()` does this) for the POSIX
+ * branch to target the right group rather than this daemon's own.
+ *
+ *   - POSIX: `process.kill(-pid, signal)` — negative pid addresses the whole
+ *     process GROUP. ESRCH (already gone) is swallowed, never thrown.
+ *   - Windows: no process-group signal exists, and a plain `child.kill()`
+ *     there already terminates unconditionally regardless of signal name
+ *     (documented Node behavior, `ProcessHandle.kill()`'s own doc) — so both
+ *     'SIGTERM' and 'SIGKILL' map to the same unconditional `taskkill /pid
+ *     <pid> /t /f`, which walks and force-terminates the recorded process
+ *     tree. A missing/already-exited pid (taskkill exits non-zero) is
+ *     swallowed the same way.
+ */
+export function killProcessTree(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+    } catch {
+      /* taskkill unavailable or the process is already gone — best-effort */
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    /* ESRCH — the group is already gone; the goal state is already reached */
+  }
+}
+
+/** The real streaming spawner (`stdio: ['pipe','pipe','pipe']`, `windowsHide`,
+ *  `detached: true` — the latter for `killGroup()`'s POSIX process-group
+ *  semantics, department-mesh task d2; harmless on Windows alongside
+ *  `windowsHide`). */
 export function nodeJobSpawn(): JobSpawn {
   return {
     spawn(cmd, args, opts = {}) {
@@ -216,6 +275,7 @@ export function nodeJobSpawn(): JobSpawn {
         env: opts.env ? { ...process.env, ...opts.env } : process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
+        detached: true,
       });
 
       let onLineCb: ((line: string) => void) | null = null;
@@ -266,6 +326,9 @@ export function nodeJobSpawn(): JobSpawn {
           } catch {
             /* already gone */
           }
+        },
+        killGroup(signal) {
+          if (child.pid != null) killProcessTree(child.pid, signal ?? 'SIGTERM');
         },
         onStdoutLine(cb) {
           onLineCb = cb;

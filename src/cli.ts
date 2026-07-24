@@ -167,6 +167,12 @@ function runStart(): void {
   // manager's `draining()` reads it alongside the server's drain directive.
   let shuttingDown = false;
 
+  // d2: same forward-reference trick as `manager` above — `departmentManager`
+  // is constructed AFTER `client` (it needs `client.send`/`client.dispatcher`),
+  // but `onBeat` below must call its `renewLeases()` on the SAME heartbeat
+  // cadence `department.lease_renew` rides (07 §6: TTL/3, never a 2nd timer).
+  let departmentManager: DepartmentManager | null = null;
+
   const client = new AgentClient({
     store,
     transports: defaultTransports(identity.base_url, consoleLogger),
@@ -193,7 +199,12 @@ function runStart(): void {
     // c6: the heartbeat-tick record writer (04) — each beat renews every
     // active job record's `updated_at`, keeping a live runner's records
     // FRESH for the reconcile.
-    onBeat: () => manager?.touchActiveRecords(),
+    // d2: same beat also renews every live department execution's lease
+    // (`department.lease_renew` at TTL/3) — the existing cadence, not a 2nd timer.
+    onBeat: () => {
+      manager?.touchActiveRecords();
+      departmentManager?.renewLeases();
+    },
   });
 
   // c3 (T1-13): construct ONE needs-input relay bridge + its pull->push
@@ -252,14 +263,18 @@ function runStart(): void {
   // unresolvable department_id gets a `capability` reject, same as an
   // offer this runner genuinely cannot serve.
   //
-  // KNOWN GAP (deliberate, d1 scope): unlike `manager`/`shipperLifecycle`
-  // above, department executions are NOT yet wired into graceful shutdown's
-  // drain/suspend sequence below — real lease renewal, reject-with-reason,
-  // and process-group cancellation are task d2's job; draining new offers
+  // d2 (real leases, reject, process-group kill, deadlines) is wired here:
+  // `renewLeases()` rides the heartbeat `onBeat` hook above; reject-with-
+  // reason and process-group cancellation are internal to `DepartmentManager`
+  // / `JsonlProcessAdapter` and need no extra composition here.
+  //
+  // KNOWN GAP (deliberate, still open post-d2): unlike `manager`/
+  // `shipperLifecycle` above, department executions are NOT yet wired into
+  // graceful shutdown's drain/suspend sequence below — draining new offers
   // (via `client.draining || shuttingDown`) is wired today, in-flight
   // executions are not yet suspended on SIGTERM/SIGINT.
   const departmentRuntimes = parseDepartmentRuntimesEnv(process.env.PIPELINE_RUNNER_DEPARTMENTS, consoleLogger);
-  const departmentManager = new DepartmentManager({
+  departmentManager = new DepartmentManager({
     adapters: [new JsonlProcessAdapter({ logger: consoleLogger })],
     resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
     send: (frame) => client.send(frame),
