@@ -13,7 +13,6 @@ import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import { Dispatcher } from '../core/dispatcher';
 import type { WireFrame } from '../core/wire';
-import { MemShipperFs } from '../../tests/_shipper-helpers';
 import { FakeAdapter, FakeNoMidTaskInputAdapter, makeMessage } from './_test-helpers';
 import type { DepartmentOfferInput, JournalWriter } from './manager';
 import { DepartmentManager } from './manager';
@@ -64,8 +63,6 @@ function makeManager(overrides: Partial<{ adapters: FakeAdapter[]; capacity: num
     dispatcher: NULL_DISPATCHER,
     journal,
     journalRoot: '/data/department',
-    fs: new MemShipperFs(),
-    transport: { name: 'fake', upload: async () => ({ ok: true, ack: { run_id: 'x', inserted: 0, skipped: 0 } }) },
     clock,
     logger,
     perContextIdleMs: overrides.perContextIdleMs,
@@ -259,7 +256,7 @@ describe('DepartmentManager — idle eviction (per-context)', () => {
   });
 });
 
-describe('DepartmentManager — wire attachment (attach(), provisional frame shapes)', () => {
+describe('DepartmentManager — wire attachment (attach(), real protocol 0.4.0 frame shapes)', () => {
   function makeWiredManager() {
     const dispatcher = new Dispatcher();
     const clock = new FakeClock();
@@ -274,8 +271,6 @@ describe('DepartmentManager — wire attachment (attach(), provisional frame sha
       dispatcher,
       journal,
       journalRoot: '/data/department',
-      fs: new MemShipperFs(),
-      transport: { name: 'fake', upload: async () => ({ ok: true, ack: { run_id: 'x', inserted: 0, skipped: 0 } }) },
       clock,
       logger: new CaptureLogger(),
     });
@@ -289,7 +284,16 @@ describe('DepartmentManager — wire attachment (attach(), provisional frame sha
     task_id: 'dtask-w1',
     context_id: 'dctx-w1',
     department_id: 'unity-department',
-    messages: [{ message_id: 'm1', role: 'ROLE_USER', parts: [{ text: 'hello' }] }],
+    attempt: 1,
+    lease_token: 'lease-w1',
+    lease_ttl_s: 900,
+    adapter: 'fake',
+    accepted_output_modes: ['text/markdown'],
+    deadline_at: '2026-07-23T18:00:00.000Z',
+    event_seq_base: 0,
+    messages: [
+      { message_id: 'm1', role: 'ROLE_USER', parts: [{ text: 'hello' }], created_at: '2026-07-23T12:00:00.000Z' },
+    ],
   };
 
   test('a well-formed department.offer admits the task and replies department.accept', async () => {
@@ -329,7 +333,12 @@ describe('DepartmentManager — wire attachment (attach(), provisional frame sha
     dispatcher.dispatch({
       type: 'department.message',
       execution_id: 'dexec-w1',
-      message: { message_id: 'answer-1', role: 'ROLE_USER', parts: [{ text: 'the answer' }] },
+      message: {
+        message_id: 'answer-1',
+        role: 'ROLE_USER',
+        parts: [{ text: 'the answer' }],
+        created_at: '2026-07-23T12:05:00.000Z',
+      },
     });
     await tick();
     const sendCalls = adapter.calls.filter((c) => c.kind === 'send');
