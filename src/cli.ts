@@ -73,6 +73,13 @@ import { parseDepartmentRuntimesEnv } from './department/config';
 // `RuntimeConfig.adapterId` exactly like `jsonl-process`; a department only
 // ever reaches it if its resolved config says `adapterId: 'container'`.
 import { ContainerAdapter, probeContainerRuntimeAvailable } from './department/container';
+// department-mesh d6 (13-mcp-authorization.md §12): the runner's confidential
+// OAuth client — obtains/caches execution-scoped tokens via
+// `client_credentials`, reusing the EXISTING runner_id/runner_token as the
+// OAuth client_id/client_secret (no new credential). Wired into
+// `DepartmentManager` below so every (re)spawn can point a model-driven
+// runtime at `<base_url>/mcp` with a live token (07 §4).
+import { ExecutionTokenManager } from './department/execution-token-manager';
 import { JsonlProcessAdapter } from './department/jsonl-process';
 import { DepartmentManager, nodeJournalWriter } from './department/manager';
 
@@ -360,6 +367,17 @@ function runStart(argv: string[] = []): void {
   // (via `client.draining || shuttingDown`) is wired today, in-flight
   // executions are not yet suspended on SIGTERM/SIGINT.
   const departmentRuntimes = parseDepartmentRuntimesEnv(process.env.PIPELINE_RUNNER_DEPARTMENTS, consoleLogger);
+  // d6: live accessors (not captured values) — same idiom as `runnerId`/
+  // `labels`/`capacity` just above, so a manager constructed before
+  // `register_ack` still works once `store.load()` starts returning a
+  // `runner_id` (the OAuth client_id) and reflects a later `register`
+  // (client_secret rotation) without reconstruction.
+  const executionTokens = new ExecutionTokenManager({
+    baseUrl: () => store.load()?.base_url ?? null,
+    clientId: () => store.load()?.runner_id ?? null,
+    clientSecret: () => store.load()?.runner_token ?? null,
+    logger: consoleLogger,
+  });
   departmentManager = new DepartmentManager({
     adapters: [new JsonlProcessAdapter({ logger: consoleLogger }), new ContainerAdapter({ logger: consoleLogger })],
     resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
@@ -368,6 +386,7 @@ function runStart(argv: string[] = []): void {
     journal: nodeJournalWriter(),
     journalRoot: join(defaultDataDir(), 'department'),
     draining: () => client.draining || shuttingDown,
+    executionTokens,
     logger: consoleLogger,
   });
   departmentManager.attach(client.dispatcher);

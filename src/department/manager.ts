@@ -128,6 +128,20 @@ import type {
   RuntimeLifecycle,
 } from './adapter';
 import { buildDepartmentJournalEnvelope } from './events';
+import type { ExecutionTokenSource } from './execution-token-manager';
+
+// ── d6: pointing model-driven runtimes at the cloud MCP server ──────────────
+// (13-mcp-authorization.md §12, 07-runtime-contract.md §4). "No adapter work
+// at all" (07 §4) for an MCP-speaking runtime means exactly this: the runner
+// does not implement an MCP client itself, it makes the URL + a live
+// execution token available to whatever it spawns, via the SAME `env`
+// mechanism every adapter already reads (`RuntimeConfig.env`,
+// `./adapter.ts`). A JSONL/program runtime's CONTRACT is unchanged (07 §3) —
+// it simply also receives these two variables and is free to ignore them;
+// a model-driven runtime that knows to read them becomes its own MCP client
+// against `https://…/mcp`, exactly as D14 intends.
+export const MESH_MCP_URL_ENV = 'PIPELINE_MESH_MCP_URL';
+export const MESH_EXECUTION_TOKEN_ENV = 'PIPELINE_MESH_EXECUTION_TOKEN';
 
 // ── The journal-writer seam (runner IS the journal writer here — unlike
 //    pipeline runs, where pipeline-cli writes events.jsonl, nothing external
@@ -186,6 +200,11 @@ export interface DepartmentManagerOptions {
   /** Root dir each execution's journal lives under: `<root>/<executionId>/events.jsonl`. */
   journalRoot?: string;
   journal?: JournalWriter;
+  /** d6 (13 §12): obtains/caches execution-scoped OAuth tokens via
+   *  `client_credentials`. Absent ⇒ no `PIPELINE_MESH_*` env is injected at
+   *  spawn and lease renewal skips the re-request — existing (pre-d6)
+   *  behaviour, unchanged, for any caller that does not wire this. */
+  executionTokens?: ExecutionTokenSource;
   capacity?(): number;
   draining?(): boolean;
   /** `per-context` idle window before an inactive handle is disposed (the
@@ -410,6 +429,17 @@ export class DepartmentManager {
       });
       if (sent) {
         state.lastLeaseRenewalAt = now;
+        // d6 (13 §12): "re-REQUEST (not refresh) on lease renewal — the
+        // token dies with the lease." A successful renewal means a fresh
+        // lease TTL, so re-request a fresh execution token to match. This
+        // updates `executionTokens`' cache for the NEXT spawn/relay drain;
+        // it does not (cannot) push a new token into an already-running
+        // process. Fire-and-forget: never let this block the heartbeat
+        // cadence `renewLeases()` itself rides. `ExecutionTokenManager.renew`
+        // never rejects (failures resolve to `{ ok: false }` and are already
+        // logged by `../core/mesh-oauth.ts`) — the `.catch` is defence in
+        // depth against a differently-behaved `ExecutionTokenSource`.
+        void this.options.executionTokens?.renew(state.executionId).catch(() => {});
       } else {
         this.logger.warn(`department execution ${state.executionId}: lease_renew not sent — connection not online`);
       }
@@ -440,6 +470,10 @@ export class DepartmentManager {
     this.clearIdleTimer(state);
     this.clearDeadlineTimer(state);
     this.clearParkTimer(state);
+    // d6 (13 §12): "revoking the lease revokes the token" — drop it from the
+    // in-memory cache too, so nothing (a stray relay drain, a respawn race)
+    // could ever hand it out again for a lease that is already gone.
+    this.options.executionTokens?.discard(executionId);
     const handle = state.handle;
     state.handle = null;
     if (handle !== null) {
@@ -581,11 +615,38 @@ export class DepartmentManager {
 
   // ── Spawn / respawn ────────────────────────────────────────────────────
 
-  private async spawnAndStart(state: ExecutionState): Promise<boolean> {
+  /**
+   * NOT declared `async` on purpose: several callers fire this with
+   * `void this.spawnAndStart(state)` and rely on it reaching (synchronous
+   * fake-adapter) `adapter.start()` in the SAME synchronous turn — e.g. the
+   * crash-recovery respawn in `handleRuntimeEvent`, exercised by tests that
+   * assert `adapter.startCalls()` immediately after driving the crash event,
+   * with no intervening tick. `await`ing anything — even an already-settled
+   * promise — always defers to the next microtask, so the `executionTokens`
+   * path (d6) is kept in a SEPARATE branch that only ever runs when d6 is
+   * actually wired; the no-`executionTokens` path below stays exactly as
+   * synchronous as it was before this task, byte for byte.
+   */
+  private spawnAndStart(state: ExecutionState): Promise<boolean> {
     state.pendingQueue = []; // its contents are already IN messageHistory — see deliverMessage
     const task: DeptTaskSpec = { taskId: state.taskId, contextId: state.contextId, messages: state.messageHistory };
+    if (this.options.executionTokens === undefined) {
+      return this.startWithInvocation(state, task, null);
+    }
+    // d6 (13 §12 / 07 §4): every (re)spawn gets its OWN execution token —
+    // requested fresh here, never carried over from a prior spawn of the
+    // same execution (a per-context respawn gets a fresh one exactly like
+    // the original admission did). A failure here (offline, execution
+    // somehow not yet visible to the AS) degrades to "no MCP env this
+    // spawn" — it must NEVER block or fail admission, since JSONL/program
+    // runtimes work today with no MCP access whatsoever (DoD: "existing
+    // behaviour unchanged").
+    return this.resolveMcpEnv(state).then((mcpEnv) => this.startWithInvocation(state, task, mcpEnv));
+  }
+
+  private async startWithInvocation(state: ExecutionState, task: DeptTaskSpec, mcpEnv: Record<string, string> | null): Promise<boolean> {
     const invocation: InvocationEnvelope = {
-      runtime: state.runtime,
+      runtime: mcpEnv === null ? state.runtime : { ...state.runtime, env: { ...state.runtime.env, ...mcpEnv } },
       task,
       // Enforcement is THIS manager's job (armDeadlineTimer, d2, 07 §7) —
       // surfaced here too only because an adapter MAY use it natively
@@ -603,6 +664,30 @@ export class DepartmentManager {
       await this.reportTerminal(state, { type: 'failed', reason: describeError(err), retrySafe: false });
       return false;
     }
+  }
+
+  /**
+   * d6 (13 §12): resolve `{ PIPELINE_MESH_MCP_URL, PIPELINE_MESH_EXECUTION_TOKEN }`
+   * for this spawn, or `null` when there is nothing to inject —
+   * `executionTokens` not configured, the runner is not registered yet, or
+   * the AS refused the request (e.g. `invalid_grant`: this execution is not
+   * leased to this runner — should not normally happen, since the offer
+   * itself only exists because it IS leased here, but the AS is the source
+   * of truth and this must degrade, not throw, either way). NEVER logs the
+   * token itself — only the OAuth error code on failure.
+   */
+  private async resolveMcpEnv(state: ExecutionState): Promise<Record<string, string> | null> {
+    if (this.options.executionTokens === undefined) return null;
+    const resourceUrl = this.options.executionTokens.resourceUrl();
+    if (resourceUrl === null) return null;
+    const result = await this.options.executionTokens.getToken(state.executionId);
+    if (!result.ok) {
+      this.logger.warn(
+        `department execution ${state.executionId}: could not obtain an execution token (${result.error.error}) — runtime will not have direct /mcp access this spawn`
+      );
+      return null;
+    }
+    return { [MESH_MCP_URL_ENV]: resourceUrl, [MESH_EXECUTION_TOKEN_ENV]: result.token.accessToken };
   }
 
   private handleRuntimeEvent(state: ExecutionState, event: RuntimeEvent): void {
@@ -668,6 +753,10 @@ export class DepartmentManager {
     this.clearIdleTimer(state);
     this.clearDeadlineTimer(state);
     this.clearParkTimer(state);
+    // d6: the execution is done — its token (if any was ever requested) is
+    // useless from here on; drop the cache entry (see handleLeaseRevoked's
+    // matching note).
+    this.options.executionTokens?.discard(state.executionId);
     this.journalRuntimeEvent(state, event);
     this.shipDepartmentEvent(state, event);
     if (state.handle !== null) {
