@@ -1,0 +1,25 @@
+src/department/artifact-upload.test.ts
+  s_d2a94d09c2de52::t_1d5fee136f0408 1-301
+src/department/artifact-upload.ts
+  s_d2a94d09c2de52::t_ee8375b0e344e5 1-278
+src/department/manager.artifacts.test.ts
+  s_d2a94d09c2de52::t_0d33dc1ab5654c 1-248
+src/department/manager.ts
+  s_d2a94d09c2de52::t_f696fdd139e302 76-93,119,125,150-151,239-247,310-314,346,353,601-625,850-853,861,874-911
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "895234a08b7e88f2950e1efb4c96b8a9b9694107",
+  "prompts": {},
+  "sessions": {
+    "s_d2a94d09c2de52": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_d2a94d09c2de52",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
