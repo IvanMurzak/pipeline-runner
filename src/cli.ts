@@ -5,19 +5,33 @@
  *
  *   register --url <base-url> --token <runner-token> [--label <l>]...
  *            [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]
- *            [--store-only]
+ *            [--gpu] [--store-only]
  *       Store the agent identity, then (unless --store-only) connect once to
  *       validate the token and persist the server-assigned runner id.
+ *       Also captures this instance's D17 capability advertisement
+ *       (isolation/gpu/os/resource hints, `./core/capabilities.ts`).
  *
- *   start    Run the agent loop: connect, register, heartbeat, reconnect.
+ *   start [--home <path>]
+ *       Run the agent loop: connect, register, heartbeat, reconnect. Acquires
+ *       the per-home exclusive lock first (department-mesh d7, D17,
+ *       `./core/home.ts`) — refuses to start if another live daemon already
+ *       holds this home. `--home <path>` (or the PIPELINE_RUNNER_HOME env
+ *       var it sets) roots this instance's config dir, data dir, and job-
+ *       workspace root, isolating it from every other home on the host.
  *   status   Print the stored identity (token redacted).
  */
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { AGENT_VERSION, ConfigStore, defaultConfigDir, describeIdentity, detectOs, type AgentIdentity } from './core/config';
+import { detectCapabilities } from './core/capabilities';
+import { AGENT_VERSION, ConfigStore, describeIdentity, detectOs, type AgentIdentity } from './core/config';
 import { AgentClient } from './core/connection';
+// department-mesh (task d7, D17): the isolated-home lock + generalized
+// workspace-root resolver — see `./core/home.ts`'s module doc for the full
+// picture (config/data dir home-awareness lives in `core/config.ts` /
+// `shipper/fs.ts` themselves).
+import { acquireHomeLock, HomeLockError, type HomeLockHandle, PIPELINE_RUNNER_HOME_ENV, resolveLockHomeDir, resolveWorkspaceRoot } from './core/home';
 import { consoleLogger } from './core/log';
 import { defaultTransports } from './core/transport';
 import type { RunnerStatus } from './core/wire';
@@ -67,10 +81,11 @@ function usage(): never {
       'usage: pipeline-runner <command>',
       '',
       '  register --url <base-url> --token <runner-token> [--label <l>]...',
-      '           [--capacity <n>] [--cli-version <v>] [--plugin-version <v>] [--store-only]',
-      '  start',
+      '           [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]',
+      '           [--gpu] [--store-only]',
+      '  start [--home <path>]',
       '  status',
-      '  service <install|uninstall|status> [--dry-run]',
+      '  service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
       '',
       `pipeline-runner ${AGENT_VERSION} (protocol v1)`,
     ].join('\n')
@@ -89,6 +104,7 @@ async function runRegister(argv: string[]): Promise<void> {
       'cli-version': { type: 'string' },
       'plugin-version': { type: 'string' },
       'store-only': { type: 'boolean' },
+      gpu: { type: 'boolean' },
     },
   });
   if (!values.url) fail('--url <base-url> is required');
@@ -109,6 +125,11 @@ async function runRegister(argv: string[]): Promise<void> {
     // concern — pass --cli-version when it matters.
     cli_version: values['cli-version'] ?? 'unknown',
     plugin_version: values['plugin-version'] ?? null,
+    // department-mesh d7 (D17): isolation is always ['process'] until the
+    // `container` adapter (task d8) lands; gpu is operator-declared
+    // (--gpu) — same posture as --capacity/--label, no portable
+    // cross-platform auto-detection exists without a native dependency.
+    capabilities: detectCapabilities({ gpu: values.gpu === true }),
   };
   const store = new ConfigStore();
   store.save(identity);
@@ -146,10 +167,37 @@ async function runRegister(argv: string[]): Promise<void> {
   }
 }
 
-function runStart(): void {
+function runStart(argv: string[] = []): void {
+  // department-mesh d7 (D17): `--home <path>` sets PIPELINE_RUNNER_HOME for
+  // THIS process before anything else resolves a config/data/workspace path
+  // — every downstream `defaultConfigDir`/`defaultDataDir`/
+  // `resolveWorkspaceRoot` call below (directly or via `ConfigStore`/
+  // `JobStore`/`DepartmentManager`) picks it up automatically since they all
+  // default to reading `process.env`. This is how a named OS service
+  // (`service/plan.ts`'s `resolveInvocation`) pins an instance to its home:
+  // the definition's ExecStart/ProgramArguments/binPath bakes in this flag.
+  const { values: startValues } = parseArgs({ args: argv, options: { home: { type: 'string' } } });
+  if (startValues.home) process.env[PIPELINE_RUNNER_HOME_ENV] = startValues.home;
+
+  // d7: the per-home exclusive lock — "one daemon per home" (07 §2.2). Must
+  // be acquired BEFORE the store/job-store/department journal below touch
+  // the home, and fails loudly (not a silent second-instance pile-up) when
+  // another live daemon already holds it.
+  let lock: HomeLockHandle;
+  try {
+    lock = acquireHomeLock(resolveLockHomeDir());
+  } catch (err) {
+    if (err instanceof HomeLockError) fail(err.message);
+    throw err;
+  }
+  consoleLogger.info(`home lock acquired: ${lock.path}`);
+
   const store = new ConfigStore();
   const identity = store.load();
-  if (identity === null) fail('no agent identity configured — run `pipeline-runner register` first');
+  if (identity === null) {
+    lock.release(); // clean early exit, not a crash — no self-heal needed
+    fail('no agent identity configured — run `pipeline-runner register` first');
+  }
 
   // Assigned below, once `attachJobExecution` returns — these accessors are
   // captured by closure into `client`'s heartbeat composition (c2: stop
@@ -244,7 +292,10 @@ function runStart(): void {
     labels: () => store.load()?.labels ?? [],
     capacity: () => store.load()?.capacity ?? 1,
     draining: () => client.draining || shuttingDown,
-    workspaceRoot: process.env.PIPELINE_RUNNER_JOBS_DIR ?? join(defaultConfigDir(), 'jobs'),
+    // d7 (D17): generalizes PIPELINE_RUNNER_JOBS_DIR onto the isolated home
+    // (`<home>/jobs`) — an explicit PIPELINE_RUNNER_JOBS_DIR still wins, and
+    // the no-home/no-override case is byte-identical to before this change.
+    workspaceRoot: resolveWorkspaceRoot(),
     logger: consoleLogger,
     // c3: the needs-input relay — every parked question now round-trips
     // through the bridge instead of hitting the default auto-fail seam.
@@ -313,6 +364,10 @@ function runStart(): void {
     suspendJobs: () => manager!.suspendAll(),
     flushShippers: () => shipperLifecycle.stopAll(),
     closeConnection: () => client.stop(),
+    // d7 (D17): release the per-home lock on a clean shutdown. Best-effort —
+    // a hard death (SCM stop, kill -9) skips this and relies on the next
+    // `start`'s stale-pid self-heal (`core/home.ts`) instead.
+    releaseLock: () => lock.release(),
     exit: (code) => process.exit(code),
     logger: consoleLogger,
   });
@@ -336,7 +391,7 @@ switch (command) {
     await runRegister(rest);
     break;
   case 'start':
-    runStart();
+    runStart(rest);
     break;
   case 'status':
     runStatus();

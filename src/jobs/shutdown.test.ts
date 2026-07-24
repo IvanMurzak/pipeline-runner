@@ -48,6 +48,44 @@ describe('createGracefulShutdown — drain order', () => {
     expect(exits).toEqual([0]);
   });
 
+  // department-mesh d7 (D17): releasing the per-home lock is an optional
+  // extra step between close and exit — the two tests above (which never
+  // pass `releaseLock`) prove it stays a no-op when a caller omits it.
+  test('releaseLock (d7, D17), when provided, runs after close and before exit', async () => {
+    const order: string[] = [];
+    const shutdown = createGracefulShutdown({
+      drain: () => {},
+      suspendJobs: async () => {},
+      flushShippers: async () => {},
+      closeConnection: () => order.push('close'),
+      releaseLock: () => order.push('releaseLock'),
+      exit: (code) => order.push(`exit ${code}`),
+      clock: new FakeClock(),
+    });
+    await shutdown();
+    expect(order).toEqual(['close', 'releaseLock', 'exit 0']);
+  });
+
+  test('a releaseLock failure is swallowed — shutdown still exits 0', async () => {
+    const logger = new CaptureLogger();
+    const exits: number[] = [];
+    const shutdown = createGracefulShutdown({
+      drain: () => {},
+      suspendJobs: async () => {},
+      flushShippers: async () => {},
+      closeConnection: () => {},
+      releaseLock: () => {
+        throw new Error('EPERM: locked by someone else');
+      },
+      exit: (code) => exits.push(code),
+      clock: new FakeClock(),
+      logger,
+    });
+    await shutdown();
+    expect(exits).toEqual([0]);
+    expect(logger.joined()).toContain('releasing the home lock failed');
+  });
+
   test('a hung drain is capped by the timeout — exit 0 anyway (spool is durable)', async () => {
     const clock = new FakeClock();
     const logger = new CaptureLogger();

@@ -12,10 +12,15 @@
  *   - Windows: `%LOCALAPPDATA%\pipeline-runner`
  *   - elsewhere: `$XDG_STATE_HOME/pipeline-runner`
  *     (falling back to `~/.local/state/pipeline-runner`)
+ *
+ * department-mesh d7 (D17): `PIPELINE_RUNNER_HOME` roots this at
+ * `<home>/data` (see `../core/config.ts`'s `resolveHome`, the single source
+ * of truth for the env var) — unset ⇒ the OS-default paths above, unchanged.
  */
 
 import * as fs from 'node:fs';
 import { join } from 'node:path';
+import { resolveHome } from '../core/config';
 
 export class ShipperFsError extends Error {}
 
@@ -143,6 +148,11 @@ export function defaultDataDir(
   env: Record<string, string | undefined> = process.env,
   platform: string = process.platform
 ): string {
+  // d7 (D17): an isolated home roots this instance's data dir at
+  // `<home>/data` — see `defaultConfigDir`'s matching check in
+  // `../core/config.ts`, which this mirrors.
+  const home = resolveHome(env);
+  if (home !== null) return join(home, 'data');
   if (platform === 'win32') {
     const local =
       env.LOCALAPPDATA ?? (env.USERPROFILE ? join(env.USERPROFILE, 'AppData', 'Local') : undefined);

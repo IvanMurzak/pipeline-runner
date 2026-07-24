@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import type { RunnerCapabilities } from '../src/core/capabilities';
 import { ConfigStore, type AgentIdentity } from '../src/core/config';
 import { applyRegisterAck, buildRegisterFrame, classifyReject, describeReject } from '../src/core/register';
 import { PROTOCOL_VERSION, type RegisterRejectMessage } from '../src/core/wire';
@@ -43,6 +44,34 @@ describe('buildRegisterFrame', () => {
     const frame = buildRegisterFrame(identity(), 'x');
     expect('capacity' in frame).toBe(false);
     expect(frame.plugin_version).toBeNull();
+  });
+
+  // department-mesh d7 (D17): capability advertisement rides the frame's
+  // additive .passthrough() (no typed schema field in protocol 0.4.0 yet —
+  // see core/capabilities.ts's PROTOCOL FOLLOW-UP note).
+  describe('D17 capability advertisement', () => {
+    const caps: RunnerCapabilities = {
+      isolation: ['process'],
+      gpu: true,
+      os: 'linux',
+      resources: { cpu_count: 8, total_memory_mb: 16384 },
+    };
+
+    test('attaches capabilities when the identity has them', () => {
+      const frame = buildRegisterFrame(identity({ capabilities: caps }), 'x');
+      expect((frame as unknown as { capabilities?: RunnerCapabilities }).capabilities).toEqual(caps);
+    });
+
+    test('omits the key entirely (not null) when the identity predates d7', () => {
+      const frame = buildRegisterFrame(identity(), 'x');
+      expect('capabilities' in frame).toBe(false);
+    });
+
+    test('survives a JSON round-trip untouched (what actually crosses the wire)', () => {
+      const frame = buildRegisterFrame(identity({ capabilities: caps }), 'x');
+      const roundTripped = JSON.parse(JSON.stringify(frame));
+      expect(roundTripped.capabilities).toEqual(caps);
+    });
   });
 });
 
