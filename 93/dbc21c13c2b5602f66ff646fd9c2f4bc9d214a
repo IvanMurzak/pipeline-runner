@@ -1,0 +1,27 @@
+src/department/fixtures/container-runtime.cjs
+  s_8b98f711c8ef2c::t_48065c0963c614 1-115
+src/department/fixtures/parking-heartbeat-runtime.ts
+  s_8b98f711c8ef2c::t_071975216d7d45 1-88
+src/department/fixtures/process-tree-runtime.ts
+  s_8b98f711c8ef2c::t_966aeb09cca734 1-82
+src/jobs/types.test.ts
+  s_8b98f711c8ef2c::t_c22ec76e9475db 165-204
+src/jobs/types.ts
+  s_8b98f711c8ef2c::t_18e06d518bd5b7 287-305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "93dbc21c13c2b5602f66ff646fd9c2f4bc9d214a",
+  "prompts": {},
+  "sessions": {
+    "s_8b98f711c8ef2c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_8b98f711c8ef2c",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
