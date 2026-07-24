@@ -162,4 +162,44 @@ describe('nodeJobSpawn — killGroup() process-tree kill (department-mesh d2)', 
       rmSync(heartbeatPath, { force: true });
     }
   }, 15_000);
+
+  // department-mesh `e2` gate: a REAL cancel-then-dispose race (the runner's
+  // OWN `DepartmentManager.terminateExecution` — `../department/manager.ts`
+  // — calls `adapter.cancel()` which writes a polite `task.cancel` line,
+  // THEN `dispose()`/`killGroup()`) exposed a genuine crash here: writing to
+  // an already-broken stdin pipe fails ASYNCHRONOUSLY (a Node stream
+  // `'error'` event, not a synchronous throw from `.write()`), and a stream
+  // with no `'error'` listener at all makes Node rethrow that event as an
+  // uncaught exception — crashing the WHOLE daemon process over one closed
+  // pipe. `writeLine()` and `endStdin()` already wrap their own synchronous
+  // call in try/catch; this proves the ASYNC failure mode is ALSO handled.
+  test('writeLine() immediately followed by killGroup() does not crash the process (a racing EPIPE is swallowed, not rethrown)', async () => {
+    const spawner = nodeJobSpawn();
+    // Ignores SIGTERM so `killGroup('SIGKILL')` is what actually reaps it.
+    const script = "process.on('SIGTERM',()=>{}); setTimeout(()=>{}, 30000);";
+    const proc = spawner.spawn(process.execPath, ['-e', script]);
+    const exited = waitForExit(proc);
+
+    // The real race this reproduces: `../department/manager.ts`'s
+    // `terminateExecution` calls `adapter.cancel()` (a `writeLine()` — data
+    // QUEUED, not necessarily flushed to the OS pipe yet, since
+    // `stream.write()` returns before that) and, essentially immediately
+    // after, `dispose()` -> `killGroup()`. If the SIGKILL severs the pipe
+    // before the queued write actually flushes, Node reports that as an
+    // ASYNCHRONOUS `'error'` event on the stream — not a synchronous throw
+    // from `.write()` — so the two calls are issued back-to-back here too,
+    // with no await/sleep between them.
+    // A large payload (not the tiny real `task.cancel` line) so the write
+    // cannot complete synchronously to the OS pipe buffer — it MUST still be
+    // in flight when the kill below severs the pipe, reliably forcing the
+    // async 'error' path rather than leaving it to chance.
+    expect(() => proc.writeLine(JSON.stringify({ type: 'task.cancel', padding: 'x'.repeat(5_000_000) }))).not.toThrow();
+    expect(() => proc.killGroup('SIGKILL')).not.toThrow();
+
+    await exited;
+    // Give any deferred 'error' event a chance to surface before the test
+    // ends — before the fix, THIS is what could crash the whole process
+    // (an unhandled stream 'error' event), not merely fail an assertion.
+    await sleep(300);
+  }, 10_000);
 });

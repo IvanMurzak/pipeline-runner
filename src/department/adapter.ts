@@ -82,11 +82,12 @@ export interface RuntimeConfig {
   /** How long a PARKED task (`input_required`, no answer yet) stays alive
    *  before the supervisor expires it (department-mesh task d2; 07 §7 —
    *  "a parked question inherits the department's park expiry rather than
-   *  waiting forever"). The real source is a department's manifest
-   *  (`department.config_update.limits.parkExpiry`, e.g. `"7d"`), which
-   *  install/config-caching (task c2) has not wired onto the runner yet —
-   *  this is the SAME placeholder env-driven seam `startupTimeoutSeconds`/
-   *  `gracefulShutdownSeconds` already use ahead of that. Default:
+   *  waiting forever"). Sourced from a department's manifest via
+   *  `department.config_update.limits.parkExpiry` (e.g. `"7d"`, parsed by
+   *  `../core/duration.ts`), layered by `./manager.ts`'s
+   *  `handleConfigUpdateFrame` on top of whatever `resolveRuntimeConfig`
+   *  (still `startupTimeoutSeconds`/`gracefulShutdownSeconds`'s
+   *  env-driven placeholder, `./config.ts`) returns as the base. Default:
    *  `./manager.ts`'s `DEFAULT_PARK_EXPIRY_S` (7 days). */
   parkExpirySeconds?: number;
   lifecycle?: RuntimeLifecycle;

@@ -500,6 +500,131 @@ describe('DepartmentManager — park expiry (d2, 07 §7 — "a parked question i
   });
 });
 
+describe('DepartmentManager — department.config_update (e2, parkExpiry only)', () => {
+  function makeWiredForConfigUpdate() {
+    const dispatcher = new Dispatcher();
+    const clock = new FakeClock();
+    const journal = new MemJournal();
+    const sink = new FrameSink();
+    const adapter = new FakeAdapter();
+    const logger = new CaptureLogger();
+    const runtimes = new Map<string, RuntimeConfig>();
+    const manager = new DepartmentManager({
+      adapters: [adapter],
+      resolveRuntimeConfig: (id) => runtimes.get(id) ?? null,
+      send: sink.send,
+      dispatcher,
+      journal,
+      journalRoot: '/data/department',
+      clock,
+      logger,
+    });
+    manager.attach(dispatcher);
+    return { manager, dispatcher, adapter, sink, runtimes, clock, logger };
+  }
+
+  function makeConfigUpdateFrame(overrides: Partial<{ departmentId: string; parkExpiry: string }> = {}): WireFrame {
+    return {
+      type: 'department.config_update',
+      department_id: overrides.departmentId ?? 'unity-department',
+      manifest_digest: 'digest-abc',
+      runtime_profile: {},
+      limits: overrides.parkExpiry !== undefined ? { parkExpiry: overrides.parkExpiry } : {},
+    };
+  }
+
+  test('a config_update received before admission changes what that (subsequent) admission\'s park timer uses', async () => {
+    const { manager, dispatcher, adapter, runtimes, clock } = makeWiredForConfigUpdate();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' }); // no parkExpirySeconds — base default (7d)
+
+    dispatcher.dispatch(makeConfigUpdateFrame({ parkExpiry: '2s' }));
+    await tick();
+
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    // Nowhere near the 7-day base default — only reachable via the override.
+    clock.advance(2_000);
+    await tick(); // onParkExpired's terminateExecution() is fire-and-forget
+
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+    expect(manager.activeCount).toBe(0);
+  });
+
+  test('a config_update received while already parked re-arms the LIVE timer to the new value', async () => {
+    const { manager, dispatcher, adapter, runtimes, clock } = makeWiredForConfigUpdate();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+    // Timer is armed for 60s at this point.
+
+    dispatcher.dispatch(makeConfigUpdateFrame({ parkExpiry: '2s' }));
+    await tick();
+
+    // Well short of the ORIGINAL 60s — only fires if the live timer was
+    // actually re-armed to the new, shorter value.
+    clock.advance(2_000);
+    await tick();
+
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+    expect(manager.activeCount).toBe(0);
+  });
+
+  test('a malformed parkExpiry is logged and ignored — no crash, no override applied, other fields untouched', async () => {
+    const { manager, dispatcher, adapter, runtimes, clock, logger } = makeWiredForConfigUpdate();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    dispatcher.dispatch(makeConfigUpdateFrame({ parkExpiry: 'not-a-duration' }));
+    await tick();
+
+    expect(logger.lines.some((l) => l.includes('parkExpiry') && l.includes('not-a-duration'))).toBe(true);
+    // The handler must not have thrown (Dispatcher.dispatch would log "threw").
+    expect(logger.lines.some((l) => l.includes('threw'))).toBe(false);
+
+    // The already-armed timer is untouched — still fires at the ORIGINAL 60s,
+    // proving no bogus override (e.g. 0s/NaN) was applied.
+    clock.advance(59_000);
+    await tick();
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(0);
+    clock.advance(1_000);
+    await tick();
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+
+    // A second, unrelated execution admitted AFTER the malformed frame still
+    // gets the plain base config — no stray override field leaked in.
+    await manager.admitTask(makeOffer({ executionId: 'dexec-2' }));
+    const secondInvocation = adapter.startCalls()[1]!;
+    expect(secondInvocation.runtime).toEqual({ adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+  });
+
+  test('a department_id the manager doesn\'t recognize is ignored safely (no crash, no cross-department effect)', async () => {
+    const { manager, dispatcher, adapter, runtimes, clock, logger } = makeWiredForConfigUpdate();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', parkExpirySeconds: 60 });
+
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'input_required', questionId: 'q1', question: { text: 'Android or iOS?' } });
+
+    dispatcher.dispatch(makeConfigUpdateFrame({ departmentId: 'no-such-department', parkExpiry: '2s' }));
+    await tick();
+
+    expect(logger.lines.some((l) => l.includes('unknown department'))).toBe(true);
+    expect(logger.lines.some((l) => l.includes('threw'))).toBe(false);
+
+    // The unrelated, already-parked unity-department execution keeps ITS OWN
+    // 60s expiry — unaffected by the unknown department's 2s frame.
+    clock.advance(2_000);
+    await tick();
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(0);
+    clock.advance(58_000);
+    await tick();
+    expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+  });
+});
+
 describe('DepartmentManager — wire attachment (attach(), real protocol 0.4.0 frame shapes)', () => {
   function makeWiredManager() {
     const dispatcher = new Dispatcher();
