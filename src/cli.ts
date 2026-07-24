@@ -5,11 +5,14 @@
  *
  *   register --url <base-url> --token <runner-token> [--label <l>]...
  *            [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]
- *            [--gpu] [--store-only]
+ *            [--gpu] [--container] [--store-only]
  *       Store the agent identity, then (unless --store-only) connect once to
  *       validate the token and persist the server-assigned runner id.
  *       Also captures this instance's D17 capability advertisement
- *       (isolation/gpu/os/resource hints, `./core/capabilities.ts`).
+ *       (isolation/gpu/os/resource hints, `./core/capabilities.ts`). `--gpu`
+ *       is operator-declared; `--container` is VERIFIED (a live docker probe,
+ *       `./department/container.ts`'s `probeContainerRuntimeAvailable`)
+ *       before the `container` isolation tier is ever advertised (D17 R14).
  *
  *   start [--home <path>]
  *       Run the agent loop: connect, register, heartbeat, reconnect. Acquires
@@ -24,7 +27,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { detectCapabilities } from './core/capabilities';
+import { detectCapabilities, type IsolationTier } from './core/capabilities';
 import { AGENT_VERSION, ConfigStore, describeIdentity, detectOs, type AgentIdentity } from './core/config';
 import { AgentClient } from './core/connection';
 // department-mesh (task d7, D17): the isolated-home lock + generalized
@@ -65,6 +68,11 @@ import { runService } from './service';
 // dispatch. `parseDepartmentRuntimesEnv` is a placeholder until department
 // install/config_update (task c2) lands — see `./department/config.ts`.
 import { parseDepartmentRuntimesEnv } from './department/config';
+// department-mesh d8 (D17): the `container` isolation-tier adapter — an
+// ADDITIONAL entry in the manager's adapter registry, resolved by
+// `RuntimeConfig.adapterId` exactly like `jsonl-process`; a department only
+// ever reaches it if its resolved config says `adapterId: 'container'`.
+import { ContainerAdapter, probeContainerRuntimeAvailable } from './department/container';
 import { JsonlProcessAdapter } from './department/jsonl-process';
 import { DepartmentManager, nodeJournalWriter } from './department/manager';
 
@@ -82,7 +90,7 @@ function usage(): never {
       '',
       '  register --url <base-url> --token <runner-token> [--label <l>]...',
       '           [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]',
-      '           [--gpu] [--store-only]',
+      '           [--gpu] [--container] [--store-only]',
       '  start [--home <path>]',
       '  status',
       '  service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
@@ -105,6 +113,7 @@ async function runRegister(argv: string[]): Promise<void> {
       'plugin-version': { type: 'string' },
       'store-only': { type: 'boolean' },
       gpu: { type: 'boolean' },
+      container: { type: 'boolean' },
     },
   });
   if (!values.url) fail('--url <base-url> is required');
@@ -112,6 +121,25 @@ async function runRegister(argv: string[]): Promise<void> {
   const capacity = values.capacity !== undefined ? Number(values.capacity) : undefined;
   if (capacity !== undefined && (!Number.isInteger(capacity) || capacity <= 0)) {
     fail('--capacity must be a positive integer');
+  }
+
+  // department-mesh d8 (D17, R14): `--container` OPTS IN to advertising the
+  // `container` isolation tier, but only after ACTUALLY VERIFYING the
+  // runtime is usable on this host — never trusted on the flag alone, unlike
+  // `--gpu` (no portable auto-detection exists for that one; docker CAN be
+  // checked, so it is). A runner must never advertise a capability it cannot
+  // actually isolate.
+  let isolation: IsolationTier[] = ['process'];
+  if (values.container === true) {
+    const probe = await probeContainerRuntimeAvailable();
+    if (probe.available) {
+      isolation = ['process', 'container'];
+      console.log(`[pipeline-runner] container isolation tier available (docker ${probe.version ?? 'unknown version'}) — advertising 'container'`);
+    } else {
+      console.warn(
+        `[pipeline-runner] warn: --container was requested but the container runtime is not usable (${probe.reason}) — NOT advertising 'container' (R14: a runner must never advertise isolation it cannot actually provide)`
+      );
+    }
   }
 
   const identity: AgentIdentity = {
@@ -125,11 +153,11 @@ async function runRegister(argv: string[]): Promise<void> {
     // concern — pass --cli-version when it matters.
     cli_version: values['cli-version'] ?? 'unknown',
     plugin_version: values['plugin-version'] ?? null,
-    // department-mesh d7 (D17): isolation is always ['process'] until the
-    // `container` adapter (task d8) lands; gpu is operator-declared
-    // (--gpu) — same posture as --capacity/--label, no portable
-    // cross-platform auto-detection exists without a native dependency.
-    capabilities: detectCapabilities({ gpu: values.gpu === true }),
+    // department-mesh d7/d8 (D17): gpu is operator-declared (--gpu) — same
+    // posture as --capacity/--label, no portable cross-platform
+    // auto-detection exists without a native dependency. `isolation` is
+    // verified above, never just declared.
+    capabilities: detectCapabilities({ gpu: values.gpu === true, isolation }),
   };
   const store = new ConfigStore();
   store.save(identity);
@@ -307,7 +335,7 @@ function runStart(argv: string[] = []): void {
     retention: resolveRetentionPolicy(process.env, consoleLogger),
   });
 
-  // department-mesh (task d1): the adapter registry starts with just
+  // department-mesh (task d1): the adapter registry starts with
   // `jsonl-process` (the flagship) — `pipeline-drive` joins it when d4 ports
   // the existing dispatch path onto the same abstraction. Runtime resolution
   // is env-driven for now (see the import doc); a `department.offer` for an
@@ -319,6 +347,13 @@ function runStart(argv: string[] = []): void {
   // reason and process-group cancellation are internal to `DepartmentManager`
   // / `JsonlProcessAdapter` and need no extra composition here.
   //
+  // d8 (D17): `ContainerAdapter` is registered ALONGSIDE `jsonl-process`, not
+  // instead of it — a department only reaches it when its resolved
+  // `RuntimeConfig.adapterId === 'container'` (`resolveRuntimeConfig` below);
+  // every other department keeps running exactly as before. Registering the
+  // adapter here does NOT itself advertise the `container` capability — that
+  // is `register --container`'s job (above), gated on a live docker probe.
+  //
   // KNOWN GAP (deliberate, still open post-d2): unlike `manager`/
   // `shipperLifecycle` above, department executions are NOT yet wired into
   // graceful shutdown's drain/suspend sequence below — draining new offers
@@ -326,7 +361,7 @@ function runStart(argv: string[] = []): void {
   // executions are not yet suspended on SIGTERM/SIGINT.
   const departmentRuntimes = parseDepartmentRuntimesEnv(process.env.PIPELINE_RUNNER_DEPARTMENTS, consoleLogger);
   departmentManager = new DepartmentManager({
-    adapters: [new JsonlProcessAdapter({ logger: consoleLogger })],
+    adapters: [new JsonlProcessAdapter({ logger: consoleLogger }), new ContainerAdapter({ logger: consoleLogger })],
     resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
     send: (frame) => client.send(frame),
     dispatcher: client.dispatcher,

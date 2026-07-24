@@ -61,4 +61,62 @@ describe('parseDepartmentRuntimesEnv', () => {
     const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd', parkExpirySeconds: 'a week' } }));
     expect(map.get('d')?.parkExpirySeconds).toBeUndefined();
   });
+
+  // department-mesh d8: an `adapterId: "container"` entry carries its
+  // sandbox spec under `container` — parsed via `./container.ts`'s
+  // `narrowContainerSpec`.
+  describe('container spec (d8)', () => {
+    test('a well-formed container entry parses the full spec', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({
+          'unity-department': {
+            adapterId: 'container',
+            command: 'unity-department',
+            args: ['--stdio'],
+            container: {
+              image: 'ghcr.io/example/unity-department:1.0',
+              mounts: [{ hostPath: '/host/creds', containerPath: '/creds', readOnly: true }],
+              egressAllowlist: [{ host: 'api.example.com', port: 443 }],
+              egressNetwork: 'dept-egress-net',
+            },
+          },
+        })
+      );
+      expect(map.get('unity-department')?.adapterId).toBe('container');
+      expect(map.get('unity-department')?.container).toEqual({
+        image: 'ghcr.io/example/unity-department:1.0',
+        mounts: [{ hostPath: '/host/creds', containerPath: '/creds', readOnly: true }],
+        egressAllowlist: [{ host: 'api.example.com', port: 443 }],
+        egressNetwork: 'dept-egress-net',
+      });
+    });
+
+    test('a container entry with no image narrows to undefined — the whole entry still parses, just without a sandbox spec', () => {
+      const logger = new CaptureLogger();
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({ d: { adapterId: 'container', command: 'd', container: { mounts: [] } } }),
+        logger
+      );
+      expect(map.get('d')?.adapterId).toBe('container');
+      expect(map.get('d')?.container).toBeUndefined();
+    });
+
+    test('a malformed mount entry (missing hostPath) is dropped, the rest of the spec still parses', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({
+          d: {
+            adapterId: 'container',
+            command: 'd',
+            container: { image: 'img:1', mounts: [{ containerPath: '/x' }, { hostPath: '/h', containerPath: '/y' }] },
+          },
+        })
+      );
+      expect(map.get('d')?.container?.mounts).toEqual([{ hostPath: '/h', containerPath: '/y' }]);
+    });
+
+    test('an entry with no container key at all leaves RuntimeConfig.container unset', () => {
+      const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'jsonl-process', command: 'd' } }));
+      expect('container' in (map.get('d') ?? {})).toBe(false);
+    });
+  });
 });
