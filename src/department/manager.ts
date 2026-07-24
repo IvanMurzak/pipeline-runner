@@ -14,14 +14,36 @@
  * this manager's `cancel`/`dispose` calls are honest about that limit (see
  * `./jsonl-process.ts`'s `dispose()` doc).
  *
- * ── Wire frame shapes are PROVISIONAL ───────────────────────────────────────
- * `@baizor/pipeline-protocol` does not carry the mesh schemas yet (0.4.0,
- * the `e1` gate — see `08-protocol-delta.md`). The `department.offer` /
- * `department.message` / `department.cancel` / `department.accept` /
- * `department.reject` shapes below are runner-LOCAL, hand-parsed against
- * `WireFrame`'s tolerant passthrough envelope, snake_case to match 08's
- * documented field names so the eventual swap to real zod schemas is a
- * near drop-in. Nothing here imports the protocol package for them.
+ * ── Wire frame shapes (e1 repin) ─────────────────────────────────────────────
+ * `@baizor/pipeline-protocol` 0.4.0 carries the real mesh schemas (08-
+ * protocol-delta.md) as of the e1 gate. `department.offer` is parsed with
+ * `DeptOfferMessageSchema`; `department.message` is validated against
+ * `DeptMessageSchema`; outgoing `department.accept` / `department.reject` /
+ * `department.event` frames are built as real, typed `Dept*Message` shapes.
+ * The runner-LOCAL `DeptMessage`/`Part` types (`./adapter.ts`) stay camelCase
+ * domain types distinct from the wire's snake_case shapes by design (see
+ * `./adapter.ts`'s module doc) — this file is the translation boundary.
+ *
+ * ── Event delivery (e1 fix — see the e1 gate report) ─────────────────────────
+ * d1 originally shipped `RuntimeEvent`s through the EXISTING pipeline shipper
+ * (tail -> filter -> seq -> batch -> spool -> drain -> `upload` frame ->
+ * `ingestBatch`), reading 07 §8 ("mesh runtime events reach the cloud through
+ * the existing shipper") as "reuse the exact `upload` wire frame". That is a
+ * genuine integration bug, not a protocol schema bug: `ingestBatch`
+ * (`cloud/apps/api/src/modules/runs/ingest.ts`) resolves an unknown `run_id`
+ * by CREATING a new `runs` row (`findRunByReportedId(...) ?? createRun(...)`)
+ * — a department execution id has no `dept_executions` counterpart there, so
+ * every mesh event would silently fabricate a phantom pipeline `runs` row and
+ * NEVER reach `dept_task_events` / `transitionTask` / `appendMessage`. The
+ * cloud's `department.event` handler (08 §5) was always the intended
+ * destination. Fixed here: `RuntimeEvent`s are shipped as real
+ * `department.event` wire frames sent directly on the connection (`seq`
+ * seeded from the offer's `event_seq_base`, 08 §4's attempt-fencing
+ * convention), NOT through the shipper/`ingestBatch` path. The local journal
+ * file write is KEPT (harmless, useful for on-disk audit) but is no longer
+ * wired to a shipper/transport. `department.artifact` (chunked upload) stays
+ * OUT of scope here — 08 §6 / P4 (task c9/d3); an `artifact` `RuntimeEvent` is
+ * journalled locally and logged, not yet shipped.
  *
  * ── Lifecycle policy, concretely ────────────────────────────────────────────
  *   - `per-task`: one `adapter.start()` per execution; disposed at terminal.
@@ -46,15 +68,23 @@
 
 import { dirname, join } from 'node:path';
 import * as nodeFs from 'node:fs';
+import {
+  DeptOfferMessageSchema,
+  DeptMessageSchema as WireDeptMessageSchema,
+} from '@baizor/pipeline-protocol';
+import type {
+  DeptEventMessage,
+  DeptMessage as WireDeptMessage,
+  DeptPart as WireDeptPart,
+  DeptRuntimeEvent,
+} from '@baizor/pipeline-protocol';
 import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Dispatcher } from '../core/dispatcher';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import type { WireFrame } from '../core/wire';
-import { defaultDataDir, nodeShipperFs, type ShipperFileSystem } from '../shipper/fs';
-import { EventShipper, shipperStateDir } from '../shipper/shipper';
-import { WireUploadTransport, type UploadTransport } from '../shipper/upload-transport';
+import { defaultDataDir } from '../shipper/fs';
 import type {
   AgentRuntimeAdapter,
   DeptMessage,
@@ -94,6 +124,11 @@ export interface DepartmentOfferInput {
   messages: DeptMessage[];
   acceptedOutputModes?: string[];
   deadlineAt?: string;
+  /** Starting shipper sequence number for this attempt's `department.event`s
+   *  (08 §4's `attempt × 1_000_000` attempt-fencing convention). Optional so
+   *  direct `admitTask()` callers (tests; `makeOffer()`) that don't care about
+   *  cross-attempt sequence collisions may omit it — defaults to 0. */
+  eventSeqBase?: number;
 }
 
 export type DepartmentRejectReason = 'busy' | 'capability' | 'policy' | 'broken_runtime';
@@ -112,8 +147,6 @@ export interface DepartmentManagerOptions {
   /** Root dir each execution's journal lives under: `<root>/<executionId>/events.jsonl`. */
   journalRoot?: string;
   journal?: JournalWriter;
-  transport?: UploadTransport;
-  fs?: ShipperFileSystem;
   capacity?(): number;
   draining?(): boolean;
   /** `per-context` idle window before an inactive handle is disposed (the
@@ -150,7 +183,9 @@ interface ExecutionState {
   respawnAttempted: boolean;
   lastActivityAt: number;
   journalPath: string;
-  shipper: EventShipper;
+  /** Next `department.event.seq` to send — seeded from the offer's
+   *  `event_seq_base` (08 §4 attempt-fencing), incremented per shipped event. */
+  nextSeq: number;
   idleTimer: unknown;
 }
 
@@ -159,7 +194,6 @@ export class DepartmentManager {
   private readonly executions = new Map<string, ExecutionState>();
   private readonly journalRoot: string;
   private readonly journal: JournalWriter;
-  private readonly fs: ShipperFileSystem;
   private readonly clock: Clock;
   private readonly logger: Logger;
   private readonly makeId: () => string;
@@ -169,7 +203,6 @@ export class DepartmentManager {
     for (const adapter of options.adapters) this.adapters.set(adapter.id, adapter);
     this.journalRoot = options.journalRoot ?? join(defaultDataDir(options.env), 'department');
     this.journal = options.journal ?? nodeJournalWriter();
-    this.fs = options.fs ?? nodeShipperFs();
     this.clock = options.clock ?? systemClock;
     this.logger = options.logger ?? nullLogger;
     this.makeId = options.makeId ?? (() => crypto.randomUUID());
@@ -255,8 +288,6 @@ export class DepartmentManager {
 
     const journalPath = join(this.journalRoot, sanitizeForPath(offer.executionId), 'events.jsonl');
     this.journal.ensureDir(dirname(journalPath));
-    const shipper = this.makeShipper(journalPath);
-    shipper.start();
 
     const state: ExecutionState = {
       executionId: offer.executionId,
@@ -273,7 +304,7 @@ export class DepartmentManager {
       respawnAttempted: false,
       lastActivityAt: this.clock.now(),
       journalPath,
-      shipper,
+      nextSeq: offer.eventSeqBase ?? 0,
       idleTimer: null,
     };
     this.executions.set(offer.executionId, state);
@@ -384,6 +415,7 @@ export class DepartmentManager {
       return;
     }
     this.journalRuntimeEvent(state, event);
+    this.shipDepartmentEvent(state, event);
   }
 
   private async reportTerminal(state: ExecutionState, event: Extract<RuntimeEvent, { type: 'completed' } | { type: 'failed' }>): Promise<void> {
@@ -391,6 +423,7 @@ export class DepartmentManager {
     state.terminal = true;
     this.clearIdleTimer(state);
     this.journalRuntimeEvent(state, event);
+    this.shipDepartmentEvent(state, event);
     if (state.handle !== null) {
       const handle = state.handle;
       state.handle = null;
@@ -399,11 +432,6 @@ export class DepartmentManager {
       } catch (err) {
         this.logger.warn(`department execution ${state.executionId}: dispose() failed: ${describeError(err)}`);
       }
-    }
-    try {
-      await state.shipper.stop();
-    } catch (err) {
-      this.logger.warn(`department execution ${state.executionId}: shipper stop failed: ${describeError(err)}`);
     }
   }
 
@@ -416,6 +444,34 @@ export class DepartmentManager {
       nowIso: new Date(this.clock.now()).toISOString(),
     });
     this.journal.appendLine(state.journalPath, JSON.stringify(envelope));
+  }
+
+  /**
+   * Ship a `RuntimeEvent` to the cloud as a real `department.event` wire
+   * frame (e1 fix — see the module doc's "Event delivery" note). `artifact`
+   * events are NOT shipped here — 08 §6 gives artifacts their own dedicated
+   * `department.artifact` chunked-upload frame (P4 / task c9-d3), out of
+   * scope for this manager; they are journalled locally and logged only.
+   * Best-effort: `options.send` returning false (runner offline) is logged,
+   * not queued/retried — a durable per-execution event outbox is future work
+   * (mirrors `gatewayRegistry.sendToRunner`'s own best-effort semantics on
+   * the cloud -> runner leg).
+   */
+  private shipDepartmentEvent(state: ExecutionState, event: RuntimeEvent): void {
+    if (event.type === 'artifact') {
+      this.logger.warn(
+        `department execution ${state.executionId}: artifact "${event.name}" journalled locally only — department.artifact upload is not yet wired (P4 scope)`,
+      );
+      return;
+    }
+    const seq = state.nextSeq;
+    state.nextSeq += 1;
+    const frame = buildDepartmentEventFrame(state, event, seq);
+    if (!this.options.send(frame)) {
+      this.logger.warn(
+        `department execution ${state.executionId}: department.event seq ${seq} (${event.type}) not sent — runner offline`,
+      );
+    }
   }
 
   // ── Idle eviction (per-context) ────────────────────────────────────────
@@ -449,22 +505,6 @@ export class DepartmentManager {
     // No re-arm: a future deliverMessage()/respawn re-establishes activity.
   }
 
-  // ── Shipper construction (mirrors ../jobs/shipper-lifecycle.ts) ────────
-
-  private makeShipper(journalPath: string): EventShipper {
-    const transport =
-      this.options.transport ?? new WireUploadTransport({ sendFrame: this.options.send, dispatcher: this.options.dispatcher, clock: this.clock });
-    return new EventShipper({
-      journalPath,
-      transport,
-      stateDir: shipperStateDir(journalPath, this.options.env),
-      projectRoot: journalPath,
-      fs: this.fs,
-      clock: this.clock,
-      logger: this.logger,
-      env: this.options.env,
-    });
-  }
 }
 
 function describeError(err: unknown): string {
@@ -477,50 +517,66 @@ function sanitizeForPath(id: string): string {
   return id.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
-// ── Provisional wire-frame parsing (see the module doc) ─────────────────────
+// ── Wire-frame parsing / building — real protocol 0.4.0 schemas (e1 repin) ──
+// The wire's `Dept*` shapes are snake_case (08-protocol-delta.md); the
+// runner-LOCAL `DeptMessage`/`Part` types (`./adapter.ts`) stay camelCase by
+// design (see that module's doc) — the functions below are the translation
+// boundary, now backed by REAL zod validation instead of hand-rolled checks.
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function narrowWirePart(raw: unknown): Part | null {
-  if (!isRecord(raw)) return null;
+function fromWirePart(raw: WireDeptPart): Part {
   const part: Part = {};
-  if (typeof raw.text === 'string') part.text = raw.text;
-  if (typeof raw.raw === 'string') part.raw = raw.raw;
-  if (typeof raw.url === 'string') part.url = raw.url;
+  if (raw.text !== undefined) part.text = raw.text;
+  if (raw.raw !== undefined) part.raw = raw.raw;
+  if (raw.url !== undefined) part.url = raw.url;
   if (raw.data !== undefined) part.data = raw.data;
-  if (typeof raw.media_type === 'string') part.mediaType = raw.media_type;
-  if (typeof raw.filename === 'string') part.filename = raw.filename;
-  if (isRecord(raw.metadata)) part.metadata = raw.metadata;
+  if (raw.mediaType !== undefined) part.mediaType = raw.mediaType;
+  if (raw.filename !== undefined) part.filename = raw.filename;
+  if (raw.metadata !== undefined) part.metadata = raw.metadata;
   return part;
 }
 
-function narrowWireMessage(raw: unknown): DeptMessage | null {
-  if (!isRecord(raw)) return null;
-  if (typeof raw.message_id !== 'string' || raw.message_id.length === 0) return null;
-  if (raw.role !== 'ROLE_USER' && raw.role !== 'ROLE_AGENT') return null;
-  if (!Array.isArray(raw.parts)) return null;
-  const parts = raw.parts.map(narrowWirePart).filter((p): p is Part => p !== null);
-  if (parts.length === 0) return null;
+function toWirePart(part: Part): WireDeptPart {
   return {
-    messageId: raw.message_id,
-    role: raw.role,
-    parts,
-    ...(typeof raw.context_id === 'string' ? { contextId: raw.context_id } : {}),
-    ...(typeof raw.task_id === 'string' ? { taskId: raw.task_id } : {}),
-    ...(typeof raw.created_at === 'string' ? { createdAt: raw.created_at } : {}),
+    ...(part.text !== undefined ? { text: part.text } : {}),
+    ...(part.raw !== undefined ? { raw: part.raw } : {}),
+    ...(part.url !== undefined ? { url: part.url } : {}),
+    ...(part.data !== undefined ? { data: part.data } : {}),
+    ...(part.mediaType !== undefined ? { mediaType: part.mediaType } : {}),
+    ...(part.filename !== undefined ? { filename: part.filename } : {}),
+    ...(part.metadata !== undefined ? { metadata: part.metadata } : {}),
+  } as WireDeptPart;
+}
+
+/** Validate + translate an incoming wire `DeptMessage` (real
+ *  `DeptMessageSchema`, snake_case) into the runner-local camelCase
+ *  `DeptMessage` (`./adapter.ts`). Returns null on a schema-invalid frame —
+ *  the caller logs and drops, same tolerance as before the repin. */
+function narrowWireMessage(raw: unknown): DeptMessage | null {
+  const parsed = WireDeptMessageSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const m = parsed.data;
+  return {
+    messageId: m.message_id,
+    role: m.role,
+    parts: m.parts.map(fromWirePart),
+    ...(m.context_id !== undefined ? { contextId: m.context_id } : {}),
+    ...(m.task_id !== undefined ? { taskId: m.task_id } : {}),
+    createdAt: m.created_at,
   };
 }
 
+/** Validate + translate an incoming `department.offer` frame with the REAL
+ *  `DeptOfferMessageSchema` (e1 repin — was hand-rolled field presence
+ *  checks before). `event_seq_base` threads through to `ExecutionState.nextSeq`. */
 function narrowOfferFrame(frame: WireFrame): DepartmentOfferInput | null {
-  const f = frame as Record<string, unknown>;
-  if (typeof f.execution_id !== 'string' || f.execution_id.length === 0) return null;
-  if (typeof f.task_id !== 'string' || f.task_id.length === 0) return null;
-  if (typeof f.context_id !== 'string' || f.context_id.length === 0) return null;
-  if (typeof f.department_id !== 'string' || f.department_id.length === 0) return null;
-  if (!Array.isArray(f.messages)) return null;
-  const messages = f.messages.map(narrowWireMessage).filter((m): m is DeptMessage => m !== null);
+  const parsed = DeptOfferMessageSchema.safeParse(frame);
+  if (!parsed.success) return null;
+  const f = parsed.data;
+  const messages = f.messages.map((m) => narrowWireMessage(m)).filter((m): m is DeptMessage => m !== null);
   if (messages.length === 0) return null;
   return {
     executionId: f.execution_id,
@@ -528,10 +584,9 @@ function narrowOfferFrame(frame: WireFrame): DepartmentOfferInput | null {
     contextId: f.context_id,
     departmentId: f.department_id,
     messages,
-    ...(Array.isArray(f.accepted_output_modes)
-      ? { acceptedOutputModes: f.accepted_output_modes.filter((m): m is string => typeof m === 'string') }
-      : {}),
-    ...(typeof f.deadline_at === 'string' ? { deadlineAt: f.deadline_at } : {}),
+    acceptedOutputModes: f.accepted_output_modes,
+    deadlineAt: f.deadline_at,
+    eventSeqBase: f.event_seq_base,
   };
 }
 
@@ -541,4 +596,47 @@ function buildDepartmentAcceptFrame(offer: DepartmentOfferInput): WireFrame {
 
 function buildDepartmentRejectFrame(executionId: string, reason: DepartmentRejectReason): WireFrame {
   return { type: 'department.reject', execution_id: executionId, reason };
+}
+
+/** Map a runner-LOCAL `RuntimeEvent` (`./adapter.ts`, camelCase) onto the
+ *  wire's `DeptRuntimeEvent` (snake_case where it differs — `question_id`,
+ *  `retry_safe`). Never called for `type: 'artifact'` (see
+ *  `shipDepartmentEvent`'s doc) — that variant has no wire counterpart here. */
+function toWireRuntimeEvent(event: Exclude<RuntimeEvent, { type: 'artifact' }>): DeptRuntimeEvent {
+  switch (event.type) {
+    case 'status':
+      return { type: 'status', state: event.state, ...(event.message !== undefined ? { message: event.message } : {}) };
+    case 'message':
+      return { type: 'message', parts: event.parts.map(toWirePart) };
+    case 'input_required':
+      return {
+        type: 'input_required',
+        question_id: event.questionId,
+        question: {
+          text: event.question.text,
+          ...(event.question.context != null ? { context: event.question.context } : {}),
+          ...(event.question.options != null ? { options: event.question.options } : {}),
+        },
+      };
+    case 'progress':
+      return { type: 'progress', note: event.note };
+    case 'completed':
+      return { type: 'completed', ...(event.summary !== undefined ? { summary: event.summary } : {}) };
+    case 'failed':
+      return { type: 'failed', reason: event.reason, retry_safe: event.retrySafe };
+  }
+}
+
+function buildDepartmentEventFrame(
+  state: { executionId: string; taskId: string },
+  event: Exclude<RuntimeEvent, { type: 'artifact' }>,
+  seq: number,
+): DeptEventMessage {
+  return {
+    type: 'department.event',
+    execution_id: state.executionId,
+    task_id: state.taskId,
+    seq,
+    event: toWireRuntimeEvent(event),
+  };
 }
