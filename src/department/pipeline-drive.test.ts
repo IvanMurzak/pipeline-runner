@@ -16,11 +16,12 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { DRIVE_COMPLETED, DRIVE_HALTED, FakeJobExec, driveAwaiting } from '../jobs/_helpers';
+import { CaptureLogger } from '../../tests/_helpers';
+import { DRIVE_COMPLETED, DRIVE_HALTED, DRIVE_PROVIDER_LIMIT, FakeJobExec, driveAwaiting } from '../jobs/_helpers';
 import type { JobExec, JobExecResult } from '../jobs/types';
-import type { InvocationEnvelope, PipelineDriveSpec, RuntimeEvent } from './adapter';
+import type { DeptMessage, InvocationEnvelope, PipelineDriveSpec, RuntimeEvent } from './adapter';
 import { RuntimeAdapterError } from './adapter';
-import { makeTaskSpec } from './_test-helpers';
+import { makeMessage, makeTaskSpec } from './_test-helpers';
 import { PIPELINE_DRIVE_CAPABILITIES, PipelineDriveAdapter, narrowPipelineDriveSpec } from './pipeline-drive';
 
 function makeDriveSpec(overrides: Partial<PipelineDriveSpec> = {}): PipelineDriveSpec {
@@ -31,7 +32,9 @@ function makeDriveSpec(overrides: Partial<PipelineDriveSpec> = {}): PipelineDriv
   };
 }
 
-function makeInvocation(overrides: { pipelineDrive?: Partial<PipelineDriveSpec> | null; taskId?: string } = {}): InvocationEnvelope {
+function makeInvocation(
+  overrides: { pipelineDrive?: Partial<PipelineDriveSpec> | null; taskId?: string; messages?: DeptMessage[] } = {}
+): InvocationEnvelope {
   const pipelineDrive =
     overrides.pipelineDrive === null ? undefined : makeDriveSpec(overrides.pipelineDrive);
   return {
@@ -41,7 +44,11 @@ function makeInvocation(overrides: { pipelineDrive?: Partial<PipelineDriveSpec> 
       cwd: '/ws',
       ...(pipelineDrive !== undefined ? { pipelineDrive } : {}),
     },
-    task: makeTaskSpec({ taskId: overrides.taskId ?? 'dtask-1', contextId: 'dctx-1' }),
+    task: makeTaskSpec({
+      taskId: overrides.taskId ?? 'dtask-1',
+      contextId: 'dctx-1',
+      ...(overrides.messages !== undefined ? { messages: overrides.messages } : {}),
+    }),
   };
 }
 
@@ -177,6 +184,203 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
   });
 });
 
+describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on-answer contract)', () => {
+  test('park → answer → resumes with --resume/--answer at the parked iteration, and does NOT restart from startIteration', async () => {
+    let call = 0;
+    const exec = new FakeJobExec(() => {
+      call += 1;
+      return call === 1 ? driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-1') : DRIVE_COMPLETED;
+    });
+    const adapter = new PipelineDriveAdapter({ exec });
+
+    // First admission: a fresh start.
+    const events1: RuntimeEvent[] = [];
+    await adapter.start(makeInvocation({ taskId: 'dtask-park-1' }), (e) => events1.push(e));
+    await flush();
+    expect(events1).toEqual([
+      { type: 'input_required', questionId: 'q-1', question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] } },
+    ]);
+    expect(exec.calls[0]!.args).toContain('steps/01-plan.md');
+
+    // DepartmentManager's respawn (./manager.ts's spawnAndStart): the SAME
+    // taskId, task.messages now the FULL retained history with the answer
+    // appended last — exactly what deliverMessage produces.
+    const answerMessage = makeMessage({ messageId: 'answer-1', parts: [{ text: 'host-a' }] });
+    const events2: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-1', messages: [makeMessage(), answerMessage] }),
+      (e) => events2.push(e)
+    );
+    await flush();
+
+    expect(exec.calls).toHaveLength(2);
+    expect(exec.calls[1]!.args).toEqual([
+      'drive',
+      '--root',
+      '/ws/.claude/pipeline/release',
+      '--run-id',
+      'dtask-park-1',
+      '--resume',
+      '--start',
+      'steps/02-deploy.md',
+      '--answer',
+      'host-a',
+      '--json',
+    ]);
+    expect(exec.calls[1]!.args).not.toContain('steps/01-plan.md');
+    expect(events2).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+
+  test('a SECOND park mid-resume overwrites the remembered iteration for the NEXT answer', async () => {
+    let call = 0;
+    const exec = new FakeJobExec(() => {
+      call += 1;
+      if (call === 1) return driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-1');
+      if (call === 2) return driveAwaiting('steps/03-verify.md', 'Which region?', 'q-2');
+      return DRIVE_COMPLETED;
+    });
+    const adapter = new PipelineDriveAdapter({ exec });
+
+    await adapter.start(makeInvocation({ taskId: 'dtask-park-2' }), () => {});
+    await flush();
+
+    const answer1 = makeMessage({ messageId: 'answer-1', parts: [{ text: 'host-a' }] });
+    const events2: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-2', messages: [makeMessage(), answer1] }),
+      (e) => events2.push(e)
+    );
+    await flush();
+    expect(events2).toEqual([
+      { type: 'input_required', questionId: 'q-2', question: { text: 'Which region?', context: 'ctx', options: ['a', 'b'] } },
+    ]);
+    expect(exec.calls[1]!.args).toContain('steps/02-deploy.md'); // resumed at the FIRST park
+
+    const answer2 = makeMessage({ messageId: 'answer-2', parts: [{ text: 'eu-west' }] });
+    const events3: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-2', messages: [makeMessage(), answer1, answer2] }),
+      (e) => events3.push(e)
+    );
+    await flush();
+    expect(exec.calls[2]!.args).toContain('steps/03-verify.md'); // the SECOND park's iteration, not the first
+    expect(exec.calls[2]!.args).toContain('eu-west');
+    expect(events3).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+
+  test('a respawn whose replayed history has no usable answer text fails cleanly instead of resuming with a blank --answer', async () => {
+    let call = 0;
+    const exec = new FakeJobExec(() => {
+      call += 1;
+      return call === 1 ? driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-1') : DRIVE_COMPLETED;
+    });
+    const adapter = new PipelineDriveAdapter({ exec });
+
+    await adapter.start(makeInvocation({ taskId: 'dtask-park-3' }), () => {});
+    await flush();
+
+    const textlessAnswer: DeptMessage = { messageId: 'answer-1', role: 'ROLE_USER', parts: [{ mediaType: 'text/plain' }] };
+    const events2: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-3', messages: [makeMessage(), textlessAnswer] }),
+      (e) => events2.push(e)
+    );
+    await flush();
+
+    expect(exec.calls).toHaveLength(1); // no second exec was even attempted
+    expect(events2).toEqual([
+      {
+        type: 'failed',
+        reason: 'pipeline-drive: task was parked awaiting an answer, but the replayed message history carries no usable answer text',
+        retrySafe: false,
+      },
+    ]);
+  });
+
+  test('a provider limit hit while resuming an answer preserves the parked state (adapter-level bookkeeping; DepartmentManager does not auto-retry per-task lifecycle today)', async () => {
+    let call = 0;
+    const exec = new FakeJobExec(() => {
+      call += 1;
+      if (call === 1) return driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-1');
+      if (call === 2) return DRIVE_PROVIDER_LIMIT;
+      return DRIVE_COMPLETED;
+    });
+    const adapter = new PipelineDriveAdapter({ exec });
+
+    await adapter.start(makeInvocation({ taskId: 'dtask-park-4' }), () => {});
+    await flush();
+
+    const answerMessage = makeMessage({ messageId: 'answer-1', parts: [{ text: 'host-a' }] });
+    const events2: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-4', messages: [makeMessage(), answerMessage] }),
+      (e) => events2.push(e)
+    );
+    await flush();
+    expect(events2).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
+    expect(exec.calls[1]!.args).toContain('--answer');
+
+    // A later start() for the SAME taskId (whatever triggers it) still
+    // resumes from the SAME parked iteration — never restarted from scratch.
+    const events3: RuntimeEvent[] = [];
+    await adapter.start(
+      makeInvocation({ taskId: 'dtask-park-4', messages: [makeMessage(), answerMessage] }),
+      (e) => events3.push(e)
+    );
+    await flush();
+    expect(exec.calls[2]!.args).toContain('steps/02-deploy.md');
+    expect(exec.calls[2]!.args).not.toContain('steps/01-plan.md');
+    expect(events3).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+});
+
+describe('PipelineDriveAdapter — provider limits (06.7, precedence over exit-code classification)', () => {
+  test('a fresh-start provider limit reports failed with retrySafe:true, not a hard classified failure', async () => {
+    const exec = new FakeJobExec(() => DRIVE_PROVIDER_LIMIT);
+    const adapter = new PipelineDriveAdapter({ exec });
+    const events: RuntimeEvent[] = [];
+    await adapter.start(makeInvocation(), (e) => events.push(e));
+    await flush();
+    expect(events).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
+  });
+
+  test('a custom detectProviderLimit is honored', async () => {
+    const exec = new FakeJobExec(() => ({ code: 1, stdout: '', stderr: 'custom throttle' }));
+    const adapter = new PipelineDriveAdapter({ exec, detectProviderLimit: () => ({ reason: 'custom throttle hit' }) });
+    const events: RuntimeEvent[] = [];
+    await adapter.start(makeInvocation(), (e) => events.push(e));
+    await flush();
+    expect(events).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: custom throttle hit', retrySafe: true }]);
+  });
+
+  test('a completed run is never limit-paused even if the detector would otherwise fire on stray text', async () => {
+    const exec = new FakeJobExec(() => ({ code: 0, stdout: JSON.stringify({ status: 'completed' }), stderr: 'discussed a rate limit' }));
+    const adapter = new PipelineDriveAdapter({ exec });
+    const events: RuntimeEvent[] = [];
+    await adapter.start(makeInvocation(), (e) => events.push(e));
+    await flush();
+    expect(events).toEqual([{ type: 'completed', summary: 'completed' }]);
+  });
+});
+
+describe('PipelineDriveAdapter — fire-and-forget safety (unhandled rejection guard)', () => {
+  test('a throwing sink is caught and logged instead of producing an unhandled rejection', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const logger = new CaptureLogger();
+    const adapter = new PipelineDriveAdapter({ exec, logger });
+    let sinkCalls = 0;
+    await adapter.start(makeInvocation(), () => {
+      sinkCalls += 1;
+      throw new Error('sink boom');
+    });
+    await flush();
+    expect(sinkCalls).toBe(1);
+    expect(
+      logger.lines.some((l) => l.includes('warn:') && l.includes('runOnce failed unexpectedly') && l.includes('sink boom'))
+    ).toBe(true);
+  });
+});
+
 describe('PipelineDriveAdapter — declared capabilities (07 §2.1, fixed)', () => {
   test('the minted handle always declares midTaskInput:false, artifacts:false', async () => {
     const exec = new FakeJobExec(() => DRIVE_COMPLETED);
@@ -270,6 +474,25 @@ describe('PipelineDriveAdapter — cancel() / dispose() (07 §7)', () => {
     const handle = await adapter.start(makeInvocation(), (e) => events.push(e));
 
     await adapter.dispose(handle);
+    resolveExec!(DRIVE_COMPLETED);
+    await flush();
+
+    expect(events).toEqual([]);
+  });
+
+  test('cancel() ALONE (no dispose() call following) also suppresses a late result — its own doc comment promises this', async () => {
+    let resolveExec: (result: JobExecResult) => void;
+    const exec = new FakeJobExec(
+      () =>
+        new Promise<JobExecResult>((resolve) => {
+          resolveExec = resolve;
+        })
+    );
+    const adapter = new PipelineDriveAdapter({ exec });
+    const events: RuntimeEvent[] = [];
+    const handle = await adapter.start(makeInvocation(), (e) => events.push(e));
+
+    await adapter.cancel(handle, 'canceled'); // deliberately no dispose() afterwards
     resolveExec!(DRIVE_COMPLETED);
     await flush();
 

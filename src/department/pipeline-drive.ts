@@ -52,14 +52,37 @@
  * `resume` / `answer`, `DriveMode`) chained by the CALLER (`executor.ts`'s
  * `driveLoop`) across possibly many exec calls before a task-level terminal
  * state is reached. THIS adapter's `start()` performs exactly ONE such exec
- * (mode `start`) and reports the ONE resulting `RuntimeEvent` —
- * `completed`, `failed`, or `input_required` — derived verbatim from
- * `classifyDriveOutcome`. It does NOT loop/retry/pause internally (provider-
- * limit policy is supervisor policy, not the adapter's, per 07 §2's own
- * module doc) and it does NOT resume a parked question on a later `send()`
- * (impossible without `acceptsMidTaskInput`, by design, above) — a caller
- * that wants the FULL multi-step drive loop (pause/resume/answer) is exactly
- * what `JobExecutor.driveLoop` already is, untouched by this file.
+ * and reports the ONE resulting `RuntimeEvent` — `completed`, `failed`, or
+ * `input_required` — derived from `classifyDriveOutcome`. It does NOT
+ * loop/retry/pause internally on a PLAIN failure (provider-limit handling is
+ * the one exception, below) — a caller that wants the FULL multi-step drive
+ * loop is exactly what `JobExecutor.driveLoop` already is, untouched by this
+ * file.
+ *
+ * ── Resuming a parked question (07 §5, `DepartmentManager`'s respawn-on-
+ *    answer contract) ────────────────────────────────────────────────────────
+ * `acceptsMidTaskInput:false` means `send()` never delivers an answer to a
+ * LIVE process (there is none to deliver to — drive already exited). Instead,
+ * per `./adapter.ts`'s own documented contract and `./manager.ts`'s
+ * `deliverMessage`/`spawnAndStart`, an answer arrives as a BRAND NEW
+ * `start()` call whose `task.messages` is the FULL retained history —
+ * original message(s) plus the answer, appended last. This adapter honors
+ * that contract for real: it remembers the drive-minted `iteration_path` /
+ * `session_id` from its own `input_required` event (an internal
+ * `taskId`-keyed map — nothing about this rides the wire; `RuntimeEvent`'s
+ * `input_required` shape carries no room for it and is not changed here), and
+ * on the NEXT `start()` for the SAME `taskId`, builds `DriveMode`'s existing
+ * `answer` variant (`--resume --start <iteration_path> --answer <text>`)
+ * instead of restarting from `pipelineDrive.startIteration` — using the
+ * SAME, unmodified `buildDriveArgs` the fresh-start path uses, just a
+ * different (already-existing) mode literal. The answer TEXT is read off the
+ * last message in the replayed history (the mesh always appends it there,
+ * `./manager.ts`'s `deliverMessage`); a park whose next `start()` carries no
+ * usable text fails the task rather than silently resending nothing.
+ * `iteration_path` is deliberately NOT consumed by `buildDriveArgs`'s
+ * `resume`/`answer` modes beyond `--start`'s value — `session_id`/`step_id`
+ * are retained too (parity with `JobExecutor`'s own `ParkedQuestion`/
+ * `RecordedQuestion`) even though drive's argv never reads them back.
  *
  * `start()` itself resolves as soon as the handle is minted — there is no
  * "ready" signal to wait for (unlike `jsonl-process`'s handshake), and the
@@ -69,7 +92,32 @@
  * exactly mirroring how `jsonl-process` streams events AFTER `start()`
  * resolves, just with a single terminal-shaped event instead of a live
  * stream (drive has nothing incremental to report, 07 §1's own table: "stdout
- * buffered until close").
+ * buffered until close"). The background exec is awaited with a `.catch()`
+ * at the fire-and-forget call site — `sink()` runs synchronously inside
+ * `DepartmentManager.handleRuntimeEvent` (journal `fs.appendFileSync`, a
+ * wire `send()`) and a throw there would otherwise become an unhandled
+ * rejection that crashes the whole daemon (verified empirically on Bun
+ * 1.3.14), taking every in-flight execution down with it — not merely this
+ * one task.
+ *
+ * ── Provider limits (06.7, `../jobs/drive.ts`'s module doc: "provider limit
+ *    takes precedence over exit-code classification") ──────────────────────
+ * `JobExecutor.driveLoop` runs `detectProviderLimit(result)` BEFORE
+ * `classifyDriveOutcome` and PAUSES (auto-resume) rather than failing on a
+ * hit. This adapter runs the SAME detector (`defaultProviderLimitDetector`,
+ * injectable, unmodified) with the SAME precedence, but — unlike
+ * `driveLoop` — does NOT implement a pause/backoff timer or auto-resume loop
+ * itself: that ladder is genuinely supervisor policy (07 §2), and
+ * `DepartmentManager` has no equivalent mechanism today for a `per-task`
+ * lifecycle (its ONE auto-respawn path is gated to `per-context`,
+ * `./manager.ts`'s `handleRuntimeEvent`). Flattening a detected limit to an
+ * ordinary `retrySafe:false` failure would silently lose exactly the
+ * distinction this task exists to preserve; instead it is surfaced honestly
+ * as `{type:'failed', retrySafe:true}` — a truthful signal a supervisor CAN
+ * act on, even though none does yet for this lifecycle. A parked question's
+ * remembered `iteration_path`/`session_id` (above) is left untouched when a
+ * limit is hit while resuming an answer, so a future retry can still resume
+ * from the right place.
  *
  * ── Cancellation (07 §7) ─────────────────────────────────────────────────────
  * There is no wire channel to ask politely (buffered `JobExec`, no stdin) —
@@ -78,18 +126,45 @@
  * already use for the SAME `pipeline drive` child (`nodeJobExec()`'s abort
  * handling: `child.kill()`, a plain SIGTERM to the direct child — no
  * process-group escalation, because the buffered seam offers none). `cancel()`
- * and `dispose()` both abort; this is IDENTICAL in strength to what pipeline
- * dispatch already had before this task — no credential path, no kill
- * semantics, changed (10-security.md §7 P5 gate).
+ * and `dispose()` both abort and both mark the handle disposed (suppressing
+ * any late/stale result either could otherwise still report) — this is
+ * IDENTICAL in strength to what pipeline dispatch already had before this
+ * task; no credential path, no kill semantics, changed (10-security.md §7 P5
+ * gate).
+ *
+ * **Known, deliberately NOT fixed gap (follow-up, not this task):**
+ * `cancel()`/`dispose()` only ever reach `nodeJobExec()`'s plain
+ * `child.kill()` — SIGTERM to the direct child, no process-GROUP kill, no
+ * SIGKILL escalation — unlike `jsonl-process`/`container`, which both use
+ * `ProcessHandle.killGroup()` (task d2) via the STREAMING `nodeJobSpawn()`
+ * seam. Giving `pipeline-drive` the same strength would mean either (a)
+ * adding `detached:true`/group-kill semantics to the SHARED `nodeJobExec()`
+ * seam — which every pipeline-dispatch invocation (git, `pipeline drive`,
+ * `pipeline hash`, `pipeline plan`, `pipeline match`) also runs through,
+ * risking the exact "no behaviour change for pipeline runs" guarantee this
+ * task is graded on — or (b) giving this adapter its own parallel spawn path
+ * that bypasses the shared `JobExec` seam entirely, which would reintroduce
+ * the asymmetry between the two dispatch paths this task exists to remove.
+ * Left as-is; a real fix belongs to a task scoped to touch `nodeJobExec()`
+ * deliberately, with pipeline-dispatch regression coverage as its own gate.
  */
 
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
-import { buildDriveArgs, classifyDriveOutcome, type DriveMode, type DriveTarget } from '../jobs/drive';
+import {
+  buildDriveArgs,
+  classifyDriveOutcome,
+  defaultProviderLimitDetector,
+  type DriveMode,
+  type DriveOutcome,
+  type DriveTarget,
+  type ProviderLimitDetector,
+} from '../jobs/drive';
 import type { JobExec, JobExecResult } from '../jobs/types';
 import { nodeJobExec } from '../jobs/types';
 import type {
   AgentRuntimeAdapter,
+  DeptMessage,
   DeptTaskSpec,
   InvocationEnvelope,
   PipelineDriveSpec,
@@ -116,6 +191,44 @@ export interface PipelineDriveAdapterOptions {
    *  `JobExecutor`'s own fallback-minting (`../jobs/executor.ts`'s
    *  `this.makeId()` in `driveLoop`'s `awaiting_input` branch). */
   makeId?(): string;
+  /** Same seam `JobExecutor` injects (`../jobs/executor.ts`'s
+   *  `detectProviderLimit`), defaulting to the SAME `defaultProviderLimitDetector`
+   *  (`../jobs/drive.ts`, unmodified) — see this module's doc's "Provider
+   *  limits" section. */
+  detectProviderLimit?: ProviderLimitDetector;
+}
+
+// ── Parked-question resume state (07 §5's respawn-on-answer contract) ───────
+// Keyed by `taskId`, which is stable across the whole execution (never
+// changes across a park/answer respawn, `./manager.ts`'s `spawnAndStart`) —
+// NOT by handle identity, since `DepartmentManager` disposes the handle that
+// reported `input_required` and mints a fresh one on the next `start()`.
+
+interface ParkedDriveState {
+  /** `DriveParked.iteration_path` (`../jobs/drive.ts`) — the ONLY field
+   *  `buildDriveArgs`'s `answer` mode actually reads back (as `--start`'s
+   *  value on the resume invocation). */
+  iterationPath: string;
+  /** Retained for parity with `JobExecutor`'s own `ParkedQuestion`/
+   *  `RecordedQuestion` (`../jobs/executor.ts`) — not consumed by
+   *  `buildDriveArgs`, which has no `--session-id`/`--step-id` flag. */
+  sessionId: string | null;
+  stepId: string | null;
+}
+
+/** The answer text for a resume: the LAST message's first text part. Reads
+ *  ONLY the last entry (never scans further back) — `DepartmentManager`
+ *  always appends the answer last (`./manager.ts`'s `deliverMessage`), and
+ *  falling back to earlier history on a textless last message would risk
+ *  silently replaying STALE content as if it were a live answer. Null ⇒ the
+ *  caller fails the task rather than resuming with no `--answer` value. */
+function extractAnswerText(messages: readonly DeptMessage[]): string | null {
+  const last = messages[messages.length - 1];
+  if (last === undefined) return null;
+  for (const part of last.parts) {
+    if (typeof part.text === 'string' && part.text.length > 0) return part.text;
+  }
+  return null;
 }
 
 // ── The handle ────────────────────────────────────────────────────────────
@@ -150,11 +263,16 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
   private readonly exec: JobExec;
   private readonly logger: Logger;
   private readonly makeId: () => string;
+  private readonly detectLimit: ProviderLimitDetector;
+  /** Parked-resume state, keyed by `taskId` — see the module doc's "Resuming
+   *  a parked question" section and `ParkedDriveState`'s own doc. */
+  private readonly parked = new Map<string, ParkedDriveState>();
 
   constructor(options: PipelineDriveAdapterOptions = {}) {
     this.exec = options.exec ?? nodeJobExec();
     this.logger = options.logger ?? nullLogger;
     this.makeId = options.makeId ?? (() => crypto.randomUUID());
+    this.detectLimit = options.detectProviderLimit ?? defaultProviderLimitDetector;
   }
 
   /**
@@ -201,8 +319,17 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     // Fire-and-forget: the ONE drive exec races in the background; its
     // outcome reaches `sink` once `pipeline drive` exits (see this module's
     // doc — there is no earlier signal the buffered `JobExec` seam could
-    // offer, unlike jsonl-process's `ready`).
-    void this.runOnce(runtime, drive, task, sink, handle);
+    // offer, unlike jsonl-process's `ready`). The `.catch()` here is NOT
+    // decorative: `sink()` runs synchronously inside `DepartmentManager.
+    // handleRuntimeEvent` (journal write, wire `send()`) and an uncaught
+    // throw from EITHER of those would otherwise surface as an unhandled
+    // promise rejection — which crashes the whole runner daemon, not just
+    // this task (see the module doc).
+    void this.runOnce(runtime, drive, task, sink, handle).catch((err: unknown) => {
+      this.logger.warn(
+        `pipeline-drive[${task.taskId}]: runOnce failed unexpectedly (${err instanceof Error ? err.message : String(err)})`
+      );
+    });
     return handle;
   }
 
@@ -224,6 +351,22 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     // the only lever, identical in strength to what pipeline dispatch already
     // had (`JobExecutor`'s own cancel/suspend use the same signal-based
     // abort against the same `nodeJobExec()` seam). See this module's doc.
+    //
+    // `disposed` is set HERE too, not only in `dispose()` (its own doc
+    // comment already promised "set by cancel()/dispose()") — `manager.ts`'s
+    // `terminateExecution` calls `cancel()` then immediately finalizes
+    // WITHOUT waiting for anything from this adapter's `sink`; a still-
+    // in-flight exec's eventual result must never be reported once the
+    // supervisor has already moved on. `dispose()` (called right after, in
+    // every real caller) then no-ops on its own `disposed` guard — harmless,
+    // `AbortController.abort()` is idempotent regardless.
+    handle.disposed = true;
+    // Real termination — no future respawn will ever consume this park.
+    // (The OTHER caller of `dispose()`, evicting a handle right after
+    // `input_required` so the mesh can respawn with the answer, never calls
+    // `cancel()` first — see the module doc — so this never fires for that
+    // case.)
+    this.parked.delete(handle.taskId);
     handle.controller.abort();
   }
 
@@ -241,6 +384,35 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     sink: RuntimeEventSink,
     handle: PipelineDriveHandle
   ): Promise<void> {
+    // Resuming a parked question (07 §5, module doc's "Resuming a parked
+    // question"): a PEEK, not a consume — only actually removed from the map
+    // once we know the outcome (below), so a provider limit hit while
+    // resuming leaves the parked state intact for a future retry.
+    const parkedState = this.parked.get(task.taskId);
+
+    let mode: DriveMode;
+    if (parkedState !== undefined) {
+      const answer = extractAnswerText(task.messages);
+      if (answer === null) {
+        // Terminal either way (a 'failed' event is about to be reported, or
+        // the handle is already disposed) — no future respawn will consume
+        // this park for this taskId, so clean it up rather than leak it.
+        this.parked.delete(task.taskId);
+        if (!handle.disposed) {
+          sink({
+            type: 'failed',
+            reason:
+              'pipeline-drive: task was parked awaiting an answer, but the replayed message history carries no usable answer text',
+            retrySafe: false,
+          });
+        }
+        return;
+      }
+      mode = { kind: 'answer', startIteration: parkedState.iterationPath, answer };
+    } else {
+      mode = { kind: 'start', startIteration: drive.startIteration };
+    }
+
     const target: DriveTarget = {
       pipelineRoot: drive.pipelineRoot,
       runId: task.taskId,
@@ -248,9 +420,9 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
       ...(drive.defaultEffort !== undefined ? { defaultEffort: drive.defaultEffort } : {}),
       ...(drive.variables !== undefined ? { variables: drive.variables } : {}),
     };
-    const mode: DriveMode = { kind: 'start', startIteration: drive.startIteration };
-    // The SAME, unchanged argv builder pipeline-dispatch uses — this IS the
-    // "one abstraction serves both dispatch paths" proof (P5 DoD).
+    // The SAME, unchanged argv builder pipeline-dispatch uses, with a mode
+    // `buildDriveArgs` already supports — this IS the "one abstraction
+    // serves both dispatch paths" proof (P5 DoD).
     const args = buildDriveArgs(target, mode);
 
     let result: JobExecResult;
@@ -277,13 +449,41 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
     // Torn down via cancel()/dispose() while the exec was in flight — the
     // outcome (however classified) is moot; the supervisor already finalized
     // this execution through a different path (mirrors jsonl-process's "an
-    // exit during dispose() is not reported as a failure").
+    // exit during dispose() is not reported as a failure"). `this.parked` is
+    // left exactly as `cancel()` already set it (cleared) or untouched
+    // (a plain `dispose()`-only eviction, which never fires mid-exec).
     if (handle.disposed) {
       this.logger.debug(`pipeline-drive[${task.taskId}]: exec settled after dispose — outcome dropped`);
       return;
     }
 
-    sink(this.toRuntimeEvent(result));
+    // Provider limit takes precedence over exit-code classification (06.7,
+    // `../jobs/drive.ts`'s module doc — the SAME rule `JobExecutor.driveLoop`
+    // applies) — see the module doc's "Provider limits" section for why this
+    // adapter surfaces it as `retrySafe:true` rather than pausing/retrying
+    // itself. `this.parked` is deliberately left UNTOUCHED here: if this
+    // invocation was itself an answer-resume, the iteration/answer target
+    // must survive for a future retry to use.
+    const limit = this.detectLimit(result);
+    if (limit !== null) {
+      sink({ type: 'failed', reason: `pipeline drive provider limit: ${limit.reason}`, retrySafe: true });
+      return;
+    }
+
+    const outcome = classifyDriveOutcome(result);
+    if (outcome.kind === 'awaiting_input') {
+      this.parked.set(task.taskId, {
+        iterationPath: outcome.parked.iteration_path,
+        sessionId: outcome.parked.session_id,
+        stepId: outcome.parked.step_id,
+      });
+    } else {
+      // completed / halted / failed — no future respawn will consume a park
+      // for this taskId again (a fresh admission always mints a NEW taskId).
+      this.parked.delete(task.taskId);
+    }
+
+    sink(this.toRuntimeEvent(outcome));
   }
 
   /** `classifyDriveOutcome` (`../jobs/drive.ts`, UNCHANGED) has four kinds;
@@ -291,13 +491,23 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
    *  the SAME `RuntimeEvent` shape — exactly mirroring `JobExecutor.driveLoop`'s
    *  own switch, where the `'halted'` and `'failed'` cases already do the
    *  identical thing (`reportTerminal('halted', …)` then `this.fail(…)`). */
-  private toRuntimeEvent(result: JobExecResult): RuntimeEvent {
-    const outcome = classifyDriveOutcome(result);
+  private toRuntimeEvent(outcome: DriveOutcome): RuntimeEvent {
     switch (outcome.kind) {
       case 'completed':
         return { type: 'completed', summary: outcome.outcome };
       case 'halted':
         return { type: 'failed', reason: outcome.reason, retrySafe: false };
+      // `classifyDriveOutcome`'s 'failed' kind covers a usage error (exit 2),
+      // an unrecognized exit code, AND a spawn-level failure (`code===null`
+      // — binary missing, EPERM, …). Deliberately `retrySafe:false` across
+      // the board: unlike `jsonl-process`'s synthetic "process died
+      // mid-stream" failure (a qualitatively different case — real work was
+      // interrupted, and per-context crash-recovery can pick it back up),
+      // none of THESE causes are something a blind retry fixes, and
+      // `retrySafe` has no live consumer for this adapter's `per-task`-only
+      // lifecycle today anyway (`./manager.ts`'s one auto-respawn path is
+      // gated to `per-context`) — false is the safer default until a real
+      // consumer exists to prove a finer distinction is worth it.
       case 'failed':
         return { type: 'failed', reason: outcome.reason, retrySafe: false };
       case 'awaiting_input': {
