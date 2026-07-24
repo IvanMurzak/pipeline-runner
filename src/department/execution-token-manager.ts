@@ -143,11 +143,24 @@ export class ExecutionTokenManager implements ExecutionTokenSource {
       logger: this.logger,
     })
       .then((result) => {
-        if (result.ok) this.cache.set(executionId, result);
+        // Cache ONLY if this request is still the current in-flight one for
+        // the execution. A `discard()` (lease revoked / execution terminal)
+        // between the request starting and completing removes the in-flight
+        // entry, and MUST win — a token for a gone lease is never cached, the
+        // guarantee `discard()`'s own doc states ("nothing … could ever hand
+        // it out again for a lease that is already gone"). Without this
+        // identity check the late `.then` would re-populate the cache after
+        // discard. A superseding `renew()`/`getToken` installs a DIFFERENT
+        // promise here, so it caches its own fresher result instead.
+        if (result.ok && this.inFlight.get(executionId) === promise) {
+          this.cache.set(executionId, result);
+        }
         return result;
       })
       .finally(() => {
-        this.inFlight.delete(executionId);
+        // Only clear OUR entry — a discard()+new-request sequence may have
+        // replaced it with a different in-flight promise we must not delete.
+        if (this.inFlight.get(executionId) === promise) this.inFlight.delete(executionId);
       });
 
     this.inFlight.set(executionId, promise);

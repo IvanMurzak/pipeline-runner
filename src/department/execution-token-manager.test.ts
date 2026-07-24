@@ -155,6 +155,41 @@ describe('ExecutionTokenManager — discard', () => {
     const { manager } = makeManager();
     expect(() => manager.discard('never-seen')).not.toThrow();
   });
+
+  test('discard() DURING an in-flight request wins — the late response is not cached (lease-gone guarantee)', async () => {
+    // A lease revoked / execution turned terminal WHILE its token request is
+    // still on the wire must not leave a usable token in the cache: discard()
+    // must win the race. Reproduce with a request whose resolution we control.
+    let resolveReq: ((r: ExecutionTokenResult) => void) | null = null;
+    const calls: string[] = [];
+    const requestToken = (opts: { executionId: string }): Promise<ExecutionTokenResult> => {
+      calls.push(opts.executionId);
+      return new Promise<ExecutionTokenResult>((res) => {
+        resolveReq = res;
+      });
+    };
+    const clock = new FakeClock();
+    const manager = new ExecutionTokenManager({
+      baseUrl: () => BASE_URL,
+      clientId: () => 'run_1',
+      clientSecret: () => 'rt_secret',
+      clock,
+      requestToken,
+    });
+
+    const inflight = manager.getToken('exec-1'); // starts the request, not yet resolved
+    manager.discard('exec-1'); // lease revoked mid-flight
+    resolveReq!({ ok: true, token: { accessToken: 'tok-late', tokenType: 'Bearer', expiresAt: 1_000_000, scope: 'mesh:execution' } });
+    await inflight; // the caller still receives its (now-stale) result — that is fine
+
+    // But the cache must be EMPTY: the next getToken issues a brand-new request
+    // (2 total), never returning the discarded token from a stale cache entry.
+    const second = manager.getToken('exec-1');
+    expect(calls).toEqual(['exec-1', 'exec-1']); // hit the network again, not a cache hit
+    resolveReq!({ ok: true, token: { accessToken: 'tok-2', tokenType: 'Bearer', expiresAt: 1_000_000, scope: 'mesh:execution' } });
+    const secondResult = await second;
+    expect(secondResult.ok && secondResult.token.accessToken).toBe('tok-2');
+  });
 });
 
 describe('ExecutionTokenManager — not registered yet', () => {
