@@ -18,20 +18,22 @@ import { nullLogger } from './log';
 export type FrameHandler = (frame: WireFrame) => void;
 
 /** Protocol-defined types this CORE routes but does not handle itself. The
- *  jobs/relay/shipper layers attach the real handlers via `on()` (`lease` +
- *  `cancel` — jobs/manager.ts, c6; `answer` — relay/bridge.ts; `upload_ack` —
- *  shipper/upload-transport.ts; `department.offer` / `department.message` /
- *  `department.cancel` — department/manager.ts, department-mesh task d1); a
+ *  jobs/relay/shipper/department layers attach the real handlers via `on()`
+ *  (`lease` + `cancel` — jobs/manager.ts, c6; `answer` — relay/bridge.ts;
+ *  `upload_ack` — shipper/upload-transport.ts; every `department.*` entry —
+ *  department/manager.ts's `attach()`, department-mesh tasks d1/d2/e2); a
  *  bare core (e.g. the `register` command's validation connection) logs them
  *  at info instead of dropping silently.
  *
- *  The `department.*` types are NOT yet in the published wire protocol
- *  (`@baizor/pipeline-protocol` 0.3.0 — the mesh schemas land at 0.4.0, the
- *  `e1` gate). `WireFrame`'s tolerant passthrough envelope (`./wire.ts`)
- *  accepts any `type` string regardless, so `DepartmentManager.attach()`
- *  routes correctly today; listing them here is purely about the "not
- *  handled yet" vs. "unknown" log level for a bare connection with no
- *  department manager attached. */
+ *  This list is PURELY a log-level classifier, never load-bearing for
+ *  routing: `dispatch()` below checks the registered-handlers map first and
+ *  calls whatever's there regardless of whether the type also appears here —
+ *  a type can be handled perfectly well (as every `department.*` entry now
+ *  is, via `DepartmentManager.attach()`) whether or not it's listed. Listing
+ *  it just keeps a connection with no handler attached yet (or none of this
+ *  type registered, e.g. a bare validation connection) from logging it as
+ *  "unknown" — `@baizor/pipeline-protocol` 0.4.0 (the `e1` gate) already
+ *  carries the real `department.*` schemas, so none of these are exotic. */
 export const RESERVED_UNHANDLED_TYPES = [
   'lease',
   'answer',

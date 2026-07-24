@@ -30,6 +30,19 @@
  * `terminateExecution` finalize-now path on expiry, so neither can wait
  * forever.
  *
+ * ── Live config updates (e2) ─────────────────────────────────────────────────
+ * `department.config_update` (cloud → runner, on install approval and on
+ * reconnect, `08-protocol-delta.md` §4) is handled by `handleConfigUpdateFrame`.
+ * Only `limits.parkExpiry` (a duration string, `../core/duration.ts`) is wired
+ * to anything today — it becomes a per-department `RuntimeConfig` override
+ * (`configOverrides`) merged on top of `options.resolveRuntimeConfig` for
+ * every future admission, AND, the realistic operational case, re-arms any
+ * execution of that department CURRENTLY parked in `input_required` to the
+ * new value immediately, rather than waiting for it to expire on the old one.
+ * `limits.taskTimeout`/`maxArtifactBytes`/`retrySafe` are accepted (schema-
+ * valid) but intentionally not acted on yet — see `handleConfigUpdateFrame`'s
+ * doc.
+ *
  * ── Wire frame shapes (e1 repin) ─────────────────────────────────────────────
  * `@baizor/pipeline-protocol` 0.4.0 carries the real mesh schemas (08-
  * protocol-delta.md) as of the e1 gate. `department.offer` is parsed with
@@ -85,6 +98,7 @@
 import { dirname, join } from 'node:path';
 import * as nodeFs from 'node:fs';
 import {
+  DeptConfigUpdateMessageSchema,
   DeptOfferMessageSchema,
   DeptMessageSchema as WireDeptMessageSchema,
 } from '@baizor/pipeline-protocol';
@@ -97,6 +111,7 @@ import type {
 import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Dispatcher } from '../core/dispatcher';
+import { parseDurationSeconds } from '../core/duration';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import type { WireFrame } from '../core/wire';
@@ -159,8 +174,10 @@ export type AdmitResult = { accepted: true } | { accepted: false; reason: Depart
 export interface DepartmentManagerOptions {
   adapters: AgentRuntimeAdapter[];
   /** Resolve a `department_id` to how to run it. Null ⇒ unknown department
-   *  (`capability` reject) — the config_update caching this reads from is a
-   *  separate concern (c2/config wiring), intentionally not built here. */
+   *  (`capability` reject). This is the STATIC/base config (today:
+   *  `PIPELINE_RUNNER_DEPARTMENTS`, task c2's env placeholder, `./config.ts`)
+   *  — a live `department.config_update` frame (below) layers a per-department
+   *  override on TOP of whatever this returns; it does not replace it. */
   resolveRuntimeConfig(departmentId: string): RuntimeConfig | null;
   send(frame: WireFrame): boolean;
   /** The agent connection's dispatcher — both for `attach()`'s inbound
@@ -235,6 +252,11 @@ interface ExecutionState {
 export class DepartmentManager {
   private readonly adapters = new Map<string, AgentRuntimeAdapter>();
   private readonly executions = new Map<string, ExecutionState>();
+  /** Per-department `RuntimeConfig` overrides applied live via
+   *  `department.config_update` — merged on top of `options.resolveRuntimeConfig`'s
+   *  result at admission time. Today this only ever carries `parkExpirySeconds`
+   *  (see `handleConfigUpdateFrame`'s doc). */
+  private readonly configOverrides = new Map<string, Partial<RuntimeConfig>>();
   private readonly journalRoot: string;
   private readonly journal: JournalWriter;
   private readonly clock: Clock;
@@ -265,11 +287,13 @@ export class DepartmentManager {
     const offMessage = dispatcher.on('department.message', (frame) => void this.handleMessageFrame(frame));
     const offCancel = dispatcher.on('department.cancel', (frame) => void this.handleCancelFrame(frame));
     const offLeaseRevoked = dispatcher.on('department.lease_revoked', (frame) => this.handleLeaseRevokedFrame(frame));
+    const offConfigUpdate = dispatcher.on('department.config_update', (frame) => this.handleConfigUpdateFrame(frame));
     return () => {
       offOffer();
       offMessage();
       offCancel();
       offLeaseRevoked();
+      offConfigUpdate();
     };
   }
 
@@ -326,7 +350,7 @@ export class DepartmentManager {
       return { accepted: true };
     }
 
-    const runtime = this.options.resolveRuntimeConfig(offer.departmentId);
+    const runtime = this.resolveEffectiveRuntimeConfig(offer.departmentId);
     if (runtime === null) return { accepted: false, reason: 'capability' };
     const adapter = this.adapters.get(runtime.adapterId);
     if (adapter === undefined) return { accepted: false, reason: 'capability' };
@@ -425,6 +449,80 @@ export class DepartmentManager {
       void state.adapter.dispose(handle).catch((err) => {
         this.logger.warn(`department execution ${executionId}: dispose() after lease_revoked failed: ${describeError(err)}`);
       });
+    }
+  }
+
+  // ── e2: department.config_update (cloud → runner) ───────────────────────
+  // Cloud sends this on install approval and on reconnect
+  // (`08-protocol-delta.md` §4/§5, `06-department-registry.md`). Only
+  // `limits.parkExpiry` is wired to a runner concept today —
+  // `RuntimeConfig.parkExpirySeconds` (see `./adapter.ts`'s doc for that
+  // field). `limits.taskTimeout` is NOT wired here: wall-clock deadlines
+  // already flow through a different mechanism, the offer's pre-computed
+  // `deadline_at` (`armDeadlineTimer`, above) — a manifest-level
+  // `taskTimeout` would need cloud-side plumbing into that computation, not
+  // a runner-side consumer. `limits.maxArtifactBytes`/`retrySafe` have no
+  // runner-side consumer at all yet (artifact upload is P4 scope, `retrySafe`
+  // is emitted BY the runtime today, `./adapter.ts`'s `RuntimeEvent`, not
+  // configured) — left unwired, same "honest placeholder" discipline as
+  // `cli.ts:69`.
+
+  /** Merge any live `department.config_update` override on top of the
+   *  static/base `resolveRuntimeConfig` result. Used at admission
+   *  (`admitTask`) so every FUTURE offer for a department picks up its
+   *  latest known config; already-admitted executions keep whatever
+   *  `ExecutionState.runtime` they started with, updated in place by
+   *  `handleConfigUpdateFrame` when a config_update actually changes
+   *  something relevant to a live execution (park expiry). */
+  private resolveEffectiveRuntimeConfig(departmentId: string): RuntimeConfig | null {
+    const base = this.options.resolveRuntimeConfig(departmentId);
+    if (base === null) return null;
+    const override = this.configOverrides.get(departmentId);
+    return override === undefined ? base : { ...base, ...override };
+  }
+
+  private handleConfigUpdateFrame(frame: WireFrame): void {
+    const parsed = DeptConfigUpdateMessageSchema.safeParse(frame);
+    if (!parsed.success) {
+      this.logger.warn('malformed department.config_update ignored');
+      return;
+    }
+    const { department_id: departmentId, limits } = parsed.data;
+
+    // "Known" here mirrors admission's own gate: a department this runner
+    // has no base config for can never be admitted anyway, so there is
+    // nothing meaningful to override — ignore rather than cache an override
+    // that would never be read.
+    if (this.options.resolveRuntimeConfig(departmentId) === null) {
+      this.logger.warn(`department.config_update for unknown department '${departmentId}' ignored`);
+      return;
+    }
+
+    if (limits.parkExpiry === undefined) return; // nothing this manager acts on in this frame
+
+    const parkExpirySeconds = parseDurationSeconds(limits.parkExpiry);
+    if (parkExpirySeconds === null) {
+      this.logger.warn(
+        `department.config_update for '${departmentId}': limits.parkExpiry '${limits.parkExpiry}' is not a valid duration — ignored (other fields, if any, still apply)`,
+      );
+      return;
+    }
+
+    const existing = this.configOverrides.get(departmentId) ?? {};
+    this.configOverrides.set(departmentId, { ...existing, parkExpirySeconds });
+
+    // Also apply to every live (non-terminal) execution of this department
+    // NOW — both so a FUTURE park on an already-running execution uses the
+    // new value, and, the realistic operational case, so an execution
+    // ALREADY parked waiting for input is re-armed to it immediately rather
+    // than expiring on the stale one.
+    for (const state of this.executions.values()) {
+      if (state.departmentId !== departmentId || state.terminal) continue;
+      state.runtime = { ...state.runtime, parkExpirySeconds };
+      if (state.parkTimer !== null) {
+        this.armParkTimer(state);
+        this.logger.info(`department execution ${state.executionId}: parked wait re-armed to ${parkExpirySeconds}s (config_update)`);
+      }
     }
   }
 
