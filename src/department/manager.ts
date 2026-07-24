@@ -73,9 +73,24 @@
  * seeded from the offer's `event_seq_base`, 08 §4's attempt-fencing
  * convention), NOT through the shipper/`ingestBatch` path. The local journal
  * file write is KEPT (harmless, useful for on-disk audit) but is no longer
- * wired to a shipper/transport. `department.artifact` (chunked upload) stays
- * OUT of scope here — 08 §6 / P4 (task c9/d3); an `artifact` `RuntimeEvent` is
- * journalled locally and logged, not yet shipped.
+ * wired to a shipper/transport.
+ *
+ * ── Artifact upload (d3, 08 §6 / 09 §3.1) ────────────────────────────────────
+ * `department.artifact` stayed OUT of scope through e1 (journalled locally,
+ * logged, never shipped). This task wires it up: an `artifact` `RuntimeEvent`
+ * is handed to `./artifact-upload.ts#uploadDepartmentArtifact`, which resolves
+ * the bytes (inline, or read from `path`), enforces the per-artifact (1 MiB)
+ * and running per-task (8 MiB) caps RUNNER-FIRST — rejecting explicitly,
+ * before any wire transfer, never truncating — then chunks accepted content
+ * into 256 KiB `department.artifact` frames. `taskArtifactBytesSent` tracks
+ * the running per-task total across this manager's lifetime (keyed by
+ * `taskId`, so it survives a `per-context` respawn's fresh `executionId` but
+ * resets on runner restart — a best-effort local gate; the cloud's own check,
+ * `mesh-artifacts/service.ts`, is the authoritative one). `department.artifact_ack`
+ * (cloud → runner) is handled by `handleArtifactAckFrame`: a rejection is
+ * always logged at `warn` (never silently dropped) and, if the caller wired
+ * `options.onArtifactAck`, handed to it too — "surfaced, not swallowed" is a
+ * DoD line, not a suggestion.
  *
  * ── Lifecycle policy, concretely ────────────────────────────────────────────
  *   - `per-task`: one `adapter.start()` per execution; disposed at terminal.
@@ -101,11 +116,13 @@
 import { dirname, join } from 'node:path';
 import * as nodeFs from 'node:fs';
 import {
+  DeptArtifactAckMessageSchema,
   DeptConfigUpdateMessageSchema,
   DeptOfferMessageSchema,
   DeptMessageSchema as WireDeptMessageSchema,
 } from '@baizor/pipeline-protocol';
 import type {
+  DeptArtifactAckMessage,
   DeptEventMessage,
   DeptMessage as WireDeptMessage,
   DeptPart as WireDeptPart,
@@ -130,6 +147,8 @@ import type {
   RuntimeHandle,
   RuntimeLifecycle,
 } from './adapter';
+import type { ArtifactFileSystem } from './artifact-upload';
+import { uploadDepartmentArtifact } from './artifact-upload';
 import { buildDepartmentJournalEnvelope } from './events';
 import type { ExecutionTokenSource } from './execution-token-manager';
 
@@ -217,6 +236,15 @@ export interface DepartmentManagerOptions {
   logger?: Logger;
   makeId?(): string;
   env?: Record<string, string | undefined>;
+  /** d3: injectable filesystem for `path`-referenced artifact reads. Default
+   *  `nodeArtifactFs()` (real `node:fs`, sync — `./artifact-upload.ts`). */
+  artifactFs?: ArtifactFileSystem;
+  /** d3: called for every `department.artifact_ack` this manager receives
+   *  (both accepted and rejected) — a hook for callers that want to observe
+   *  ack traffic beyond the log line `handleArtifactAckFrame` always emits.
+   *  Never required for "rejection is surfaced" to hold: that is the log
+   *  line, unconditionally; this is additive. */
+  onArtifactAck?(ack: DeptArtifactAckMessage): void;
 }
 
 const DEFAULT_CAPACITY = 4;
@@ -279,6 +307,11 @@ export class DepartmentManager {
    *  result at admission time. Today this only ever carries `parkExpirySeconds`
    *  (see `handleConfigUpdateFrame`'s doc). */
   private readonly configOverrides = new Map<string, Partial<RuntimeConfig>>();
+  /** d3: running total of artifact bytes THIS PROCESS has sent per `taskId`
+   *  (09 §3.1's per-task 8 MiB cap, enforced runner-first) — see the module
+   *  doc's "Artifact upload" section for why this is per-task, not
+   *  per-execution, and why it is best-effort rather than authoritative. */
+  private readonly taskArtifactBytesSent = new Map<string, number>();
   private readonly journalRoot: string;
   private readonly journal: JournalWriter;
   private readonly clock: Clock;
@@ -310,12 +343,14 @@ export class DepartmentManager {
     const offCancel = dispatcher.on('department.cancel', (frame) => void this.handleCancelFrame(frame));
     const offLeaseRevoked = dispatcher.on('department.lease_revoked', (frame) => this.handleLeaseRevokedFrame(frame));
     const offConfigUpdate = dispatcher.on('department.config_update', (frame) => this.handleConfigUpdateFrame(frame));
+    const offArtifactAck = dispatcher.on('department.artifact_ack', (frame) => this.handleArtifactAckFrame(frame));
     return () => {
       offOffer();
       offMessage();
       offCancel();
       offLeaseRevoked();
       offConfigUpdate();
+      offArtifactAck();
     };
   }
 
@@ -563,6 +598,31 @@ export class DepartmentManager {
     }
   }
 
+  // ── d3: department.artifact_ack (cloud → runner) ─────────────────────────
+  // 08 §6 / 09 §3.1: "an explicit department.artifact_ack per artifact —
+  // rejection is always explicit; silent truncation is forbidden." A
+  // malformed frame is logged and dropped, same tolerance every other
+  // handler in this class applies; a well-formed one is ALWAYS logged —
+  // `accepted:true` at info, `accepted:false` at warn with the reason — so a
+  // rejection can never pass through unnoticed. `options.onArtifactAck` is an
+  // additive hook for a caller that wants to react to it (e.g. a future
+  // per-execution artifact-status surface); it is not what makes rejection
+  // "surfaced" — the log line unconditionally is.
+  private handleArtifactAckFrame(frame: WireFrame): void {
+    const parsed = DeptArtifactAckMessageSchema.safeParse(frame);
+    if (!parsed.success) {
+      this.logger.warn('malformed department.artifact_ack ignored');
+      return;
+    }
+    const ack = parsed.data;
+    if (ack.accepted) {
+      this.logger.info(`department.artifact_ack: artifact ${ack.artifact_id} accepted`);
+    } else {
+      this.logger.warn(`department.artifact_ack: artifact ${ack.artifact_id} REJECTED — ${ack.reason ?? 'no reason given'}`);
+    }
+    this.options.onArtifactAck?.(ack);
+  }
+
   /** Deliver mid-task input. Live + capable ⇒ sent immediately. Otherwise
    *  queued and, if there is no live handle at all, a respawn is kicked off
    *  (07 §3's "queues it and delivers at the next task.start"). */
@@ -787,9 +847,10 @@ export class DepartmentManager {
   /**
    * Ship a `RuntimeEvent` to the cloud as a real `department.event` wire
    * frame (e1 fix — see the module doc's "Event delivery" note). `artifact`
-   * events are NOT shipped here — 08 §6 gives artifacts their own dedicated
-   * `department.artifact` chunked-upload frame (P4 / task c9-d3), out of
-   * scope for this manager; they are journalled locally and logged only.
+   * events take a SEPARATE path — 08 §6 gives artifacts their own dedicated
+   * `department.artifact` chunked-upload frames, never the tier-filtered
+   * event-ingest path (07 §8) — routed to `uploadArtifact` (d3) instead of
+   * `buildDepartmentEventFrame`/`options.send` below.
    * Best-effort: `options.send` returning false (runner offline) is logged,
    * not queued/retried — a durable per-execution event outbox is future work
    * (mirrors `gatewayRegistry.sendToRunner`'s own best-effort semantics on
@@ -797,9 +858,7 @@ export class DepartmentManager {
    */
   private shipDepartmentEvent(state: ExecutionState, event: RuntimeEvent): void {
     if (event.type === 'artifact') {
-      this.logger.warn(
-        `department execution ${state.executionId}: artifact "${event.name}" journalled locally only — department.artifact upload is not yet wired (P4 scope)`,
-      );
+      this.uploadArtifact(state, event);
       return;
     }
     const seq = state.nextSeq;
@@ -808,6 +867,44 @@ export class DepartmentManager {
     if (!this.options.send(frame)) {
       this.logger.warn(
         `department execution ${state.executionId}: department.event seq ${seq} (${event.type}) not sent — runner offline`,
+      );
+    }
+  }
+
+  /**
+   * d3 (08 §6 / 09 §3.1): hand one `artifact` `RuntimeEvent` to
+   * `./artifact-upload.ts#uploadDepartmentArtifact`, which enforces every cap
+   * runner-first and chunks accepted content into `department.artifact`
+   * frames. `taskArtifactBytesSent` — this manager's running per-task total —
+   * is only incremented on a `'sent'` outcome, so a rejected artifact never
+   * inflates the budget its own rejection was measured against. A rejection
+   * is already logged by `uploadDepartmentArtifact` itself (with the exact
+   * cap and size that were violated) — nothing further to do here; this
+   * execution's task keeps running exactly as it would for any other
+   * best-effort-shipped event.
+   */
+  private uploadArtifact(state: ExecutionState, event: Extract<RuntimeEvent, { type: 'artifact' }>): void {
+    const bytesAlreadySentForTask = this.taskArtifactBytesSent.get(state.taskId) ?? 0;
+    const outcome = uploadDepartmentArtifact(
+      {
+        executionId: state.executionId,
+        taskId: state.taskId,
+        name: event.name,
+        mediaType: event.mediaType,
+        ...(event.bytes !== undefined ? { bytes: event.bytes } : {}),
+        ...(event.path !== undefined ? { path: event.path } : {}),
+      },
+      {
+        send: this.options.send,
+        bytesAlreadySentForTask,
+        ...(this.options.artifactFs !== undefined ? { fs: this.options.artifactFs } : {}),
+        logger: this.logger,
+      },
+    );
+    if (outcome.status === 'sent') {
+      this.taskArtifactBytesSent.set(state.taskId, bytesAlreadySentForTask + outcome.size);
+      this.logger.info(
+        `department execution ${state.executionId}: artifact "${event.name}" uploaded (${outcome.size}B, ${outcome.chunkTotal} chunk(s), checksum ${outcome.checksum})`,
       );
     }
   }
