@@ -90,6 +90,10 @@ export interface RuntimeConfig {
    *  `./manager.ts`'s `DEFAULT_PARK_EXPIRY_S` (7 days). */
   parkExpirySeconds?: number;
   lifecycle?: RuntimeLifecycle;
+  /** `container` adapter only (task d8, see the section above) — read-only-
+   *  root/explicit-mounts/egress-allowlist spec. Every other adapter ignores
+   *  this field entirely. */
+  container?: ContainerSpec;
 }
 
 export interface ProbeResult {
@@ -99,6 +103,82 @@ export interface ProbeResult {
   capabilities?: RuntimeCapabilities;
   /** Present when `ok:false` — why the probe failed. */
   reason?: string;
+}
+
+// ── `container` isolation-tier spec (department-mesh, task d8; 07 §2.1/§2.2,
+//    10-security.md §5/T15/T30) ───────────────────────────────────────────────
+// Read by the `container` adapter ONLY (`./container.ts`) — every other
+// adapter ignores `RuntimeConfig.container` entirely, same "read what you
+// understand" discipline `RuntimeConfig`'s own doc states. Kept here (next to
+// `RuntimeConfig`) rather than in `./container.ts` so the field can be typed
+// on `RuntimeConfig` without a cross-module import cycle.
+
+/** One explicit host<->container bind mount. `container` never bind-mounts
+ *  anything NOT listed here (plus its own auto-provisioned per-execution
+ *  workspace, `./container.ts`) — "explicit mounts only" is enforced by
+ *  construction: there is no "mount everything under `cwd`" fallback. */
+export interface ContainerMount {
+  /** Absolute host-side path. */
+  hostPath: string;
+  /** Absolute path the mount appears at INSIDE the container. */
+  containerPath: string;
+  /** Default false (read-write). The container's ROOT filesystem is
+   *  read-only regardless of this flag — mounts (including this one) are the
+   *  ONLY writable surface a `container`-tier runtime has. */
+  readOnly?: boolean;
+}
+
+/** One egress-allowlist entry: a host (name or literal IP) the container may
+ *  reach, optionally restricted to one port. No wildcards — exact match only,
+ *  the same least-privilege discipline `10-security.md`'s SSRF controls (T8)
+ *  apply elsewhere. */
+export interface ContainerEgressRule {
+  host: string;
+  port?: number;
+}
+
+export type ContainerRuntimeBinary = 'docker' | 'podman';
+
+/** The `container` adapter's per-department config (07 §2.1: "wraps
+ *  `jsonl-process` … in a container with a read-only root, explicit mounts,
+ *  and an egress allowlist"). Required on `RuntimeConfig` whenever
+ *  `adapterId === 'container'` — `ContainerAdapter` refuses to start a
+ *  department that omits it rather than ever running one unsandboxed. */
+export interface ContainerSpec {
+  /** OCI image the wrapped `command`/`args` run inside. No default — an
+   *  operator must choose one explicitly, exactly as `command` has none. */
+  image: string;
+  /** Explicit mounts — see `ContainerMount`'s doc. May be empty. */
+  mounts: ContainerMount[];
+  /** Egress allowlist. Empty/absent ⇒ the container gets NO network at all
+   *  (`--network none`) — the safe default; a runtime that needs egress must
+   *  say so, host by host. */
+  egressAllowlist?: ContainerEgressRule[];
+  /** REQUIRED whenever `egressAllowlist` is non-empty: the pre-provisioned
+   *  container network the operator has configured to actually enforce that
+   *  allowlist (firewall/proxy rules — see `./container.ts`'s module doc for
+   *  exactly what this adapter does and does not automate). Missing this
+   *  while declaring an allowlist is a fail-closed construction error, never
+   *  a silent attach to an unenforced default network. */
+  egressNetwork?: string;
+  /** `'docker'` (default) or `'podman'` — both accept the same flag surface
+   *  this adapter emits. */
+  runtimeBinary?: ContainerRuntimeBinary;
+  /** Container-side working directory. Defaults to the auto-provisioned
+   *  per-execution workspace mount's container path. */
+  workdir?: string;
+  /** Container path the auto-provisioned, per-execution workspace directory
+   *  is mounted at, read-write (T15/T30). Default `/workspace`. */
+  workspaceContainerPath?: string;
+  /** Size, in MiB, of the writable `/tmp` tmpfs every container gets so
+   *  `--read-only` stays usable without relaxing it (memory-backed, never a
+   *  host bind-mount, never persisted). Default 64. */
+  tmpfsSizeMb?: number;
+  /** Extra raw flags appended verbatim just before the image — an escape
+   *  hatch for operator-specific needs (resource limits, a seccomp profile,
+   *  …). Never used to relax read-only-root or the mount list; those are
+   *  hard-coded by `./container.ts`, not configurable through this field. */
+  extraArgs?: string[];
 }
 
 // ── Invocation + handle ──────────────────────────────────────────────────────

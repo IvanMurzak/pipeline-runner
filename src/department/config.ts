@@ -12,6 +12,10 @@
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import type { RuntimeConfig, RuntimeLifecycle } from './adapter';
+// department-mesh d8: an entry with `adapterId: "container"` carries its
+// sandbox spec under a `container` key — parsed the same tolerant way every
+// other optional `RuntimeConfig` field here is.
+import { narrowContainerSpec } from './container';
 
 export const DEPARTMENT_RUNTIMES_ENV = 'PIPELINE_RUNNER_DEPARTMENTS';
 
@@ -70,6 +74,10 @@ function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   }
   if (typeof r.lifecycle === 'string' && (LIFECYCLES as readonly string[]).includes(r.lifecycle)) {
     config.lifecycle = r.lifecycle as RuntimeLifecycle;
+  }
+  if (r.container !== undefined) {
+    const containerSpec = narrowContainerSpec(r.container);
+    if (containerSpec !== undefined) config.container = containerSpec;
   }
   return config;
 }

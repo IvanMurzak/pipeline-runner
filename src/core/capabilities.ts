@@ -25,8 +25,15 @@ import { cpus, totalmem } from 'node:os';
 import { detectOs } from './config';
 
 /** Isolation tiers a runner instance can host (07 §2.2). `container` — the
- *  strong tier, required for cross-org/public work (D18) — is task `d8`;
- *  this runner always advertises `['process']` until that adapter exists. */
+ *  strong tier, required for cross-org/public work (D18) — is the
+ *  `container` adapter (`../department/container.ts`, task d8). `isolation`
+ *  still DEFAULTS to `['process']` here (this function stays synchronous,
+ *  host-only detection); including `'container'` is the caller's job, and
+ *  `../cli.ts`'s `register --container` only ever does so after actually
+ *  VERIFYING the container runtime is usable
+ *  (`../department/container.ts`'s `probeContainerRuntimeAvailable`) — R14:
+ *  "a `container`-tier runner must not advertise a capability it can't
+ *  actually isolate". */
 export const ISOLATION_TIERS = ['process', 'container'] as const;
 export type IsolationTier = (typeof ISOLATION_TIERS)[number];
 
