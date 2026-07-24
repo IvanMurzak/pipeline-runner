@@ -9,7 +9,11 @@
  *      SIGTERM the drive children (their per-step state is durable; E7/E8
  *      resume machinery covers the re-entry).
  *   3. Flush the shipper spool (final poll + flush + drain attempt per job).
- *   4. Close the socket, exit 0.
+ *   4. Close the socket.
+ *   5. Release the per-home lock (department-mesh d7, D17 — optional; a
+ *      hard death leaves it for the NEXT start's stale-pid self-heal, see
+ *      `core/home.ts`, so this step is a courtesy, not load-bearing).
+ *   6. Exit 0.
  *
  * The whole drain is capped by `timeoutMs` — shutdown must never hang on an
  * offline cloud (the spool is durable; whatever did not upload ships on the
@@ -42,6 +46,10 @@ export interface GracefulShutdownDeps {
   flushShippers(): Promise<void>;
   /** Close the agent connection (client.stop). */
   closeConnection(): void;
+  /** Release the per-home lock (d7, D17) — optional; a caller with no home
+   *  lock wired (or none acquired yet) simply omits it. Best-effort: errors
+   *  are swallowed, the shutdown sequence never blocks on it. */
+  releaseLock?(): void;
   /** Process exit (injectable for tests). */
   exit(code: number): void;
   timeoutMs?: number;
@@ -77,7 +85,13 @@ export function createGracefulShutdown(deps: GracefulShutdownDeps): () => Promis
       logger.warn(`shutdown: drain exceeded ${timeoutMs}ms — exiting anyway (spool is durable; records persisted at suspend)`);
     }
     deps.closeConnection();
-    logger.info('shutdown: connection closed — bye');
+    logger.info('shutdown: connection closed');
+    try {
+      deps.releaseLock?.();
+    } catch (err) {
+      logger.warn(`shutdown: releasing the home lock failed (harmless — next start self-heals): ${err}`);
+    }
+    logger.info('shutdown: bye');
     deps.exit(0);
   };
 

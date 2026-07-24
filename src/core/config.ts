@@ -18,16 +18,40 @@
  * Import-inert: importing this module touches nothing on disk; the storage
  * path and the filesystem are both injectable so tests never see the real
  * home dir.
+ *
+ * department-mesh d7 (D17, `07-runtime-contract.md` §2.2): `PIPELINE_RUNNER_HOME`
+ * roots an ISOLATED instance's config dir (and, via `../shipper/fs.ts`'s
+ * `defaultDataDir`, its data dir too), so N runner instances can coexist on
+ * one host without ever sharing a config file, job store, spool, or
+ * workspace root. Unset ⇒ the OS-default paths above, byte-for-byte
+ * unchanged from before this — a single default-home runner behaves exactly
+ * as it always has.
  */
 
 import { join } from 'node:path';
 import * as fs from 'node:fs';
+import type { RunnerCapabilities } from './capabilities';
+import { narrowRunnerCapabilities } from './capabilities';
 
 /** Keep in sync with `package.json` `version`. */
 export const AGENT_VERSION = '0.1.0';
 
 export const CONFIG_DIR_NAME = 'pipeline-runner';
 export const CONFIG_FILE_NAME = 'config.json';
+
+/** Roots an isolated instance's config dir + data dir (D17). See the module
+ *  doc above and `../core/home.ts` (the lock + workspace-root resolvers). */
+export const PIPELINE_RUNNER_HOME_ENV = 'PIPELINE_RUNNER_HOME';
+
+/**
+ * The isolated HOME root, or `null` when `PIPELINE_RUNNER_HOME` is unset (or
+ * blank) — the historical single-home default, where `defaultConfigDir`/
+ * `defaultDataDir` keep their pre-d7 OS-default paths untouched.
+ */
+export function resolveHome(env: Record<string, string | undefined> = process.env): string | null {
+  const home = env[PIPELINE_RUNNER_HOME_ENV];
+  return home !== undefined && home.trim().length > 0 ? home : null;
+}
 
 /** The placeholder `describeIdentity` substitutes for the runner token. */
 export const REDACTED = '<redacted>';
@@ -62,6 +86,11 @@ export interface AgentIdentity {
   plugin_version?: string | null;
   /** Heartbeat cadence adopted from `register_ack`. */
   heartbeat_interval_s?: number;
+  /** D17 capability advertisement (`./capabilities.ts`), captured at
+   *  `register` time. Optional/omitted for an identity that predates d7 or
+   *  was never re-registered — `buildRegisterFrame` simply leaves the
+   *  frame's `capabilities` key off in that case, exactly like `capacity`. */
+  capabilities?: RunnerCapabilities;
 }
 
 export class ConfigError extends Error {}
@@ -111,6 +140,11 @@ export function defaultConfigDir(
   env: Record<string, string | undefined> = process.env,
   platform: string = process.platform
 ): string {
+  // d7 (D17): an isolated home roots this instance's config dir at
+  // `<home>/config`, checked BEFORE the OS-default branches below so an
+  // unset PIPELINE_RUNNER_HOME leaves every existing path untouched.
+  const home = resolveHome(env);
+  if (home !== null) return join(home, 'config');
   if (platform === 'win32') {
     const appData = env.APPDATA ?? (env.USERPROFILE ? join(env.USERPROFILE, 'AppData', 'Roaming') : undefined);
     if (!appData) throw new ConfigError('cannot determine config directory: %APPDATA% and %USERPROFILE% are both unset');
@@ -200,6 +234,7 @@ export class ConfigStore {
       plugin_version:
         typeof record.plugin_version === 'string' ? record.plugin_version : record.plugin_version === null ? null : undefined,
       heartbeat_interval_s: typeof record.heartbeat_interval_s === 'number' ? record.heartbeat_interval_s : undefined,
+      capabilities: narrowRunnerCapabilities(record.capabilities),
     };
   }
 

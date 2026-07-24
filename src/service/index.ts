@@ -137,15 +137,32 @@ export function previewService(opts: ServiceOptions = {}): ServicePreview {
 function serviceUsage(): void {
   console.log(
     [
-      'usage: pipeline-runner service <install|uninstall|status> [--dry-run]',
+      'usage: pipeline-runner service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
       '',
       '  install    register + start the runner as an OS service (systemd/launchd/Windows)',
       '  uninstall  stop + deregister the service',
       '  status     report running/enabled state',
       '',
-      '  --dry-run  (install) print the generated unit/plist/command; touch nothing',
+      '  --dry-run       (install) print the generated unit/plist/command; touch nothing',
+      '  --name <name>   NAMED instance (D17): systemd pipeline-runner@<name>, a per-label',
+      '                  launchd agent, a per-name Windows service. Omit for the single',
+      '                  default instance.',
+      '  --home <path>   pin this instance to an isolated home (PIPELINE_RUNNER_HOME) — its',
+      '                  own config dir, data dir, job-workspace root, and lock file, so it',
+      '                  never collides with another instance on the same host.',
     ].join('\n')
   );
+}
+
+/** Parse `--name <val>`/`--home <val>` out of the service subcommand's rest
+ *  args (positional-friendly, mirrors the pre-existing `--dry-run` check). */
+function parseInstanceFlags(rest: string[]): { name?: string; home?: string } {
+  const out: { name?: string; home?: string } = {};
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === '--name' && rest[i + 1] !== undefined) out.name = rest[++i];
+    else if (rest[i] === '--home' && rest[i + 1] !== undefined) out.home = rest[++i];
+  }
+  return out;
 }
 
 /**
@@ -156,24 +173,25 @@ function serviceUsage(): void {
 export function runService(argv: string[]): void {
   const [sub, ...rest] = argv;
   const dryRun = rest.includes('--dry-run');
+  const opts: ServiceOptions = parseInstanceFlags(rest);
   try {
     switch (sub) {
       case 'install': {
         if (dryRun) {
-          const preview = previewService();
+          const preview = previewService(opts);
           console.log(`[pipeline-runner] service preview (${preview.backend}, ${preview.platform})`);
           if (preview.definitionPath) console.log(`[pipeline-runner] path: ${preview.definitionPath}`);
           console.log(preview.definition);
           return;
         }
-        printResult(installService());
+        printResult(installService(opts));
         return;
       }
       case 'uninstall':
-        printResult(uninstallService());
+        printResult(uninstallService(opts));
         return;
       case 'status':
-        printResult(serviceStatus());
+        printResult(serviceStatus(opts));
         return;
       default:
         serviceUsage();

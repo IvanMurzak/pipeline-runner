@@ -9,6 +9,11 @@
  *                         NOT hot-loop); `capacity` is transient (retry with
  *                         backoff). `describeReject` renders the precise
  *                         operator-facing message per reason.
+ *
+ * department-mesh d7 (D17): `buildRegisterFrame` also attaches the identity's
+ * `capabilities` (`./capabilities.ts`) when present — see that module's
+ * PROTOCOL FOLLOW-UP note for why it rides the frame's additive
+ * `.passthrough()` rather than a typed schema field.
  */
 
 import type { AgentIdentity } from './config';
@@ -33,6 +38,11 @@ export function buildRegisterFrame(identity: AgentIdentity, id: string): Registe
     protocol_version: PROTOCOL_VERSION,
   };
   if (identity.capacity !== undefined) frame.capacity = identity.capacity;
+  // d7 (D17): capability advertisement — additive passthrough field (no
+  // typed schema slot in protocol 0.4.0 yet; see the module doc above).
+  // Omitted (not `null`) when this identity predates d7 / was never
+  // re-registered, exactly like `capacity` above.
+  if (identity.capabilities !== undefined) frame.capabilities = identity.capabilities;
   return frame;
 }
 
