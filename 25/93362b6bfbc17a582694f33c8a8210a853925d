@@ -1,0 +1,38 @@
+package.json
+  s_ddab4fcf9dfea4::t_6a3f46f57f1276 33
+src/department/fixtures/clarifying-runtime.ts
+  s_ddab4fcf9dfea4::t_416c68c8c158f6 1-87
+src/department/manager.ts
+  s_ddab4fcf9dfea4::t_3b244d0a920296 71-80,87
+  s_ddab4fcf9dfea4::t_ca0db891a846c0 418
+  s_ddab4fcf9dfea4::t_b8c401d81ff738 186-188
+  s_ddab4fcf9dfea4::t_3f1d9f08bf8c26 426,449-474
+  s_ddab4fcf9dfea4::t_cd014f979d4cb5 475,568,572-574,576-579,587-589,600-642
+  s_ddab4fcf9dfea4::t_771e8a300e5fd3 520-524,530,532-534,536-538,542-557,559-561,563-567
+  s_ddab4fcf9dfea4::t_46f0a8926a999d 127-131
+  s_ddab4fcf9dfea4::t_aa1aa8b18bf35e 307
+  s_ddab4fcf9dfea4::t_105ea1f1a155f1 17-46
+  s_ddab4fcf9dfea4::t_9864a0d03fadbf 476
+bun.lock
+  s_ddab4fcf9dfea4::t_6354d37fcc30df 8,17
+src/department/manager.test.ts
+  s_ddab4fcf9dfea4::t_dd39fdf8def80a 287-296
+  s_ddab4fcf9dfea4::t_d860947a2e65d1 259
+  s_ddab4fcf9dfea4::t_16566bf706ef98 336-341
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "2593362b6bfbc17a582694f33c8a8210a853925d",
+  "prompts": {},
+  "sessions": {
+    "s_ddab4fcf9dfea4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72ad2e76-6d1b-4b13-a97d-6977aca140cf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
