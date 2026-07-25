@@ -1,0 +1,29 @@
+src/core/dispatcher.ts
+  s_65212b43961dea::t_57c8cc8cb79110 21-24,28-36
+src/core/duration.ts
+  s_65212b43961dea::t_45f46ea2ce7eb6 1-49
+src/department/adapter.ts
+  s_65212b43961dea::t_70a8e6e0be1543 85-90
+src/department/manager.test.ts
+  s_65212b43961dea::t_25c90ddcf1798a 503-627
+src/department/manager.ts
+  s_65212b43961dea::t_0e45f67c41c1a9 33-45,101,114,177-180,255-259,290,296,353,455-528
+tests/duration.test.ts
+  s_65212b43961dea::t_45f351374b03a7 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "27aa740c216d77963d44cdb85115dd2ca99c1b22",
+  "prompts": {},
+  "sessions": {
+    "s_65212b43961dea": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_65212b43961dea",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
