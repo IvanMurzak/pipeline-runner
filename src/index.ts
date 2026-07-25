@@ -13,6 +13,8 @@ export * from './core/config';
 export * from './core/backoff';
 export * from './core/dispatcher';
 export * from './core/register';
+// department-mesh d5 (P6): which credential the register frame carries.
+export * from './core/register-credential';
 export * from './core/heartbeat';
 export * from './core/transport';
 export * from './core/connection';

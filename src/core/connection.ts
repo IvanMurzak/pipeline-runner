@@ -24,17 +24,33 @@
  *
  * Inbound frames all flow through the `Dispatcher`; T1-12/T1-13 attach their
  * `lease`/`answer`/`upload_ack` handlers on `client.dispatcher` later.
+ *
+ * department-mesh d5 (P6, `13-mcp-authorization.md` §10.2): WHICH credential
+ * goes on the register frame is decided by `./register-credential.ts`. Two
+ * rules here follow from R11 ("a runner refused at register cannot re-register
+ * itself"):
+ *
+ *   - A runner that is not migrated resolves its credential SYNCHRONOUSLY, so
+ *     its connect sequence is unchanged from before P6 — no new network
+ *     dependency is introduced into the path every deployed runner uses.
+ *   - A fatal `register_reject` while presenting an OAuth credential is
+ *     retried ONCE with the legacy token before it is honoured, so a
+ *     server-side OAuth fault (rotated signing key, stale client secret, clock
+ *     skew) cannot take a runner offline that its legacy token would have kept
+ *     online.
  */
 
 import { backoffDelayMs, DEFAULT_BACKOFF, type BackoffPolicy } from './backoff';
 import type { Clock } from './clock';
 import { systemClock } from './clock';
-import type { ConfigStore } from './config';
+import type { AgentIdentity, ConfigStore } from './config';
 import { Dispatcher } from './dispatcher';
 import { HeartbeatLoop } from './heartbeat';
 import type { Logger } from './log';
 import { nullLogger } from './log';
 import { applyRegisterAck, buildRegisterFrame, classifyReject, describeReject } from './register';
+import type { RegisterCredentialClass, RegisterCredentialResolution } from './register-credential';
+import { RegisterCredentialProvider } from './register-credential';
 import type { Transport, TransportConnection } from './transport';
 import type { RunnerStatus, WireFrame } from './wire';
 import { isCompatible, isRegisterAck, isRegisterReject, PROTOCOL_VERSION } from './wire';
@@ -80,6 +96,10 @@ export interface AgentClientOptions {
   /** c6: per-beat hook — the job manager's heartbeat-tick record writer
    *  (`touchActiveRecords`). Absent ⇒ nothing. */
   onBeat?(): void;
+  /** d5 (P6): the register-credential chooser. Absent ⇒ a default provider,
+   *  which for an un-migrated identity resolves to the legacy runner token with
+   *  no I/O — i.e. exactly the pre-P6 behaviour. Injected by tests. */
+  registerCredentials?: RegisterCredentialProvider;
   events?: AgentClientEvents;
 }
 
@@ -92,6 +112,7 @@ export class AgentClient {
   private readonly backoff: BackoffPolicy;
   private readonly makeId: () => string;
   private readonly registerTimeoutMs: number;
+  private readonly registerCredentials: RegisterCredentialProvider;
 
   private state_: ConnectionState = 'idle';
   private fatalReason_: string | null = null;
@@ -105,6 +126,9 @@ export class AgentClient {
   private registerTimer: unknown = null;
   private reconnectTimer: unknown = null;
   private heartbeat: HeartbeatLoop | null = null;
+  /** d5: which credential class the in-flight register presented — read by
+   *  `onRegisterReject` to decide whether a legacy retry is available. */
+  private registerClass: RegisterCredentialClass | null = null;
 
   constructor(private readonly options: AgentClientOptions) {
     if (options.transports.length === 0) throw new Error('AgentClient needs at least one transport');
@@ -114,6 +138,8 @@ export class AgentClient {
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.makeId = options.makeId ?? (() => crypto.randomUUID());
     this.registerTimeoutMs = options.registerTimeoutMs ?? DEFAULT_REGISTER_TIMEOUT_MS;
+    this.registerCredentials =
+      options.registerCredentials ?? new RegisterCredentialProvider({ clock: this.clock, logger: this.logger });
     this.dispatcher = new Dispatcher(this.logger);
     this.dispatcher.on('register_ack', (frame) => this.onRegisterAck(frame));
     this.dispatcher.on('register_reject', (frame) => this.onRegisterReject(frame));
@@ -221,13 +247,56 @@ export class AgentClient {
     }
     this.opened = true;
     this.setState('registering');
-    this.registerId = this.makeId();
-    // The register frame is the FIRST frame on the connection, always.
-    this.connection?.send(buildRegisterFrame(identity, this.registerId));
+    const registerId = this.makeId();
+    this.registerId = registerId;
+    this.registerClass = null; // nothing presented on THIS connection yet
+    const connection = this.connection;
+    // Armed BEFORE the credential is resolved, so a hung `/oauth/token` (d5)
+    // can never wedge a connection open indefinitely — it drops and backs off
+    // exactly like a server that never answers the register.
     this.registerTimer = this.clock.setTimeout(() => {
       this.logger.warn('register timed out — dropping connection');
       this.connection?.close();
     }, this.registerTimeoutMs);
+
+    // d5: the un-migrated path resolves with no I/O, so the register frame is
+    // still the FIRST frame on the connection, sent in this same turn.
+    const immediate = this.registerCredentials.immediate(identity);
+    if (immediate !== null) {
+      this.sendRegister(identity, registerId, connection, immediate);
+      return;
+    }
+    void this.registerCredentials.resolve(identity).then((resolution) => {
+      // Guards: the socket may have dropped, been superseded, or the client
+      // stopped while the token exchange was in flight.
+      if (this.state_ !== 'registering' || this.registerId !== registerId || this.connection !== connection) {
+        this.logger.debug('register credential resolved after the connection moved on — discarded');
+        return;
+      }
+      this.sendRegister(identity, registerId, connection, resolution);
+    });
+  }
+
+  private sendRegister(
+    identity: AgentIdentity,
+    registerId: string,
+    connection: TransportConnection | null,
+    resolution: RegisterCredentialResolution
+  ): void {
+    if (!resolution.ok) {
+      // Deliberately NOT fatal: this is retryable by construction (see
+      // `register-credential.ts`). Drop the socket and let backoff retry.
+      this.logger.warn(`no register credential available: ${resolution.reason} — retrying with backoff`);
+      connection?.close();
+      return;
+    }
+    const { credential } = resolution;
+    this.registerClass = credential.credentialClass;
+    if (credential.credentialClass === 'legacy' && credential.reason !== null) {
+      this.logger.debug(`register: presenting the legacy runner token (${credential.reason})`);
+    }
+    // The register frame is the FIRST frame on the connection, always.
+    connection?.send(buildRegisterFrame(identity, registerId, credential.value));
   }
 
   private onRegisterAck(frame: WireFrame): void {
@@ -305,13 +374,47 @@ export class AgentClient {
       this.clock.clearTimeout(this.registerTimer);
       this.registerTimer = null;
     }
+    // d5: whatever the verdict, never re-present a token the server just
+    // refused — the next attempt re-requests one.
+    const presentedClass = this.registerClass;
+    this.registerCredentials.invalidate();
     const message = describeReject(frame);
     if (classifyReject(frame.reason) === 'fatal') {
+      // ── R11 SAFETY NET ────────────────────────────────────────────────────
+      // A fatal reject of an OAuth credential is retried once with the legacy
+      // token before the runner is allowed to stop. Without this, any
+      // server-side OAuth fault would take offline a runner whose legacy token
+      // the cloud still accepts (the window is `dual` by default), which is
+      // precisely the failure mode P6 must not introduce. If legacy is refused
+      // too, the next reject is honoured and the client stops for real.
+      if (presentedClass === 'oauth' && !this.registerCredentials.legacyForced && this.hasLegacyToken()) {
+        this.registerCredentials.forceLegacy();
+        this.logger.warn(
+          `register rejected while presenting an OAuth credential (${message}) — retrying with this runner's ` +
+            `legacy runner token. This process will keep using the legacy token; fix the OAuth client secret ` +
+            `(\`pipeline-runner set-credentials\`) and restart to migrate again.`
+        );
+        this.connection?.close(); // → handleClose → backoff → retry with legacy
+        return;
+      }
       this.fatal(message);
       return;
     }
     this.logger.warn(`register rejected: ${message}`);
     this.connection?.close(); // → handleClose → backoff → retry
+  }
+
+  /** Is there still a legacy plaintext token to fall back on? Read through the
+   *  store so a `set-credentials`/re-`register` between attempts is seen. */
+  private hasLegacyToken(): boolean {
+    try {
+      const token = this.options.store.load()?.runner_token;
+      return token !== undefined && token.length > 0;
+    } catch {
+      // A config that no longer loads is not a reason to bypass the fatal
+      // path — the fallback simply is not available.
+      return false;
+    }
   }
 
   private fatal(reason: string): void {

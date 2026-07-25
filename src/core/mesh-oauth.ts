@@ -1,27 +1,42 @@
 /**
- * Execution-token exchange (department-mesh task d6; `13-mcp-authorization.md`
- * §12). The runner is a confidential OAuth 2.1 client whose credential is its
- * EXISTING runner registration secret — reused as the OAuth `client_secret`,
- * never a new credential (§10.2/§12: "the runner's existing token is its
- * OAuth client secret"). `client_id` is the server-assigned `runner_id` from
- * `register_ack` (`../core/register.ts`'s `applyRegisterAck`) — the same id
- * the cloud AS resolves the runner row by
- * (`cloud/apps/api/src/modules/mesh-oauth/routes.ts`'s
- * `handleClientCredentialsGrant`: `runnerAuth.runner.id !== clientId` is the
- * uniform `invalid_client` check).
+ * The runner's ONE OAuth 2.1 confidential client (department-mesh d6 + d5;
+ * `13-mcp-authorization.md` §12 and §10.2).
  *
- * Exactly ONE grant is implemented here — `client_credentials` — because it
- * is the ONLY grant a runner ever uses (13 §12: "client_credentials is
- * EXCLUSIVELY the runner execution-token path"). No refresh token is ever
- * requested or accepted (RFC 6749 §4.4.3 / OAuth 2.1 §4.2: a refresh token
- * SHOULD NOT accompany this grant) — a dead/renewed lease means the runner
- * calls this function again, naming the SAME `execution_id`, and gets either
- * a fresh token (lease still live) or `invalid_grant` (lease gone).
+ * Exactly ONE grant is implemented here — `client_credentials` — because it is
+ * the only grant a runner ever uses (13 §12). It now buys TWO machine token
+ * kinds from the same endpoint, matching the cloud's own
+ * `handleClientCredentialsGrant`:
  *
- * SECRETS DISCIPLINE (10-security.md §6, mirrors `../core/register.ts` and
- * `tests/connection.test.ts:359`): `clientSecret` and the returned
- * `accessToken` are NEVER logged, in success or failure. Every `logger.*`
- * call below carries execution ids and OAuth `error` codes only — never a
+ *   | scope             | audience        | what it is for                     |
+ *   |-------------------|-----------------|------------------------------------|
+ *   | `mesh:execution`  | `<base>/mcp`    | one live execution (d6, 13 §12)    |
+ *   | `runner:register` | `<base>/api`    | the WSS `register` frame (d5, §10.2)|
+ *
+ * No refresh token is ever requested or accepted (RFC 6749 §4.4.3 / OAuth 2.1
+ * §4.2: a refresh token SHOULD NOT accompany this grant) — the runner simply
+ * re-requests.
+ *
+ * ── Which secret authenticates the client (department-mesh d5 / c15) ─────────
+ * `clientId` is the server-assigned `runner_id` from `register_ack`
+ * (`./register.ts`'s `applyRegisterAck`) — the same id the cloud AS resolves the
+ * runner row by. `clientSecret` is whatever the caller hands over, and after
+ * c15 that is deliberately a CHOICE, not a fixed field:
+ *
+ *   - the DISTINCT `oauth_client_secret` when the operator has issued one
+ *     (`POST /api/v1/runners/:id/oauth-credentials`), or
+ *   - the legacy plaintext `runner_token` when they have not.
+ *
+ * d6 originally hard-wired the second option ("the runner's existing token IS
+ * its OAuth client secret"). c15 broke that entanglement precisely so the legacy
+ * credential can retire on its own, and the cloud records which class
+ * authenticated (`last_client_auth_class`) to gate that retirement. Choosing the
+ * secret is therefore the CALLER's job — see `./register-credential.ts`'s
+ * `selectClientSecret`, the single place that ordering is expressed.
+ *
+ * SECRETS DISCIPLINE (10-security.md §6, mirrors `./register.ts` and
+ * `tests/connection.test.ts`'s secrets-discipline suite): `clientSecret` and the
+ * returned `accessToken` are NEVER logged, in success or failure. Every
+ * `logger.*` call below carries ids and OAuth `error` codes only — never a
  * credential.
  */
 
@@ -30,15 +45,19 @@ import { systemClock } from './clock';
 import type { Logger } from './log';
 import { nullLogger } from './log';
 
-/** The one scope a runner ever requests (13 §6: "machine-only, never
- *  user-delegated"). */
+/** The one scope a runner ever requests for an execution (13 §6: "machine-only,
+ *  never user-delegated"). */
 export const MESH_EXECUTION_SCOPE = 'mesh:execution';
+
+/** The scope a MIGRATED runner exchanges its client credentials for in order to
+ *  register (13 §10.2; cloud `mesh-oauth/types.ts`'s `RUNNER_REGISTER_SCOPE`). */
+export const RUNNER_REGISTER_SCOPE = 'runner:register';
 
 /** The minimal `fetch` surface this module needs — injectable so tests never
  *  hit the network (mirrors `../shipper/upload-transport.ts`'s `FetchLike`). */
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
-export interface ExecutionAccessToken {
+export interface ClientCredentialsToken {
   accessToken: string;
   tokenType: string;
   /** Clock-ms absolute expiry (`clock.now() + expires_in * 1000` at the
@@ -48,7 +67,7 @@ export interface ExecutionAccessToken {
   scope: string;
 }
 
-export interface ExecutionTokenError {
+export interface ClientCredentialsError {
   /** RFC 6749 §5.2 `error` code — e.g. `invalid_grant`, `invalid_client`,
    *  `invalid_target`, `invalid_request` — or a LOCAL synthetic code
    *  (`network_error`, `invalid_response`) for failures that never reached
@@ -59,7 +78,15 @@ export interface ExecutionTokenError {
   status?: number;
 }
 
-export type ExecutionTokenResult = { ok: true; token: ExecutionAccessToken } | { ok: false; error: ExecutionTokenError };
+export type ClientCredentialsResult =
+  | { ok: true; token: ClientCredentialsToken }
+  | { ok: false; error: ClientCredentialsError };
+
+/** d6-era names, kept as aliases so `../department/execution-token-manager.ts`
+ *  and its tests read exactly as they did before d5 generalized this module. */
+export type ExecutionAccessToken = ClientCredentialsToken;
+export type ExecutionTokenError = ClientCredentialsError;
+export type ExecutionTokenResult = ClientCredentialsResult;
 
 export interface RequestExecutionTokenOptions {
   /** Control-plane base URL (`AgentIdentity.base_url`) — the SAME origin
@@ -67,7 +94,8 @@ export interface RequestExecutionTokenOptions {
   baseUrl: string;
   /** OAuth client id — the server-assigned `runner_id`. */
   clientId: string;
-  /** OAuth client secret — the runner's EXISTING registration token. SECRET. */
+  /** OAuth client secret — the distinct `oauth_client_secret` when the runner
+   *  has one, else its legacy registration token. SECRET. */
   clientSecret: string;
   executionId: string;
   fetchImpl?: FetchLike;
@@ -75,16 +103,54 @@ export interface RequestExecutionTokenOptions {
   logger?: Logger;
 }
 
+export interface RequestRunnerRegistrationTokenOptions {
+  /** Control-plane base URL (`AgentIdentity.base_url`). */
+  baseUrl: string;
+  /** OAuth client id — the server-assigned `runner_id`. */
+  clientId: string;
+  /** OAuth client secret. SECRET. See the module doc on WHICH one. */
+  clientSecret: string;
+  fetchImpl?: FetchLike;
+  clock?: Clock;
+  logger?: Logger;
+  /** Abort the exchange after this many ms. Defaults to
+   *  {@link REGISTRATION_TOKEN_TIMEOUT_MS} — see that constant for why a
+   *  registration-token request MUST be bounded. */
+  timeoutMs?: number;
+}
+
+/**
+ * A registration-token exchange must finish well inside the connection's
+ * register timeout (`core/connection.ts`'s `DEFAULT_REGISTER_TIMEOUT_MS`,
+ * 10 s): if it does not, the socket is dropped before any `register` frame is
+ * sent, and a persistently slow `/oauth/token` would stall a migrated runner
+ * indefinitely instead of degrading. Bounding it turns "stalled" into a
+ * `network_error`, which `../core/register-credential.ts` answers with the
+ * legacy token — the degradation R11 requires.
+ */
+export const REGISTRATION_TOKEN_TIMEOUT_MS = 7_000;
+
+function trimBase(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '');
+}
+
 /** `${issuer}/mcp` — the ONE audience an execution token is ever requested
  *  for (13 §10: MCP server canonical resource). Mirrors the cloud's own
  *  `issuer()`/`canonicalResource()` (`cloud/apps/api/src/modules/mesh-oauth/resource.ts`)
  *  trailing-slash normalization so the string matches byte-for-byte. */
 export function meshMcpResource(baseUrl: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}/mcp`;
+  return `${trimBase(baseUrl)}/mcp`;
+}
+
+/** `${issuer}/api` — the REST audience, and the ONLY one a `runner:register`
+ *  token is ever issued for (13 §10 D15; the cloud refuses any other with
+ *  `invalid_target`). No fourth audience was invented for P6. */
+export function meshApiResource(baseUrl: string): string {
+  return `${trimBase(baseUrl)}/api`;
 }
 
 function tokenEndpoint(baseUrl: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}/oauth/token`;
+  return `${trimBase(baseUrl)}/oauth/token`;
 }
 
 function basicAuthHeader(clientId: string, clientSecret: string): string {
@@ -94,7 +160,10 @@ function basicAuthHeader(clientId: string, clientSecret: string): string {
 /** Narrow a decoded JSON success body to the fields we need. Anything
  *  missing/mistyped is treated as `invalid_response` — never a thrown/NaN
  *  `expiresAt`. */
-function narrowSuccessBody(raw: unknown): { accessToken: string; tokenType: string; expiresInS: number; scope: string } | null {
+function narrowSuccessBody(
+  raw: unknown,
+  fallbackScope: string
+): { accessToken: string; tokenType: string; expiresInS: number; scope: string } | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.access_token !== 'string' || r.access_token.length === 0) return null;
@@ -103,7 +172,7 @@ function narrowSuccessBody(raw: unknown): { accessToken: string; tokenType: stri
     accessToken: r.access_token,
     tokenType: typeof r.token_type === 'string' ? r.token_type : 'Bearer',
     expiresInS: r.expires_in,
-    scope: typeof r.scope === 'string' ? r.scope : MESH_EXECUTION_SCOPE,
+    scope: typeof r.scope === 'string' ? r.scope : fallbackScope,
   };
 }
 
@@ -120,40 +189,89 @@ function narrowErrorBody(raw: unknown): { error: string; description?: string } 
   return { error: 'unknown_error' };
 }
 
-/**
- * Exchange the runner's client credentials for one execution-scoped access
- * token naming `options.executionId` (13 §12). Never throws — every failure
- * mode (network error, non-2xx response, malformed body) resolves to
- * `{ ok: false, error }`.
- */
-export async function requestExecutionToken(options: RequestExecutionTokenOptions): Promise<ExecutionTokenResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const clock = options.clock ?? systemClock;
-  const logger = options.logger ?? nullLogger;
+interface ClientCredentialsRequest {
+  baseUrl: string;
+  clientId: string;
+  clientSecret: string;
+  scope: string;
+  resource: string;
+  /** Grant-specific form fields (e.g. `execution_id`). */
+  extraParams?: Record<string, string>;
+  /** Log-safe noun for this token kind, e.g. `execution token`. */
+  what: string;
+  /** Log-safe subject, e.g. `execution dexec-1` / `runner run_abc`. NEVER a
+   *  secret — every id here is server-assigned and non-sensitive. */
+  subject: string;
+  /** Abort the request after this many ms. Omitted ⇒ no client-side deadline
+   *  (the d6 execution-token path, whose caller has its own retry cadence). */
+  timeoutMs?: number;
+  fetchImpl?: FetchLike;
+  clock?: Clock;
+  logger?: Logger;
+}
 
-  const resource = meshMcpResource(options.baseUrl);
+/**
+ * The single `client_credentials` exchange every runner token kind goes
+ * through. Never throws — every failure mode (network error, non-2xx response,
+ * malformed body) resolves to `{ ok: false, error }`, because every caller of
+ * this module has a degradation path and none of them may take a runner down.
+ */
+async function requestClientCredentialsToken(request: ClientCredentialsRequest): Promise<ClientCredentialsResult> {
+  const fetchImpl = request.fetchImpl ?? fetch;
+  const clock = request.clock ?? systemClock;
+  const logger = request.logger ?? nullLogger;
+
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
-    resource,
-    scope: MESH_EXECUTION_SCOPE,
-    execution_id: options.executionId,
+    resource: request.resource,
+    scope: request.scope,
+    ...(request.extraParams ?? {}),
   });
 
-  logger.debug(`mesh-oauth: requesting execution token for execution ${options.executionId}`);
+  logger.debug(`mesh-oauth: requesting ${request.what} for ${request.subject}`);
+
+  // The deadline (when one is asked for). Deliberately NOT `AbortSignal.timeout`
+  // — under Bun that signal's `abort` event does not reach a plain listener, so
+  // a race against it would silently never fire and the "bounded" guarantee
+  // would be a lie. A timer on the INJECTED clock is portable, observable, and
+  // deterministic under the tests' `FakeClock`. The `AbortController` is still
+  // passed to `fetch` so a real in-flight request is actually cancelled rather
+  // than left running after we stop waiting for it.
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let deadlineTimer: unknown = null;
+  const deadline =
+    request.timeoutMs === undefined
+      ? null
+      : new Promise<never>((_resolve, reject) => {
+          deadlineTimer = clock.setTimeout(() => {
+            controller?.abort();
+            reject(new Error(`timed out after ${request.timeoutMs}ms`));
+          }, request.timeoutMs!);
+        });
+  const clearDeadline = (): void => {
+    if (deadlineTimer !== null) {
+      clock.clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
 
   let response: Response;
   try {
-    response = await fetchImpl(tokenEndpoint(options.baseUrl), {
+    const attempt = fetchImpl(tokenEndpoint(request.baseUrl), {
       method: 'POST',
       headers: {
-        authorization: basicAuthHeader(options.clientId, options.clientSecret),
+        authorization: basicAuthHeader(request.clientId, request.clientSecret),
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: body.toString(),
+      ...(controller !== null ? { signal: controller.signal } : {}),
     });
+    response = deadline === null ? await attempt : await Promise.race([attempt, deadline]);
+    clearDeadline();
   } catch (err) {
+    clearDeadline();
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn(`mesh-oauth: execution token request for ${options.executionId} failed — network error: ${message}`);
+    logger.warn(`mesh-oauth: ${request.what} request for ${request.subject} failed — network error: ${message}`);
     return { ok: false, error: { error: 'network_error', description: message } };
   }
 
@@ -167,18 +285,21 @@ export async function requestExecutionToken(options: RequestExecutionTokenOption
   if (!response.ok) {
     const { error, description } = narrowErrorBody(decoded);
     logger.warn(
-      `mesh-oauth: execution token for ${options.executionId} refused (HTTP ${response.status}, ${error})${description ? `: ${description}` : ''}`
+      `mesh-oauth: ${request.what} for ${request.subject} refused (HTTP ${response.status}, ${error})${description ? `: ${description}` : ''}`
     );
     return { ok: false, error: { error, ...(description !== undefined ? { description } : {}), status: response.status } };
   }
 
-  const success = narrowSuccessBody(decoded);
+  const success = narrowSuccessBody(decoded, request.scope);
   if (success === null) {
-    logger.warn(`mesh-oauth: execution token response for ${options.executionId} was malformed`);
-    return { ok: false, error: { error: 'invalid_response', description: 'token endpoint returned a malformed success body', status: response.status } };
+    logger.warn(`mesh-oauth: ${request.what} response for ${request.subject} was malformed`);
+    return {
+      ok: false,
+      error: { error: 'invalid_response', description: 'token endpoint returned a malformed success body', status: response.status },
+    };
   }
 
-  logger.debug(`mesh-oauth: execution token obtained for ${options.executionId} (expires in ${success.expiresInS}s)`);
+  logger.debug(`mesh-oauth: ${request.what} obtained for ${request.subject} (expires in ${success.expiresInS}s)`);
   return {
     ok: true,
     token: {
@@ -188,4 +309,52 @@ export async function requestExecutionToken(options: RequestExecutionTokenOption
       scope: success.scope,
     },
   };
+}
+
+/**
+ * Exchange the runner's client credentials for one execution-scoped access
+ * token naming `options.executionId` (13 §12). Never throws.
+ */
+export async function requestExecutionToken(options: RequestExecutionTokenOptions): Promise<ExecutionTokenResult> {
+  return await requestClientCredentialsToken({
+    baseUrl: options.baseUrl,
+    clientId: options.clientId,
+    clientSecret: options.clientSecret,
+    scope: MESH_EXECUTION_SCOPE,
+    resource: meshMcpResource(options.baseUrl),
+    extraParams: { execution_id: options.executionId },
+    what: 'execution token',
+    subject: `execution ${options.executionId}`,
+    ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.clock !== undefined ? { clock: options.clock } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+  });
+}
+
+/**
+ * Exchange the runner's client credentials for one short-lived
+ * `runner:register` token — the credential a MIGRATED runner presents on the
+ * WSS `register` frame instead of its plaintext long-lived token (13 §10.2, P6).
+ *
+ * Never throws, and the caller (`./register-credential.ts`) treats EVERY
+ * failure as "use the legacy token instead". That is the whole safety story of
+ * P6 on this side of the wire: the cloud dual-accepts (c15), so a runner that
+ * cannot mint a registration token still registers.
+ */
+export async function requestRunnerRegistrationToken(
+  options: RequestRunnerRegistrationTokenOptions
+): Promise<ClientCredentialsResult> {
+  return await requestClientCredentialsToken({
+    baseUrl: options.baseUrl,
+    clientId: options.clientId,
+    clientSecret: options.clientSecret,
+    scope: RUNNER_REGISTER_SCOPE,
+    resource: meshApiResource(options.baseUrl),
+    what: 'registration token',
+    subject: `runner ${options.clientId}`,
+    timeoutMs: options.timeoutMs ?? REGISTRATION_TOKEN_TIMEOUT_MS,
+    ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+    ...(options.clock !== undefined ? { clock: options.clock } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+  });
 }

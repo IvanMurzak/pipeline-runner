@@ -13,11 +13,16 @@ import {
   PIPELINE_RUNNER_HOME_ENV,
   REDACTED,
   resolveHome,
+  SECRET_IDENTITY_FIELDS,
   type AgentIdentity,
 } from '../src/core/config';
 import { MemFs } from './_helpers';
 
 const TOKEN = 'rt_super-secret-token-9f8e7d';
+/** d5 (P6): the DISTINCT OAuth client secret (c15) — a second credential the
+ *  identity may carry, and a second thing that must never be logged. */
+const CLIENT_SECRET = 'rcs_distinct-client-secret-1a2b3c';
+const RUNNER_ID = 'run_9c1f';
 
 function identity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
   return {
@@ -76,6 +81,52 @@ describe('ConfigStore', () => {
     expect(() => store.load()).toThrow(ConfigError);
   });
 
+  // ── department-mesh d5 (P6, 13 §10.2): a runner may hold EITHER credential ──
+
+  test('save → load round-trips the OAuth client secret alongside the legacy token', () => {
+    const store = new ConfigStore({ dir: 'cfg', fs: new MemFs() });
+    store.save(identity({ oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }));
+    const loaded = store.load();
+    expect(loaded?.oauth_client_secret).toBe(CLIENT_SECRET);
+    expect(loaded?.runner_id).toBe(RUNNER_ID);
+    expect(loaded?.runner_token).toBe(TOKEN);
+  });
+
+  test('a MIGRATED identity loads with no runner_token at all (DoD: no longer required)', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(
+      store.path,
+      JSON.stringify({ base_url: 'https://x', oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }),
+      0o600
+    );
+    const loaded = store.load();
+    expect(loaded?.runner_token).toBeUndefined();
+    expect(loaded?.oauth_client_secret).toBe(CLIENT_SECRET);
+  });
+
+  test('a client secret WITHOUT a runner_id is not a usable credential — it has no client_id', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(store.path, JSON.stringify({ base_url: 'https://x', oauth_client_secret: CLIENT_SECRET }), 0o600);
+    expect(() => store.load()).toThrow(ConfigError);
+  });
+
+  test('an EMPTY-string credential counts as absent, not as a credential', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(store.path, JSON.stringify({ base_url: 'https://x', runner_token: '', oauth_client_secret: '' }), 0o600);
+    expect(() => store.load()).toThrow(ConfigError);
+  });
+
+  test('a pre-P6 config (legacy token only) still loads unchanged', () => {
+    const store = new ConfigStore({ dir: 'cfg', fs: new MemFs() });
+    store.save(identity());
+    const loaded = store.load();
+    expect(loaded?.runner_token).toBe(TOKEN);
+    expect(loaded?.oauth_client_secret).toBeUndefined();
+  });
+
   test('writes with restrictive modes: dir 0o700, file 0o600', () => {
     const fs = new MemFs();
     const store = new ConfigStore({ dir: 'cfg', fs });
@@ -124,6 +175,34 @@ describe('describeIdentity (log-safe view)', () => {
     expect(JSON.stringify(safe)).not.toContain(TOKEN);
     expect(JSON.stringify(safe)).not.toContain(TOKEN.slice(0, 8));
     expect(safe.base_url).toBe('https://cp.example.com'); // everything else intact
+  });
+
+  // d5 (P6): the second credential gets the same treatment, and the check is
+  // written against SECRET_IDENTITY_FIELDS so a THIRD credential added later
+  // without redaction fails here instead of leaking on `pipeline-runner status`.
+  test('redacts every field named in SECRET_IDENTITY_FIELDS', () => {
+    const full = identity({ oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID });
+    const safe = describeIdentity(full);
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      expect(safe[field]).toBe(REDACTED);
+    }
+    expect(SECRET_IDENTITY_FIELDS).toContain('oauth_client_secret');
+  });
+
+  test('no secret value (or prefix) survives serialization', () => {
+    const serialized = JSON.stringify(describeIdentity(identity({ oauth_client_secret: CLIENT_SECRET })));
+    for (const secret of [TOKEN, CLIENT_SECRET]) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(secret.slice(0, 8));
+    }
+  });
+
+  test('an ABSENT secret stays absent rather than being reported as redacted', () => {
+    // `status` on a migrated runner must show truthfully that it holds no
+    // legacy token, not imply it is hiding one.
+    const safe = describeIdentity(identity({ runner_token: undefined, oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }));
+    expect(safe.runner_token).toBeUndefined();
+    expect(safe.oauth_client_secret).toBe(REDACTED);
   });
 });
 

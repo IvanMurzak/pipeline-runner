@@ -20,14 +20,21 @@ intend to register as a runner so `pipeline` resolves on PATH before running
 ## Usage
 
 ```sh
-# one-time: store identity + validate the token against the control plane
+# one-time: store identity + validate the credential against the control plane
 bun src/cli.ts register --url <base-url> --token <runner-token> \
     [--label repo:acme/api]... [--capacity 2] [--store-only]
+
+# ...or register with OAuth client credentials instead of a plaintext token
+bun src/cli.ts register --url <base-url> \
+    --client-id <runner-id> --client-secret <secret>
+
+# migrate an already-registered runner onto OAuth client credentials
+bun src/cli.ts set-credentials --client-id <runner-id> --client-secret <secret>
 
 # run the runner loop (connect, register, heartbeat, reconnect, accept jobs)
 bun src/cli.ts start
 
-# inspect the stored identity (token redacted)
+# inspect the stored identity (credentials redacted)
 bun src/cli.ts status
 
 # install/uninstall/status as a native OS service
@@ -39,12 +46,46 @@ bun src/cli.ts service <install|uninstall|status> [--dry-run]
 | Flag | Required | Meaning |
 |---|---|---|
 | `--url <base-url>` | yes | Control-plane base URL, e.g. `https://api.ai-pipeline.dev`. |
-| `--token <runner-token>` | yes | Scoped runner token issued by the control plane. |
+| `--token <runner-token>` | one of | Scoped runner token issued by the control plane. |
+| `--client-id <id>` + `--client-secret <s>` | one of | OAuth client credentials for this runner (see below). `--client-id` is the runner id. |
 | `--label <k:v>` | no, repeatable | Matchable label, e.g. `--label repo:acme/api`. `os:<detected>` is always added. |
 | `--capacity <n>` | no | Max parallel runs this runner accepts (positive integer). |
 | `--cli-version <v>` | no | Detected `pipeline` CLI version, for server-side compatibility checks. |
 | `--plugin-version <v>` | no | Detected `ai-pipeline` plugin version, or omit if not installed. |
 | `--store-only` | no | Store the identity but skip the one-time connect-and-validate step. |
+
+### Registering with OAuth client credentials
+
+A runner can register with a short-lived OAuth `runner:register` token instead
+of a plaintext long-lived runner token. The control plane issues the credential
+pair (`clientId` = the runner id, `clientSecret` shown once) when the runner is
+minted, or on demand from `POST /api/v1/runners/:id/oauth-credentials`. The
+runner then exchanges them at `POST /oauth/token`
+(`grant_type=client_credentials`, `scope=runner:register`) on every connect and
+puts the resulting token on the register frame.
+
+| Env var | Meaning |
+|---|---|
+| `PIPELINE_RUNNER_OAUTH_CLIENT_ID` | Alternative to `--client-id`. |
+| `PIPELINE_RUNNER_OAUTH_CLIENT_SECRET` | Alternative to `--client-secret` — keeps the secret out of argv and shell history. |
+
+**Nothing breaks if you do not do this.** A runner with no client secret keeps
+using its runner token, and the control plane keeps accepting it. Even a runner
+that *has* client credentials falls back to its runner token whenever the token
+exchange cannot complete — endpoint unreachable, credential refused, malformed
+response — so migrating can never leave a runner unable to register. Keep the
+runner token in the config until the control plane's
+`GET /api/v1/runners/credential-window` reports this runner clear; then remove
+it with `set-credentials --drop-token`.
+
+`set-credentials` flags:
+
+| Flag | Required | Meaning |
+|---|---|---|
+| `--client-id <id>` | yes | The runner id (the OAuth `client_id`). Env: `PIPELINE_RUNNER_OAUTH_CLIENT_ID`. |
+| `--client-secret <s>` | yes | The OAuth client secret. Env: `PIPELINE_RUNNER_OAUTH_CLIENT_SECRET`. |
+| `--drop-token` | no | Also remove the legacy runner token from the config. Removes the fallback — only do this once the credential-window report is clear. |
+| `--home <path>` | no | Which isolated runner home to migrate, when several runners share this host. |
 
 `service install` supports `--dry-run` to print the generated systemd
 unit / launchd plist / `sc.exe create` + `sc.exe failure` commands without

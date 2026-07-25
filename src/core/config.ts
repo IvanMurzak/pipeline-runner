@@ -1,19 +1,35 @@
 /**
  * Agent identity/config store.
  *
- * Persists the runner's identity — control-plane base URL, the runner_token
- * (a SECRET), the server-assigned runner_id, labels, capacity, and detected
+ * Persists the runner's identity — control-plane base URL, its credentials
+ * (SECRETS), the server-assigned runner_id, labels, capacity, and detected
  * environment versions — as JSON in an OS-appropriate user config dir:
  *
  *   - Windows: `%APPDATA%\pipeline-runner\config.json`
  *   - elsewhere: `$XDG_CONFIG_HOME/pipeline-runner/config.json`
  *     (falling back to `~/.config/pipeline-runner/config.json`)
  *
- * The token IS stored in the file (it is the agent's credential and must
+ * Credentials ARE stored in the file (they are the agent's credentials and must
  * survive restarts) but with restrictive permissions where the OS supports
  * them: dir 0o700, file 0o600 (POSIX; on Windows modes are a no-op and the
- * per-user %APPDATA% ACL is the protection). It must NEVER be logged — log
- * only `describeIdentity(...)`, which replaces it with `<redacted>`.
+ * per-user %APPDATA% ACL is the protection). They must NEVER be logged — log
+ * only `describeIdentity(...)`, which replaces every field named in
+ * `SECRET_IDENTITY_FIELDS` with `<redacted>`.
+ *
+ * department-mesh d5 (P6, `13-mcp-authorization.md` §10.2): a runner may now
+ * hold EITHER credential, or both:
+ *
+ *   - `runner_token` — the legacy plaintext long-lived registration secret,
+ *     the only thing every deployed runner has today;
+ *   - `oauth_client_secret` — the DISTINCT OAuth client secret issued by
+ *     `POST /api/v1/runners/:id/oauth-credentials`, which (with `runner_id` as
+ *     the client id) buys short-lived `runner:register` and `mesh:execution`
+ *     tokens from `POST /oauth/token`.
+ *
+ * A migrated runner therefore no longer needs `runner_token` at all, which is
+ * why it is optional below. `load()` still refuses a config carrying NEITHER
+ * usable credential — that is an unregisterable identity, and failing at load
+ * with an actionable message beats failing on the wire.
  *
  * Import-inert: importing this module touches nothing on disk; the storage
  * path and the filesystem are both injectable so tests never see the real
@@ -53,8 +69,16 @@ export function resolveHome(env: Record<string, string | undefined> = process.en
   return home !== undefined && home.trim().length > 0 ? home : null;
 }
 
-/** The placeholder `describeIdentity` substitutes for the runner token. */
+/** The placeholder `describeIdentity` substitutes for every secret field. */
 export const REDACTED = '<redacted>';
+
+/**
+ * EVERY secret an `AgentIdentity` can carry. `describeIdentity` redacts exactly
+ * this list, and `tests/config.test.ts` asserts the list is exhaustive against
+ * a fully-populated identity — so adding a credential field without redacting
+ * it fails the suite rather than leaking on the next `pipeline-runner status`.
+ */
+export const SECRET_IDENTITY_FIELDS = ['runner_token', 'oauth_client_secret'] as const;
 
 /** Directory mode for the config dir (POSIX; ignored on Windows). */
 export const CONFIG_DIR_MODE = 0o700;
@@ -68,9 +92,27 @@ export const CONFIG_FILE_MODE = 0o600;
 export interface AgentIdentity {
   /** Control-plane base URL, e.g. `https://pipeline.example.com`. */
   base_url: string;
-  /** Scoped runner token — SECRET. Never log; redact via `describeIdentity`. */
-  runner_token: string;
-  /** Server-assigned stable id, persisted from `register_ack`. */
+  /**
+   * The LEGACY plaintext long-lived runner token — SECRET. Never log; redact
+   * via `describeIdentity`.
+   *
+   * d5 (P6): optional. A migrated runner holding `oauth_client_secret` +
+   * `runner_id` does not need it, and once the operator retires the legacy
+   * credential server-side it should be removed from the file. Every runner
+   * deployed before P6 still has one, and keeps using it — the cloud
+   * dual-accepts (c15) — so it is optional, never deprecated-and-ignored.
+   */
+  runner_token?: string;
+  /**
+   * The DISTINCT OAuth client secret (d5 / c15) — SECRET. Issued once by
+   * `POST /api/v1/runners/:id/oauth-credentials` (or at mint) and stored by
+   * `pipeline-runner register --client-secret` / `set-credentials`. Paired with
+   * `runner_id` as the OAuth `client_id`.
+   */
+  oauth_client_secret?: string;
+  /** Server-assigned stable id, persisted from `register_ack`. ALSO the OAuth
+   *  `client_id` for `oauth_client_secret` above (the cloud uses the runner row
+   *  id for both). */
   runner_id?: string;
   /** Matchable labels advertised on register. */
   labels: string[];
@@ -94,6 +136,12 @@ export interface AgentIdentity {
 }
 
 export class ConfigError extends Error {}
+
+/** A present, non-empty string, or undefined — the shape every optional
+ *  credential/id field is narrowed to on load. */
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
 
 /** Minimal injectable filesystem — tests use an in-memory implementation. */
 export interface ConfigFileSystem {
@@ -164,12 +212,20 @@ export function detectOs(platform: string = process.platform): string {
 }
 
 /**
- * A log-safe view of the identity: the runner token replaced with
- * `<redacted>` (whole-token — no prefix leaks). THIS is what may be logged
- * or printed; the raw identity never is.
+ * A log-safe view of the identity: every field in `SECRET_IDENTITY_FIELDS`
+ * replaced with `<redacted>` (whole value — no prefix leaks). THIS is what may
+ * be logged or printed; the raw identity never is.
+ *
+ * A secret that is ABSENT stays absent rather than becoming `<redacted>` — so
+ * `pipeline-runner status` on a migrated runner truthfully shows it holds no
+ * legacy token, instead of implying it is hiding one.
  */
 export function describeIdentity(identity: AgentIdentity): Record<string, unknown> {
-  return { ...identity, runner_token: REDACTED };
+  const safe: Record<string, unknown> = { ...identity };
+  for (const field of SECRET_IDENTITY_FIELDS) {
+    if (safe[field] !== undefined) safe[field] = REDACTED;
+  }
+  return safe;
 }
 
 export interface ConfigStoreOptions {
@@ -217,15 +273,25 @@ export class ConfigStore {
     if (typeof record.base_url !== 'string' || record.base_url.length === 0) {
       throw new ConfigError(`config file is missing base_url: ${this.path}`);
     }
-    if (typeof record.runner_token !== 'string' || record.runner_token.length === 0) {
-      throw new ConfigError(`config file is missing runner_token: ${this.path}`);
+    const runnerToken = nonEmptyString(record.runner_token);
+    const clientSecret = nonEmptyString(record.oauth_client_secret);
+    const runnerId = nonEmptyString(record.runner_id);
+    // d5 (P6): EITHER credential is enough. The OAuth pair needs `runner_id`
+    // too — it is the `client_id` half — so a client secret without one cannot
+    // register and does not count. Refusing here (rather than on the wire)
+    // keeps the message actionable.
+    if (runnerToken === undefined && (clientSecret === undefined || runnerId === undefined)) {
+      throw new ConfigError(
+        `config file has no usable credential: needs runner_token, or oauth_client_secret + runner_id: ${this.path}`
+      );
     }
     return {
       // Tolerant load: unknown extra fields are dropped on the next save, but
       // the fields we own are defaulted so an older file still loads.
       base_url: record.base_url,
-      runner_token: record.runner_token,
-      runner_id: typeof record.runner_id === 'string' ? record.runner_id : undefined,
+      runner_token: runnerToken,
+      oauth_client_secret: clientSecret,
+      runner_id: runnerId,
       labels: Array.isArray(record.labels) ? record.labels.filter((l): l is string => typeof l === 'string') : [],
       capacity: typeof record.capacity === 'number' ? record.capacity : undefined,
       os: typeof record.os === 'string' ? record.os : detectOs(),
