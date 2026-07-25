@@ -40,6 +40,28 @@ describe('buildRegisterFrame', () => {
     expect(buildRegisterFrame(identity(), 'x').protocol_version).toBe(1);
   });
 
+  // department-mesh d5 (P6, 13 §10.2): the SAME wire field carries either
+  // credential class — no protocol change, the cloud classifies what arrived.
+  describe('P6 credential (d5)', () => {
+    test('an explicit credential replaces the legacy token on the frame', () => {
+      const frame = buildRegisterFrame(identity(), 'x', 'hdr.pld.sig');
+      expect(frame.runner_token).toBe('hdr.pld.sig');
+    });
+
+    test('a migrated identity with no legacy token registers with the supplied credential', () => {
+      const frame = buildRegisterFrame(identity({ runner_token: undefined }), 'x', 'hdr.pld.sig');
+      expect(frame.runner_token).toBe('hdr.pld.sig');
+    });
+
+    test('omitting the credential keeps the pre-P6 behaviour exactly', () => {
+      expect(buildRegisterFrame(identity(), 'x').runner_token).toBe(TOKEN);
+    });
+
+    test('throws when there is nothing at all to present (ConfigStore.load refuses this upstream)', () => {
+      expect(() => buildRegisterFrame(identity({ runner_token: undefined }), 'x')).toThrow('no register credential');
+    });
+  });
+
   test('omits capacity when unset; plugin_version defaults to null', () => {
     const frame = buildRegisterFrame(identity(), 'x');
     expect('capacity' in frame).toBe(false);

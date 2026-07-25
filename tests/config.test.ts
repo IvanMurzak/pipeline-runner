@@ -13,11 +13,16 @@ import {
   PIPELINE_RUNNER_HOME_ENV,
   REDACTED,
   resolveHome,
+  SECRET_IDENTITY_FIELDS,
   type AgentIdentity,
 } from '../src/core/config';
 import { MemFs } from './_helpers';
 
 const TOKEN = 'rt_super-secret-token-9f8e7d';
+/** d5 (P6): the DISTINCT OAuth client secret (c15) — a second credential the
+ *  identity may carry, and a second thing that must never be logged. */
+const CLIENT_SECRET = 'rcs_distinct-client-secret-1a2b3c';
+const RUNNER_ID = 'run_9c1f';
 
 function identity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
   return {
@@ -76,6 +81,52 @@ describe('ConfigStore', () => {
     expect(() => store.load()).toThrow(ConfigError);
   });
 
+  // ── department-mesh d5 (P6, 13 §10.2): a runner may hold EITHER credential ──
+
+  test('save → load round-trips the OAuth client secret alongside the legacy token', () => {
+    const store = new ConfigStore({ dir: 'cfg', fs: new MemFs() });
+    store.save(identity({ oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }));
+    const loaded = store.load();
+    expect(loaded?.oauth_client_secret).toBe(CLIENT_SECRET);
+    expect(loaded?.runner_id).toBe(RUNNER_ID);
+    expect(loaded?.runner_token).toBe(TOKEN);
+  });
+
+  test('a MIGRATED identity loads with no runner_token at all (DoD: no longer required)', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(
+      store.path,
+      JSON.stringify({ base_url: 'https://x', oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }),
+      0o600
+    );
+    const loaded = store.load();
+    expect(loaded?.runner_token).toBeUndefined();
+    expect(loaded?.oauth_client_secret).toBe(CLIENT_SECRET);
+  });
+
+  test('a client secret WITHOUT a runner_id is not a usable credential — it has no client_id', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(store.path, JSON.stringify({ base_url: 'https://x', oauth_client_secret: CLIENT_SECRET }), 0o600);
+    expect(() => store.load()).toThrow(ConfigError);
+  });
+
+  test('an EMPTY-string credential counts as absent, not as a credential', () => {
+    const fs = new MemFs();
+    const store = new ConfigStore({ dir: 'cfg', fs });
+    fs.writeFileText(store.path, JSON.stringify({ base_url: 'https://x', runner_token: '', oauth_client_secret: '' }), 0o600);
+    expect(() => store.load()).toThrow(ConfigError);
+  });
+
+  test('a pre-P6 config (legacy token only) still loads unchanged', () => {
+    const store = new ConfigStore({ dir: 'cfg', fs: new MemFs() });
+    store.save(identity());
+    const loaded = store.load();
+    expect(loaded?.runner_token).toBe(TOKEN);
+    expect(loaded?.oauth_client_secret).toBeUndefined();
+  });
+
   test('writes with restrictive modes: dir 0o700, file 0o600', () => {
     const fs = new MemFs();
     const store = new ConfigStore({ dir: 'cfg', fs });
@@ -124,6 +175,90 @@ describe('describeIdentity (log-safe view)', () => {
     expect(JSON.stringify(safe)).not.toContain(TOKEN);
     expect(JSON.stringify(safe)).not.toContain(TOKEN.slice(0, 8));
     expect(safe.base_url).toBe('https://cp.example.com'); // everything else intact
+  });
+
+  // d5 (P6): the second credential gets the same treatment. Iterating
+  // SECRET_IDENTITY_FIELDS alone would NOT be a guarantee — a new credential
+  // field added without touching the list keeps every such assertion green
+  // while `status` prints it in the clear. So the fixture below is typed
+  // `Required<AgentIdentity>` (adding any field to the interface fails `tsc`
+  // until it is named here) and the test then insists every key of that
+  // fixture is classified as either a secret or explicitly non-secret.
+  const NON_SECRET_IDENTITY_FIELDS = [
+    'base_url',
+    'runner_id',
+    'labels',
+    'capacity',
+    'os',
+    'agent_version',
+    'cli_version',
+    'plugin_version',
+    'heartbeat_interval_s',
+    'capabilities',
+  ] as const;
+
+  const fullyPopulated: Required<AgentIdentity> = {
+    base_url: 'https://cp.example.com',
+    runner_token: TOKEN,
+    oauth_client_secret: CLIENT_SECRET,
+    runner_id: RUNNER_ID,
+    labels: ['os:windows'],
+    capacity: 2,
+    os: 'windows',
+    agent_version: AGENT_VERSION,
+    cli_version: '1.2.3',
+    plugin_version: null,
+    heartbeat_interval_s: 30,
+    capabilities: { isolation: ['process'], gpu: false, os: 'windows', resources: { cpu_count: 8, total_memory_mb: 16384 } },
+  };
+
+  test('every field of a fully-populated identity is classified secret or non-secret', () => {
+    const classified = new Set<string>([...SECRET_IDENTITY_FIELDS, ...NON_SECRET_IDENTITY_FIELDS]);
+    const unclassified = Object.keys(fullyPopulated).filter((key) => !classified.has(key));
+    // A new AgentIdentity field lands here. If it holds a credential it must be
+    // added to SECRET_IDENTITY_FIELDS; if not, to the allowlist above — but it
+    // cannot be silently forgotten and then printed by `status`.
+    expect(unclassified).toEqual([]);
+    // …and the allowlist cannot be used to smuggle a known secret out.
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      expect(NON_SECRET_IDENTITY_FIELDS as readonly string[]).not.toContain(field);
+    }
+  });
+
+  test('redacts every field named in SECRET_IDENTITY_FIELDS, and nothing else', () => {
+    const safe = describeIdentity(fullyPopulated);
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      expect(safe[field]).toBe(REDACTED);
+    }
+    for (const field of NON_SECRET_IDENTITY_FIELDS) {
+      expect(safe[field]).toEqual(fullyPopulated[field]); // untouched
+    }
+  });
+
+  test('no value of any secret field survives serialization of the full identity', () => {
+    const serialized = JSON.stringify(describeIdentity(fullyPopulated));
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      const secret = fullyPopulated[field];
+      expect(typeof secret).toBe('string');
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(secret.slice(0, 8));
+    }
+  });
+
+  test('no secret value (or prefix) survives serialization', () => {
+    const serialized = JSON.stringify(describeIdentity(identity({ oauth_client_secret: CLIENT_SECRET })));
+    for (const secret of [TOKEN, CLIENT_SECRET]) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(secret.slice(0, 8));
+    }
+  });
+
+  test('an ABSENT secret stays absent rather than being reported as redacted', () => {
+    // `status` on a migrated runner must show truthfully that it holds no
+    // legacy token, not imply it is hiding one.
+    const safe = describeIdentity(identity({ runner_token: undefined, oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID }));
+    expect(safe.runner_token).toBeUndefined();
+    expect(safe.oauth_client_secret).toBe(REDACTED);
   });
 });
 

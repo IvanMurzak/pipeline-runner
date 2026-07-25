@@ -3,16 +3,28 @@
  * `pipeline-runner` CLI — a THIN wrapper over `src/core/`; all logic lives (and
  * is tested) there. Subcommands:
  *
- *   register --url <base-url> --token <runner-token> [--label <l>]...
+ *   register --url <base-url> [--token <runner-token>]
+ *            [--client-id <id> --client-secret <secret>] [--label <l>]...
  *            [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]
  *            [--gpu] [--container] [--store-only]
  *       Store the agent identity, then (unless --store-only) connect once to
- *       validate the token and persist the server-assigned runner id.
+ *       validate the credential and persist the server-assigned runner id.
  *       Also captures this instance's D17 capability advertisement
  *       (isolation/gpu/os/resource hints, `./core/capabilities.ts`). `--gpu`
  *       is operator-declared; `--container` is VERIFIED (a live docker probe,
  *       `./department/container.ts`'s `probeContainerRuntimeAvailable`)
  *       before the `container` isolation tier is ever advertised (D17 R14).
+ *
+ *   set-credentials --client-id <id> --client-secret <secret> [--drop-token]
+ *                   [--home <path>]
+ *       department-mesh d5 (P6): install this runner's OAuth client
+ *       credentials onto the EXISTING identity, so the next register presents
+ *       a short-lived `runner:register` token instead of the plaintext
+ *       long-lived one (`13-mcp-authorization.md` §10.2). The values come from
+ *       `POST /api/v1/runners/:id/oauth-credentials` (shown once). The legacy
+ *       token is KEPT as the fallback that guarantees this runner can still
+ *       register; `--drop-token` removes it, which an operator should do only
+ *       after the cloud's `/api/v1/runners/credential-window` says it is safe.
  *
  *   start [--home <path>]
  *       Run the agent loop: connect, register, heartbeat, reconnect. Acquires
@@ -36,6 +48,10 @@ import { AgentClient } from './core/connection';
 // `shipper/fs.ts` themselves).
 import { acquireHomeLock, HomeLockError, type HomeLockHandle, PIPELINE_RUNNER_HOME_ENV, resolveLockHomeDir, resolveWorkspaceRoot } from './core/home';
 import { consoleLogger } from './core/log';
+// department-mesh d5 (P6, 13 §10.2): which credential registers this runner,
+// and which secret authenticates it as an OAuth client. See
+// `./core/register-credential.ts` — the connection wires the provider itself.
+import { carryForwardLegacyToken, selectClientSecret, storeOAuthClientCredentials } from './core/register-credential';
 import { defaultTransports } from './core/transport';
 import type { RunnerStatus } from './core/wire';
 import { defaultDataDir, nodeShipperFs } from './shipper/fs';
@@ -75,10 +91,10 @@ import { parseDepartmentRuntimesEnv } from './department/config';
 import { ContainerAdapter, probeContainerRuntimeAvailable } from './department/container';
 // department-mesh d6 (13-mcp-authorization.md §12): the runner's confidential
 // OAuth client — obtains/caches execution-scoped tokens via
-// `client_credentials`, reusing the EXISTING runner_id/runner_token as the
-// OAuth client_id/client_secret (no new credential). Wired into
-// `DepartmentManager` below so every (re)spawn can point a model-driven
-// runtime at `<base_url>/mcp` with a live token (07 §4).
+// `client_credentials`, authenticating with `runner_id` as the client_id and
+// (d5/c15) the DISTINCT `oauth_client_secret` when this runner has one, else
+// its legacy token. Wired into `DepartmentManager` below so every (re)spawn can
+// point a model-driven runtime at `<base_url>/mcp` with a live token (07 §4).
 import { ExecutionTokenManager } from './department/execution-token-manager';
 import { JsonlProcessAdapter } from './department/jsonl-process';
 import { DepartmentManager, nodeJournalWriter } from './department/manager';
@@ -93,6 +109,20 @@ import { PipelineDriveAdapter } from './department/pipeline-drive';
 
 const REGISTER_ONCE_TIMEOUT_MS = 30_000;
 
+/**
+ * d5: env fallbacks for the OAuth client secret, so the one long-lived secret
+ * P6 introduces need not sit in argv (world-readable in `ps` on Linux) or in
+ * shell history. The flag still works; the env var is simply the better habit
+ * and costs nothing to offer.
+ */
+const CLIENT_SECRET_ENV = 'PIPELINE_RUNNER_OAUTH_CLIENT_SECRET';
+const CLIENT_ID_ENV = 'PIPELINE_RUNNER_OAUTH_CLIENT_ID';
+
+function envValue(name: string): string | undefined {
+  const raw = process.env[name];
+  return raw !== undefined && raw.trim().length > 0 ? raw.trim() : undefined;
+}
+
 function fail(message: string): never {
   console.error(`[pipeline-runner] error: ${message}`);
   process.exit(1);
@@ -103,12 +133,17 @@ function usage(): never {
     [
       'usage: pipeline-runner <command>',
       '',
-      '  register --url <base-url> --token <runner-token> [--label <l>]...',
+      '  register --url <base-url> [--token <runner-token>]',
+      '           [--client-id <id>] [--client-secret <secret>] [--label <l>]...',
       '           [--capacity <n>] [--cli-version <v>] [--plugin-version <v>]',
       '           [--gpu] [--container] [--store-only]',
+      '  set-credentials --client-id <id> --client-secret <secret> [--drop-token] [--home <path>]',
       '  start [--home <path>]',
       '  status',
       '  service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
+      '',
+      `  ${CLIENT_ID_ENV} / ${CLIENT_SECRET_ENV} may supply the OAuth client`,
+      '  credentials instead of the flags (keeps the secret out of argv).',
       '',
       `pipeline-runner ${AGENT_VERSION} (protocol v1)`,
     ].join('\n')
@@ -122,6 +157,8 @@ async function runRegister(argv: string[]): Promise<void> {
     options: {
       url: { type: 'string' },
       token: { type: 'string' },
+      'client-id': { type: 'string' },
+      'client-secret': { type: 'string' },
       label: { type: 'string', multiple: true },
       capacity: { type: 'string' },
       'cli-version': { type: 'string' },
@@ -132,7 +169,35 @@ async function runRegister(argv: string[]): Promise<void> {
     },
   });
   if (!values.url) fail('--url <base-url> is required');
-  if (!values.token) fail('--token <runner-token> is required');
+  // d5 (P6): EITHER credential registers this runner. The legacy token is no
+  // longer required for a runner that was given OAuth client credentials — the
+  // whole point of P6 — but it is still accepted, because that is what every
+  // deployed runner has and the cloud dual-accepts it (c15).
+  //
+  // The env vars are consulted ONLY when the operator asked for the OAuth path
+  // on the command line (either flag present). Otherwise a plain
+  // `register --token X` in a shell that happens to export
+  // PIPELINE_RUNNER_OAUTH_* would silently attach credentials nobody asked
+  // for. `set-credentials`, whose whole purpose is installing them, keeps the
+  // unconditional fallback.
+  const oauthRequested = values['client-id'] !== undefined || values['client-secret'] !== undefined;
+  const clientId = values['client-id'] ?? (oauthRequested ? envValue(CLIENT_ID_ENV) : undefined);
+  const clientSecret = values['client-secret'] ?? (oauthRequested ? envValue(CLIENT_SECRET_ENV) : undefined);
+  if (oauthRequested) {
+    // Say out loud which half came from the environment — a credential picked
+    // up invisibly is a credential nobody audits.
+    if (values['client-id'] === undefined && clientId !== undefined) console.log(`[pipeline-runner] client id from ${CLIENT_ID_ENV}`);
+    if (values['client-secret'] === undefined && clientSecret !== undefined) console.log(`[pipeline-runner] client secret from ${CLIENT_SECRET_ENV}`);
+  }
+  if (clientSecret !== undefined && clientId === undefined) {
+    fail(`--client-id <id> is required with --client-secret (or set ${CLIENT_ID_ENV}); it is the runner id shown when the credential was issued`);
+  }
+  if (clientId !== undefined && clientSecret === undefined) {
+    fail(`--client-secret <secret> is required with --client-id (or set ${CLIENT_SECRET_ENV})`);
+  }
+  if (!values.token && clientSecret === undefined) {
+    fail(`--token <runner-token>, or --client-id + --client-secret (or ${CLIENT_ID_ENV}/${CLIENT_SECRET_ENV}), is required`);
+  }
   const capacity = values.capacity !== undefined ? Number(values.capacity) : undefined;
   if (capacity !== undefined && (!Number.isInteger(capacity) || capacity <= 0)) {
     fail('--capacity must be a positive integer');
@@ -159,7 +224,11 @@ async function runRegister(argv: string[]): Promise<void> {
 
   const identity: AgentIdentity = {
     base_url: values.url,
-    runner_token: values.token,
+    ...(values.token !== undefined ? { runner_token: values.token } : {}),
+    // d5: `client_id` IS the runner id by the cloud's own construction
+    // (`POST /api/v1/runners` returns `clientId: row.id`), so storing it as
+    // `runner_id` is the same value the register ack will confirm.
+    ...(clientSecret !== undefined ? { oauth_client_secret: clientSecret, runner_id: clientId } : {}),
     labels: [`os:${detectOs()}`, ...(values.label ?? [])],
     capacity,
     os: detectOs(),
@@ -175,8 +244,31 @@ async function runRegister(argv: string[]): Promise<void> {
     capabilities: detectCapabilities({ gpu: values.gpu === true, isolation }),
   };
   const store = new ConfigStore();
-  store.save(identity);
+  // d5 (P6): `register` overwrites the config wholesale, so migrating a LIVE
+  // runner with `--client-id/--client-secret` (and no `--token`) would
+  // otherwise delete the legacy fallback silently. Carry it forward and say so;
+  // removing it stays the explicit act it is in `set-credentials --drop-token`.
+  let previous: AgentIdentity | null = null;
+  try {
+    previous = store.load();
+  } catch {
+    previous = null; // an unreadable/incomplete old config is not a fallback
+  }
+  const { identity: toStore, carried } = carryForwardLegacyToken(previous, identity);
+  store.save(toStore);
   console.log(`[pipeline-runner] identity stored at ${store.path}`);
+  if (carried) {
+    console.log(
+      '[pipeline-runner] kept the existing legacy runner token as a fallback — remove it with ' +
+        '`pipeline-runner set-credentials --drop-token` once the control plane reports this runner clear.'
+    );
+  } else if (toStore.runner_token === undefined) {
+    console.warn(
+      '[pipeline-runner] warn: this identity has NO legacy runner token. If the OAuth token exchange fails, ' +
+        'this runner has nothing to fall back on and will retry with backoff until it succeeds. Pass --token ' +
+        'as well to keep a fallback.'
+    );
+  }
   if (values['store-only']) return;
 
   console.log('[pipeline-runner] connecting to validate registration...');
@@ -190,7 +282,7 @@ async function runRegister(argv: string[]): Promise<void> {
   });
   const client = new AgentClient({
     store,
-    transports: defaultTransports(identity.base_url, consoleLogger),
+    transports: defaultTransports(toStore.base_url, consoleLogger),
     logger: consoleLogger,
     events: {
       onOnline: () => settle('online'),
@@ -208,6 +300,55 @@ async function runRegister(argv: string[]): Promise<void> {
   } else {
     fail('could not reach the control plane within 30s — identity stored; run `pipeline-runner start` to retry');
   }
+}
+
+/**
+ * department-mesh d5 (P6): install (or replace) this runner's OAuth client
+ * credentials on an ALREADY-REGISTERED identity — "migrate on re-registration,
+ * never a flag day" (`11-migration-rollout.md` P6, R11). The next connect
+ * exchanges them for a short-lived `runner:register` token and stops putting a
+ * plaintext long-lived secret on the wire.
+ *
+ * The legacy token stays put unless `--drop-token` is passed: while it is
+ * there, ANY failure of the OAuth path (endpoint down, secret wrong, window
+ * mis-configured) degrades to a working registration instead of an outage.
+ */
+function runSetCredentials(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      'client-id': { type: 'string' },
+      'client-secret': { type: 'string' },
+      'drop-token': { type: 'boolean' },
+      home: { type: 'string' },
+    },
+  });
+  // d7 (D17): same idiom as `runStart` — a host running several isolated
+  // runners must be able to name WHICH one is being migrated.
+  if (values.home) process.env[PIPELINE_RUNNER_HOME_ENV] = values.home;
+  const clientId = values['client-id'] ?? envValue(CLIENT_ID_ENV);
+  const clientSecret = values['client-secret'] ?? envValue(CLIENT_SECRET_ENV);
+  if (!clientId) fail(`--client-id <id> is required (or set ${CLIENT_ID_ENV})`);
+  if (!clientSecret) fail(`--client-secret <secret> is required (or set ${CLIENT_SECRET_ENV})`);
+
+  const store = new ConfigStore();
+  if (store.load() === null) fail('no agent identity configured — run `pipeline-runner register` first');
+  storeOAuthClientCredentials(store, { clientId, clientSecret });
+  console.log(`[pipeline-runner] OAuth client credentials stored at ${store.path} (client_id ${clientId})`);
+
+  if (values['drop-token'] === true) {
+    store.update({ runner_token: undefined });
+    console.warn(
+      '[pipeline-runner] warn: the legacy runner token has been REMOVED from this config. This runner can no ' +
+        'longer fall back to it if the OAuth path fails — re-run `register --token ...` to restore one.'
+    );
+  } else {
+    console.log(
+      '[pipeline-runner] the legacy runner token is kept as a fallback. Remove it with --drop-token once ' +
+        'GET /api/v1/runners/credential-window reports this runner clear.'
+    );
+  }
+  console.log('[pipeline-runner] restart the runner for the change to take effect.');
 }
 
 function runStart(argv: string[] = []): void {
@@ -385,10 +526,19 @@ function runStart(argv: string[] = []): void {
   // `register_ack` still works once `store.load()` starts returning a
   // `runner_id` (the OAuth client_id) and reflects a later `register`
   // (client_secret rotation) without reconstruction.
+  // d5 (P6 / c15): the client secret is the DISTINCT `oauth_client_secret` when
+  // this runner has one, falling back to the legacy token when it does not —
+  // `selectClientSecret` is the one place that ordering lives, shared with the
+  // register path, so both token kinds migrate together. d6 hard-wired the
+  // legacy token here; c15 issued a separate secret precisely so the legacy
+  // credential could retire independently.
   const executionTokens = new ExecutionTokenManager({
     baseUrl: () => store.load()?.base_url ?? null,
     clientId: () => store.load()?.runner_id ?? null,
-    clientSecret: () => store.load()?.runner_token ?? null,
+    clientSecret: () => {
+      const current = store.load();
+      return current === null ? null : selectClientSecret(current);
+    },
     logger: consoleLogger,
   });
   departmentManager = new DepartmentManager({
@@ -460,6 +610,9 @@ const [command, ...rest] = process.argv.slice(2);
 switch (command) {
   case 'register':
     await runRegister(rest);
+    break;
+  case 'set-credentials':
+    runSetCredentials(rest);
     break;
   case 'start':
     runStart(rest);

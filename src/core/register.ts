@@ -14,6 +14,14 @@
  * `capabilities` (`./capabilities.ts`) when present — see that module's
  * PROTOCOL FOLLOW-UP note for why it rides the frame's additive
  * `.passthrough()` rather than a typed schema field.
+ *
+ * department-mesh d5 (P6, `13-mcp-authorization.md` §10.2): the frame's
+ * `runner_token` field now carries EITHER credential class — a short-lived
+ * `runner:register` JWT for a migrated runner, or the legacy plaintext token
+ * for one that has not migrated. **No protocol change is involved**: the wire
+ * field is `z.string().min(1)` and the cloud classifies what arrived
+ * (`cloud/apps/api/src/modules/gateway/register-credential.ts`). Choosing
+ * between the two is `./register-credential.ts`'s job, not this module's.
  */
 
 import type { AgentIdentity } from './config';
@@ -24,12 +32,21 @@ import { PROTOCOL_VERSION } from './wire';
 /**
  * Build the `register` frame — the FIRST frame on every connection. `id` is
  * the correlation id echoed by the reply.
+ *
+ * `credential` is the value for the frame's `runner_token` field (d5). Omitted
+ * ⇒ the identity's legacy `runner_token`, which is the pre-P6 behaviour and the
+ * shape every existing caller/test uses. It throws only when there is nothing
+ * at all to present, which `ConfigStore.load()` already rejects upstream.
  */
-export function buildRegisterFrame(identity: AgentIdentity, id: string): RegisterMessage {
+export function buildRegisterFrame(identity: AgentIdentity, id: string, credential?: string): RegisterMessage {
+  const runnerToken = credential ?? identity.runner_token;
+  if (runnerToken === undefined || runnerToken.length === 0) {
+    throw new Error('cannot build a register frame: no register credential available');
+  }
   const frame: RegisterMessage = {
     type: 'register',
     id,
-    runner_token: identity.runner_token,
+    runner_token: runnerToken,
     labels: identity.labels,
     os: identity.os,
     agent_version: identity.agent_version,
@@ -67,11 +84,19 @@ export function describeReject(reject: RegisterRejectMessage): string {
   const detail = reject.message ? ` (server: ${reject.message})` : '';
   switch (reject.reason) {
     case 'upgrade_required': {
+      // d5 (P6): the cloud reuses this reason for a RETIRED legacy credential
+      // as well as a protocol mismatch (c15's `register-credential.ts`), and
+      // the two have opposite fixes. The server's `message` says which; naming
+      // both here means an operator is never left guessing when it does not.
       const min = reject.min_protocol_version !== undefined ? `v${reject.min_protocol_version}` : 'a newer protocol';
-      return `update the agent (server requires protocol ${min}; this agent speaks v${PROTOCOL_VERSION})${detail}`;
+      return (
+        `update the agent (server requires protocol ${min}; this agent speaks v${PROTOCOL_VERSION})` +
+        ` — or, if this runner's legacy token has been retired, install its OAuth client secret with` +
+        ` \`pipeline-runner set-credentials\`${detail}`
+      );
     }
     case 'invalid_token':
-      return `runner token was not accepted — check the token and re-run \`pipeline-runner register\`${detail}`;
+      return `runner credential was not accepted — check the credential and re-run \`pipeline-runner register\`${detail}`;
     case 'revoked':
       return `runner token has been revoked — issue a new token from the control plane and re-register${detail}`;
     case 'capacity':

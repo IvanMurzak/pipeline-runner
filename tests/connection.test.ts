@@ -1,10 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import { ConfigStore, type AgentIdentity } from '../src/core/config';
 import { AgentClient, type AgentClientOptions } from '../src/core/connection';
+import type { ClientCredentialsResult } from '../src/core/mesh-oauth';
+import { RegisterCredentialProvider } from '../src/core/register-credential';
 import type { Transport } from '../src/core/transport';
 import { CaptureLogger, FakeClock, MemFs, MockTransport, tick } from './_helpers';
 
 const TOKEN = 'rt_hyper-secret-token-31337';
+/** d5 (P6): the DISTINCT OAuth client secret and the short-lived
+ *  `runner:register` token it buys. Both are secrets; neither may be logged. */
+const CLIENT_SECRET = 'rcs_distinct-client-secret-77';
+const REGISTER_JWT = 'hdr.pld.sig-registration-token';
+const RUNNER_ID = 'run_r-1';
 
 function identity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
   return {
@@ -355,6 +362,286 @@ describe('heartbeat composition (c2 — job manager truth)', () => {
   });
 });
 
+// ── department-mesh d5 (P6): which credential the register frame carries ─────
+
+/** A migrated runner: distinct client secret + the runner id that is its
+ *  OAuth `client_id`. */
+function migratedIdentity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
+  return identity({ oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID, ...overrides });
+}
+
+function providerReturning(result: ClientCredentialsResult, clock?: FakeClock, logger?: CaptureLogger): RegisterCredentialProvider {
+  return new RegisterCredentialProvider({
+    requestToken: async () => result,
+    ...(clock !== undefined ? { clock } : {}),
+    ...(logger !== undefined ? { logger } : {}),
+  });
+}
+
+const issuedToken: ClientCredentialsResult = {
+  ok: true,
+  token: { accessToken: REGISTER_JWT, tokenType: 'Bearer', expiresAt: 900_000, scope: 'runner:register' },
+};
+
+describe('d5 — register credential selection over the connection', () => {
+  test('a MIGRATED runner registers with the runner:register token, not the plaintext one', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    world.client.start();
+    await tick();
+    const frame = world.wss.last.sent[0]!;
+    expect(frame.type).toBe('register');
+    expect(frame.runner_token).toBe(REGISTER_JWT);
+    expect(frame.runner_token).not.toBe(TOKEN);
+  });
+
+  test('a MIGRATED runner with NO plaintext token in its config still registers (DoD 1)', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity({ runner_token: undefined }),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    await goOnline(world);
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT);
+    expect(world.store.load()?.runner_token).toBeUndefined();
+  });
+
+  test('an UN-UPGRADED runner registers with its legacy token, with no token-endpoint call (DoD 2)', async () => {
+    let calls = 0;
+    const world = makeWorld({
+      clientOverrides: {
+        registerCredentials: new RegisterCredentialProvider({
+          requestToken: async () => {
+            calls += 1;
+            return issuedToken;
+          },
+        }),
+      },
+    });
+    await goOnline(world);
+    expect(world.wss.last.sent[0]!.runner_token).toBe(TOKEN);
+    expect(calls).toBe(0);
+  });
+
+  test('an un-migrated runner sends register in the SAME turn the socket opened — a hung token endpoint cannot delay it', async () => {
+    // A never-settling exchange: the migrated client is still waiting for its
+    // credential while the un-migrated one has already registered.
+    const pending = new RegisterCredentialProvider({ requestToken: () => new Promise<ClientCredentialsResult>(() => {}) });
+    const blocked = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: pending } });
+    const plain = makeWorld();
+
+    blocked.client.start();
+    plain.client.start();
+    await tick();
+
+    expect(plain.wss.last.sent).toHaveLength(1);
+    expect(blocked.wss.last.sent).toHaveLength(0);
+    expect(blocked.client.state).toBe('registering');
+  });
+
+  test('a hung token exchange drops the connection on the register timeout and backs off — it never wedges', async () => {
+    const pending = new RegisterCredentialProvider({ requestToken: () => new Promise<ClientCredentialsResult>(() => {}) });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: pending } });
+    world.client.start();
+    await tick();
+    world.clock.advance(10_000); // DEFAULT_REGISTER_TIMEOUT_MS
+    await tick();
+    expect(world.logger.joined()).toContain('register timed out');
+    expect(world.client.state).toBe('backoff');
+  });
+
+  test('R11: when the token endpoint refuses, the runner falls back to its legacy token and stays online', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'invalid_client', status: 401 } }),
+      },
+    });
+    await goOnline(world);
+    expect(world.wss.last.sent[0]!.runner_token).toBe(TOKEN);
+    expect(world.client.state).toBe('online');
+  });
+
+  test('R11 safety net: a FATAL reject of an OAuth credential retries with legacy instead of stopping', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT);
+
+    // The cloud refuses the JWT fatally (rotated OAUTH_TOKEN_SECRET, stale
+    // client secret, clock skew). Pre-d5 this runner would have presented its
+    // still-valid legacy token; it must not be worse off for having migrated.
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'invalid_token' });
+    expect(world.client.state).not.toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(0);
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+
+    expect(world.wss.connections).toHaveLength(2);
+    expect(world.wss.last.sent[0]!.runner_token).toBe(TOKEN);
+    world.wss.last.serverSend({ type: 'register_ack', id: world.wss.last.sent[0]!.id, protocol_version: 1, runner_id: 'r-1' });
+    expect(world.client.state).toBe('online');
+    expect(world.logger.joined()).toContain('retrying with this runner');
+  });
+
+  test('…and if the legacy token is refused too, the fatal stop is honoured (no reject loop)', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    world.client.start();
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'invalid_token' });
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'invalid_token' });
+    expect(world.client.state).toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(1);
+  });
+
+  test('a migrated runner with no legacy fallback RETRIES with backoff — it never stops fatally on its own', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity({ runner_token: undefined }),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'network_error' } }),
+      },
+    });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent).toHaveLength(0);
+    expect(world.client.state).toBe('backoff');
+    expect(world.fatal).toHaveLength(0);
+    expect(world.logger.joined()).toContain('no register credential available');
+    world.clock.advance(1_000);
+    await tick();
+    expect(world.wss.connections).toHaveLength(2); // it keeps trying
+  });
+
+  // ── A1: the reject that must NOT be fatal ──────────────────────────────────
+  // A migrated runner whose token exchange blipped presents its legacy token as
+  // a STAND-IN. If the window is closed (`oauth_only`) the cloud answers
+  // `upgrade_required` — fatal by the protocol's vocabulary. Honouring it here
+  // would turn a recoverable failure on `/oauth/token` into a permanent outage
+  // over a WSS channel that was healthy the whole time. That is a NEW R11 path
+  // this migration must not create.
+  test('R11: a fatal reject of a DEGRADED legacy stand-in is retried, not honoured', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'network_error' } }),
+      },
+    });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(TOKEN); // the stand-in
+
+    world.wss.last.serverSend({
+      type: 'register_reject',
+      reason: 'upgrade_required',
+      message: 'legacy runner token retired for this runner',
+    });
+    expect(world.client.state).not.toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(0);
+    expect(world.logger.joined()).toContain('STAND-IN');
+
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+    expect(world.wss.connections).toHaveLength(2); // it keeps trying
+  });
+
+  test('…and once the exchange recovers, the very next attempt registers with OAuth', async () => {
+    let failing = true;
+    const provider = new RegisterCredentialProvider({
+      requestToken: async () => (failing ? { ok: false, error: { error: 'network_error' } } : issuedToken),
+    });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: provider } });
+    world.client.start();
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required' });
+    await tick();
+    failing = false; // /oauth/token comes back
+    world.clock.advance(1_000);
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT);
+    world.wss.last.serverSend({ type: 'register_ack', id: world.wss.last.sent[0]!.id, protocol_version: 1, runner_id: 'r-1' });
+    expect(world.client.state).toBe('online');
+  });
+
+  test('a genuinely UN-MIGRATED runner is NOT rescued by that branch — it still stops on the first reject', async () => {
+    // The un-migrated identity can never mint, so its legacy token is never a
+    // "stand-in" and `upgrade_required` means what it has always meant.
+    const world = makeWorld();
+    world.client.start();
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required', min_protocol_version: 2 });
+    expect(world.client.state).toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(1);
+    expect(world.wss.connections).toHaveLength(1);
+  });
+
+  test('the stand-in branch does not fire once the client secret is gone from the config', async () => {
+    // Reject arrives; by then the operator has removed the client secret, so
+    // this runner can no longer mint and the fatal answer is the true one.
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'network_error' } }),
+      },
+    });
+    world.client.start();
+    await tick();
+    world.store.save({ ...world.store.load()!, oauth_client_secret: undefined });
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required' });
+    expect(world.client.state).toBe('stopped_fatal');
+  });
+
+  // ── A3: the register deadline is re-armed when the frame actually leaves ────
+  test('a slow exchange does not eat the gateway’s answer budget — the timer restarts at send', async () => {
+    let release: (result: ClientCredentialsResult) => void = () => {};
+    const provider = new RegisterCredentialProvider({
+      requestToken: () => new Promise<ClientCredentialsResult>((resolve) => (release = resolve)),
+    });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: provider } });
+    world.client.start();
+    await tick();
+    world.clock.advance(7_000); // the exchange took 7 of the 10 seconds
+    release(issuedToken);
+    await tick();
+    expect(world.wss.last.sent).toHaveLength(1);
+    // Pre-fix this would have fired 3s later; the gateway now gets a full 10s.
+    world.clock.advance(9_000);
+    await tick();
+    expect(world.logger.joined()).not.toContain('register timed out');
+    expect(world.client.state).toBe('registering');
+    world.clock.advance(2_000);
+    await tick();
+    expect(world.logger.joined()).toContain('register timed out');
+  });
+
+  test('a credential resolved after the connection dropped is discarded, never sent late', async () => {
+    let release: (result: ClientCredentialsResult) => void = () => {};
+    const provider = new RegisterCredentialProvider({
+      requestToken: () => new Promise<ClientCredentialsResult>((resolve) => (release = resolve)),
+    });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: provider } });
+    world.client.start();
+    await tick();
+    world.wss.last.serverClose('network reset');
+    await tick();
+    release(issuedToken);
+    await tick();
+    expect(world.wss.connections[0]!.sent).toHaveLength(0);
+    expect(world.logger.joined()).toContain('resolved after the connection moved on');
+  });
+});
+
 describe('secrets discipline', () => {
   test('the runner token NEVER appears in any log line across the full lifecycle', async () => {
     // Exercise every logging path: connect, register, transient reject,
@@ -384,6 +671,52 @@ describe('secrets discipline', () => {
     expect(world.logger.lines.length).toBeGreaterThan(5); // plenty was logged...
     expect(world.logger.joined()).not.toContain(TOKEN); // ...none of it the token
     expect(world.fatal.join('\n')).not.toContain(TOKEN);
+  });
+
+  // d5 (P6): the same guarantee now has to cover TWO more secrets — the
+  // distinct OAuth client secret and the short-lived `runner:register` token it
+  // buys. Both cross the same code paths as the legacy token, so both are
+  // exercised over the full lifecycle rather than asserted in isolation.
+  test('NEITHER the OAuth client secret NOR the issued registration token appears in any log line', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT); // it WAS used
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'capacity' });
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+    const register = world.wss.last.sent[0]!;
+    world.wss.last.serverSend({ type: 'register_ack', id: register.id, protocol_version: 1, runner_id: 'r-1', heartbeat_interval_s: 5 });
+    world.clock.advance(5_000);
+    world.wss.last.serverClose('flap');
+    world.clock.advance(1_000);
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'revoked' });
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'revoked' });
+
+    const everything = [world.logger.joined(), world.fatal.join('\n')].join('\n');
+    expect(world.logger.lines.length).toBeGreaterThan(5);
+    for (const secret of [TOKEN, CLIENT_SECRET, REGISTER_JWT]) {
+      expect(everything).not.toContain(secret);
+      expect(everything).not.toContain(secret.slice(0, 12)); // no prefix leaks
+    }
+  });
+
+  test('the register FRAME still carries the credential — redaction is a logging rule, not a wire one', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: { registerCredentials: providerReturning(issuedToken) },
+    });
+    await goOnline(world);
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT);
+    expect(world.logger.joined()).not.toContain(REGISTER_JWT);
   });
 });
 
