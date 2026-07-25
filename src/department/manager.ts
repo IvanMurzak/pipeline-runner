@@ -73,9 +73,45 @@
  * seeded from the offer's `event_seq_base`, 08 §4's attempt-fencing
  * convention), NOT through the shipper/`ingestBatch` path. The local journal
  * file write is KEPT (harmless, useful for on-disk audit) but is no longer
- * wired to a shipper/transport. `department.artifact` (chunked upload) stays
- * OUT of scope here — 08 §6 / P4 (task c9/d3); an `artifact` `RuntimeEvent` is
- * journalled locally and logged, not yet shipped.
+ * wired to a shipper/transport.
+ *
+ * ── Artifact upload (d3, 08 §6 / 09 §3.1) ────────────────────────────────────
+ * `department.artifact` stayed OUT of scope through e1 (journalled locally,
+ * logged, never shipped). This task wires it up: an `artifact` `RuntimeEvent`
+ * is handed to `uploadArtifact`, which first resolves `event.path` against
+ * `state.runtime.cwd` (a RELATIVE path — the 07 §3 canonical example, `./out/
+ * review.md` — is resolved the same way `jsonl-process.ts` resolves the
+ * spawned process's own cwd; an ABSOLUTE path is used as-is; a `container`-
+ * tier department's path is refused explicitly — see `resolveArtifactPath`'s
+ * doc for why translating a container-internal path is out of scope rather
+ * than guessed at), then hands the bytes to
+ * `./artifact-upload.ts#uploadDepartmentArtifact`, which enforces the
+ * per-artifact (1 MiB) and running per-task (8 MiB) caps RUNNER-FIRST —
+ * rejecting explicitly, before any wire transfer, never truncating — then
+ * chunks accepted content into 256 KiB `department.artifact` frames.
+ * `taskArtifactBytesSent` tracks the running per-task total across this
+ * manager's lifetime (keyed by `taskId`, so it survives a `per-context`
+ * respawn's fresh `executionId` but resets on runner restart — a
+ * best-effort local gate; the cloud's own check, `mesh-artifacts/service.ts`,
+ * is the authoritative one). Every entry is reclaimed once no execution of
+ * that `taskId` is still live — `releaseTaskArtifactBudgetIfIdle`, called
+ * from both terminal funnels (`reportTerminal` AND `handleLeaseRevoked`,
+ * which deliberately bypasses `reportTerminal` — see its own doc) — plus a
+ * `MAX_TRACKED_TASK_ARTIFACT_BUDGETS` size backstop in case a future
+ * termination path is ever added without also calling it.
+ *
+ * `department.artifact_ack` (cloud → runner) is handled by
+ * `handleArtifactAckFrame`: a rejection is always logged at `warn` (never
+ * silently dropped) and, if the caller wired `options.onArtifactAck`, handed
+ * to it too — "surfaced, not swallowed" is a DoD line, not a suggestion.
+ * **This handler is dormant today**: as of task d3, the cloud's `c9`
+ * scheduler (`handleDepartmentArtifact` in
+ * `cloud/apps/api/src/modules/mesh/scheduler.ts`) records
+ * `task.artifact_stored`/`task.artifact_rejected` TASK EVENTS but does not
+ * yet SEND a `department.artifact_ack` WIRE FRAME anywhere — this handler is
+ * fully wired and tested against the real schema for when that frame starts
+ * arriving, but no runner will actually receive one until the cloud side is
+ * closed (tracked as a `c9`/mesh follow-up, not a defect in this file).
  *
  * ── Lifecycle policy, concretely ────────────────────────────────────────────
  *   - `per-task`: one `adapter.start()` per execution; disposed at terminal.
@@ -98,14 +134,16 @@
  *     surface here.)
  */
 
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 import * as nodeFs from 'node:fs';
 import {
+  DeptArtifactAckMessageSchema,
   DeptConfigUpdateMessageSchema,
   DeptOfferMessageSchema,
   DeptMessageSchema as WireDeptMessageSchema,
 } from '@baizor/pipeline-protocol';
 import type {
+  DeptArtifactAckMessage,
   DeptEventMessage,
   DeptMessage as WireDeptMessage,
   DeptPart as WireDeptPart,
@@ -130,6 +168,8 @@ import type {
   RuntimeHandle,
   RuntimeLifecycle,
 } from './adapter';
+import type { ArtifactFileSystem } from './artifact-upload';
+import { uploadDepartmentArtifact } from './artifact-upload';
 import { buildDepartmentJournalEnvelope } from './events';
 import type { ExecutionTokenSource } from './execution-token-manager';
 
@@ -217,6 +257,15 @@ export interface DepartmentManagerOptions {
   logger?: Logger;
   makeId?(): string;
   env?: Record<string, string | undefined>;
+  /** d3: injectable filesystem for `path`-referenced artifact reads. Default
+   *  `nodeArtifactFs()` (real `node:fs`, sync — `./artifact-upload.ts`). */
+  artifactFs?: ArtifactFileSystem;
+  /** d3: called for every `department.artifact_ack` this manager receives
+   *  (both accepted and rejected) — a hook for callers that want to observe
+   *  ack traffic beyond the log line `handleArtifactAckFrame` always emits.
+   *  Never required for "rejection is surfaced" to hold: that is the log
+   *  line, unconditionally; this is additive. */
+  onArtifactAck?(ack: DeptArtifactAckMessage): void;
 }
 
 const DEFAULT_CAPACITY = 4;
@@ -225,6 +274,13 @@ const DEFAULT_PER_CONTEXT_IDLE_MS = 15 * 60_000;
  *  `RuntimeConfig.parkExpirySeconds` states one — matches the design's own
  *  `parkExpiry` example (`"7d"`, `08-protocol-delta.md` §4's `DeptLimits`). */
 const DEFAULT_PARK_EXPIRY_S = 7 * 24 * 60 * 60;
+/** d3 (per code-review finding): hard ceiling on the number of DISTINCT
+ *  `taskId`s `taskArtifactBytesSent` tracks at once. `releaseTaskArtifactBudgetIfIdle`
+ *  (called from both termination funnels) is what's SUPPOSED to keep this map
+ *  small — this is defence in depth for the case a future termination path is
+ *  added without also calling it, so the map is bounded regardless, not just
+ *  when every caller remembers to clean up. */
+const MAX_TRACKED_TASK_ARTIFACT_BUDGETS = 2000;
 
 interface ExecutionState {
   executionId: string;
@@ -279,6 +335,11 @@ export class DepartmentManager {
    *  result at admission time. Today this only ever carries `parkExpirySeconds`
    *  (see `handleConfigUpdateFrame`'s doc). */
   private readonly configOverrides = new Map<string, Partial<RuntimeConfig>>();
+  /** d3: running total of artifact bytes THIS PROCESS has sent per `taskId`
+   *  (09 §3.1's per-task 8 MiB cap, enforced runner-first) — see the module
+   *  doc's "Artifact upload" section for why this is per-task, not
+   *  per-execution, and why it is best-effort rather than authoritative. */
+  private readonly taskArtifactBytesSent = new Map<string, number>();
   private readonly journalRoot: string;
   private readonly journal: JournalWriter;
   private readonly clock: Clock;
@@ -310,12 +371,14 @@ export class DepartmentManager {
     const offCancel = dispatcher.on('department.cancel', (frame) => void this.handleCancelFrame(frame));
     const offLeaseRevoked = dispatcher.on('department.lease_revoked', (frame) => this.handleLeaseRevokedFrame(frame));
     const offConfigUpdate = dispatcher.on('department.config_update', (frame) => this.handleConfigUpdateFrame(frame));
+    const offArtifactAck = dispatcher.on('department.artifact_ack', (frame) => this.handleArtifactAckFrame(frame));
     return () => {
       offOffer();
       offMessage();
       offCancel();
       offLeaseRevoked();
       offConfigUpdate();
+      offArtifactAck();
     };
   }
 
@@ -477,6 +540,11 @@ export class DepartmentManager {
     // in-memory cache too, so nothing (a stray relay drain, a respawn race)
     // could ever hand it out again for a lease that is already gone.
     this.options.executionTokens?.discard(executionId);
+    // d3 (per code-review finding): this path deliberately bypasses
+    // `reportTerminal` (see this method's doc), so it needs its OWN call to
+    // reclaim the per-task artifact-budget entry — `reportTerminal` doing it
+    // is not enough to cover every termination path.
+    this.releaseTaskArtifactBudgetIfIdle(state.taskId);
     const handle = state.handle;
     state.handle = null;
     if (handle !== null) {
@@ -561,6 +629,37 @@ export class DepartmentManager {
         this.logger.info(`department execution ${state.executionId}: parked wait re-armed to ${parkExpirySeconds}s (config_update)`);
       }
     }
+  }
+
+  // ── d3: department.artifact_ack (cloud → runner) ─────────────────────────
+  // 08 §6 / 09 §3.1: "an explicit department.artifact_ack per artifact —
+  // rejection is always explicit; silent truncation is forbidden." A
+  // malformed frame is logged and dropped, same tolerance every other
+  // handler in this class applies; a well-formed one is ALWAYS logged —
+  // `accepted:true` at info, `accepted:false` at warn with the reason — so a
+  // rejection can never pass through unnoticed. `options.onArtifactAck` is an
+  // additive hook for a caller that wants to react to it (e.g. a future
+  // per-execution artifact-status surface); it is not what makes rejection
+  // "surfaced" — the log line unconditionally is.
+  //
+  // DORMANT TODAY: the cloud's `c9` scheduler does not yet SEND this frame
+  // (it records `task.artifact_stored`/`task.artifact_rejected` task events
+  // instead — see the module doc's "Artifact upload" section) — this handler
+  // is ready and tested against the real schema, but nothing calls it in
+  // production until that cloud-side gap closes.
+  private handleArtifactAckFrame(frame: WireFrame): void {
+    const parsed = DeptArtifactAckMessageSchema.safeParse(frame);
+    if (!parsed.success) {
+      this.logger.warn('malformed department.artifact_ack ignored');
+      return;
+    }
+    const ack = parsed.data;
+    if (ack.accepted) {
+      this.logger.info(`department.artifact_ack: artifact ${ack.artifact_id} accepted`);
+    } else {
+      this.logger.warn(`department.artifact_ack: artifact ${ack.artifact_id} REJECTED — ${ack.reason ?? 'no reason given'}`);
+    }
+    this.options.onArtifactAck?.(ack);
   }
 
   /** Deliver mid-task input. Live + capable ⇒ sent immediately. Otherwise
@@ -760,6 +859,11 @@ export class DepartmentManager {
     // useless from here on; drop the cache entry (see handleLeaseRevoked's
     // matching note).
     this.options.executionTokens?.discard(state.executionId);
+    // d3 (per code-review finding): reclaim this task's artifact-budget
+    // entry now that this execution is ending — see `releaseTaskArtifactBudgetIfIdle`'s
+    // doc for why it only actually deletes when no OTHER execution of the
+    // same taskId is still live.
+    this.releaseTaskArtifactBudgetIfIdle(state.taskId);
     this.journalRuntimeEvent(state, event);
     this.shipDepartmentEvent(state, event);
     if (state.handle !== null) {
@@ -787,9 +891,10 @@ export class DepartmentManager {
   /**
    * Ship a `RuntimeEvent` to the cloud as a real `department.event` wire
    * frame (e1 fix — see the module doc's "Event delivery" note). `artifact`
-   * events are NOT shipped here — 08 §6 gives artifacts their own dedicated
-   * `department.artifact` chunked-upload frame (P4 / task c9-d3), out of
-   * scope for this manager; they are journalled locally and logged only.
+   * events take a SEPARATE path — 08 §6 gives artifacts their own dedicated
+   * `department.artifact` chunked-upload frames, never the tier-filtered
+   * event-ingest path (07 §8) — routed to `uploadArtifact` (d3) instead of
+   * `buildDepartmentEventFrame`/`options.send` below.
    * Best-effort: `options.send` returning false (runner offline) is logged,
    * not queued/retried — a durable per-execution event outbox is future work
    * (mirrors `gatewayRegistry.sendToRunner`'s own best-effort semantics on
@@ -797,9 +902,7 @@ export class DepartmentManager {
    */
   private shipDepartmentEvent(state: ExecutionState, event: RuntimeEvent): void {
     if (event.type === 'artifact') {
-      this.logger.warn(
-        `department execution ${state.executionId}: artifact "${event.name}" journalled locally only — department.artifact upload is not yet wired (P4 scope)`,
-      );
+      this.uploadArtifact(state, event);
       return;
     }
     const seq = state.nextSeq;
@@ -810,6 +913,141 @@ export class DepartmentManager {
         `department execution ${state.executionId}: department.event seq ${seq} (${event.type}) not sent — runner offline`,
       );
     }
+  }
+
+  /**
+   * d3 (08 §6 / 09 §3.1): hand one `artifact` `RuntimeEvent` to
+   * `./artifact-upload.ts#uploadDepartmentArtifact`, which enforces every cap
+   * runner-first and chunks accepted content into `department.artifact`
+   * frames. `event.path`, if present, is resolved FIRST via
+   * `resolveArtifactPath` — against `state.runtime.cwd` for a relative path,
+   * or refused outright for a `container`-tier department (see that method's
+   * doc) — before the uploader ever sees it. `taskArtifactBytesSent` — this
+   * manager's running per-task total — is only incremented on a `'sent'`
+   * outcome (via `noteTaskArtifactBytesSent`), so a rejected artifact never
+   * inflates the budget its own rejection was measured against. A rejection
+   * is already logged (either by `resolveArtifactPath` or by
+   * `uploadDepartmentArtifact` itself, with the exact cap and size that were
+   * violated) — nothing further to do here; this execution's task keeps
+   * running exactly as it would for any other best-effort-shipped event.
+   */
+  private uploadArtifact(state: ExecutionState, event: Extract<RuntimeEvent, { type: 'artifact' }>): void {
+    let path = event.path;
+    if (path !== undefined) {
+      const resolved = this.resolveArtifactPath(state, path);
+      if (!resolved.ok) {
+        this.logger.warn(resolved.reason);
+        return;
+      }
+      path = resolved.path;
+    }
+
+    const bytesAlreadySentForTask = this.taskArtifactBytesSent.get(state.taskId) ?? 0;
+    const outcome = uploadDepartmentArtifact(
+      {
+        executionId: state.executionId,
+        taskId: state.taskId,
+        name: event.name,
+        mediaType: event.mediaType,
+        ...(event.bytes !== undefined ? { bytes: event.bytes } : {}),
+        ...(path !== undefined ? { path } : {}),
+      },
+      {
+        send: this.options.send,
+        bytesAlreadySentForTask,
+        ...(this.options.artifactFs !== undefined ? { fs: this.options.artifactFs } : {}),
+        logger: this.logger,
+      },
+    );
+    if (outcome.status === 'sent') {
+      this.noteTaskArtifactBytesSent(state.taskId, outcome.size);
+      this.logger.info(
+        `department execution ${state.executionId}: artifact "${event.name}" uploaded (${outcome.size}B, ${outcome.chunkTotal} chunk(s), checksum ${outcome.checksum})`,
+      );
+    }
+  }
+
+  /**
+   * d3 (per code-review finding): resolve a `task.artifact`'s `path` against
+   * the department's OWN working directory before ever handing it to
+   * `uploadDepartmentArtifact` — the previous version passed `event.path`
+   * through verbatim, which resolved against the DAEMON's cwd rather than the
+   * runtime's, even though 07 §3's own canonical example is a relative path
+   * (`"./out/review.md"`) and `jsonl-process.ts` spawns the child WITH
+   * `runtime.cwd` (`this.spawnSeam.spawn(runtime.command, runtime.args ?? [],
+   * { cwd: runtime.cwd, ... })`) — so resolving against that same `cwd` is
+   * what makes a relative artifact path mean what the runtime that emitted it
+   * meant.
+   *
+   * - An ABSOLUTE path is used as-is (already unambiguous).
+   * - A RELATIVE path is resolved against `state.runtime.cwd` when the
+   *   department declares one; with no declared `cwd` there is nothing to
+   *   resolve against but the daemon's own process cwd, so the path is
+   *   passed through unchanged — the same behaviour this manager has always
+   *   had for that case, now explicit rather than accidental.
+   * - A `container`-tier department (`state.runtime.container !== undefined`)
+   *   is REFUSED explicitly, always, regardless of whether the path looks
+   *   relative or absolute: `path` names a location inside the CONTAINER's
+   *   filesystem (relative to `ContainerSpec.workspaceContainerPath`/
+   *   `workdir`, e.g. `/workspace`), which this HOST process cannot open
+   *   directly. Correctly translating it would need to know whether it falls
+   *   under the auto-provisioned workspace mount (`container.ts`'s
+   *   `<workspaceRoot>/<taskId>` ↔ `/workspace`) or one of
+   *   `ContainerSpec.mounts`' arbitrary host↔container pairs — information
+   *   `ContainerAdapter` does not expose to this supervisor today. Guessing
+   *   wrong here would mean silently reading (or worse, silently NOT
+   *   reading) the wrong file, so this refuses with a reason naming the
+   *   limitation instead — the same "explicit refusal over guessing" contract
+   *   `uploadDepartmentArtifact`'s caps already hold to. Container-tier
+   *   artifact publishing is left to inline `bytes` (under 64 KiB) or a
+   *   follow-up task that threads the host mount path through
+   *   `ContainerHandle`.
+   */
+  private resolveArtifactPath(state: ExecutionState, path: string): { ok: true; path: string } | { ok: false; reason: string } {
+    if (state.runtime.container !== undefined) {
+      return {
+        ok: false,
+        reason:
+          `department execution ${state.executionId}: artifact path "${path}" is inside a 'container'-tier department's ` +
+          `filesystem, which this runner process cannot read directly (d3 scope gap — path translation across the ` +
+          `container boundary is not implemented) — rejected, not read from the wrong filesystem; use inline bytes ` +
+          `under 64 KiB instead`,
+      };
+    }
+    if (isAbsolute(path) || state.runtime.cwd === undefined) return { ok: true, path };
+    return { ok: true, path: resolvePath(state.runtime.cwd, path) };
+  }
+
+  /** d3 (per code-review finding): record a successful upload against
+   *  `taskId`'s running total, evicting the OLDEST tracked task first if this
+   *  would introduce a new entry past {@link MAX_TRACKED_TASK_ARTIFACT_BUDGETS}
+   *  — the size backstop described in the module doc. */
+  private noteTaskArtifactBytesSent(taskId: string, size: number): void {
+    const current = this.taskArtifactBytesSent.get(taskId) ?? 0;
+    if (current === 0 && this.taskArtifactBytesSent.size >= MAX_TRACKED_TASK_ARTIFACT_BUDGETS) {
+      const oldest: string | undefined = this.taskArtifactBytesSent.keys().next().value;
+      if (oldest !== undefined) this.taskArtifactBytesSent.delete(oldest);
+    }
+    this.taskArtifactBytesSent.set(taskId, current + size);
+  }
+
+  /**
+   * d3 (per code-review finding): reclaim `taskId`'s `taskArtifactBytesSent`
+   * entry once no NON-TERMINAL execution of that task remains — called from
+   * both termination funnels (`reportTerminal`, and `handleLeaseRevoked`
+   * separately since it deliberately bypasses `reportTerminal`). Guarded by
+   * "no other execution of this taskId is still live" rather than deleting
+   * unconditionally: a task CAN have more than one `ExecutionState` at once
+   * (a redelivered offer with a fresh `executionId` after the previous
+   * attempt's lease expired, before this one's own termination lands) — were
+   * this to always delete, one execution's termination would erase the
+   * budget another, still-running execution of the SAME task had already
+   * spent against, letting it exceed 09 §3.1's per-task cap after all. */
+  private releaseTaskArtifactBudgetIfIdle(taskId: string): void {
+    for (const other of this.executions.values()) {
+      if (other.taskId === taskId && !other.terminal) return;
+    }
+    this.taskArtifactBytesSent.delete(taskId);
   }
 
   // ── Idle eviction (per-context) ────────────────────────────────────────
