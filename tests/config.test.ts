@@ -177,16 +177,72 @@ describe('describeIdentity (log-safe view)', () => {
     expect(safe.base_url).toBe('https://cp.example.com'); // everything else intact
   });
 
-  // d5 (P6): the second credential gets the same treatment, and the check is
-  // written against SECRET_IDENTITY_FIELDS so a THIRD credential added later
-  // without redaction fails here instead of leaking on `pipeline-runner status`.
-  test('redacts every field named in SECRET_IDENTITY_FIELDS', () => {
-    const full = identity({ oauth_client_secret: CLIENT_SECRET, runner_id: RUNNER_ID });
-    const safe = describeIdentity(full);
+  // d5 (P6): the second credential gets the same treatment. Iterating
+  // SECRET_IDENTITY_FIELDS alone would NOT be a guarantee — a new credential
+  // field added without touching the list keeps every such assertion green
+  // while `status` prints it in the clear. So the fixture below is typed
+  // `Required<AgentIdentity>` (adding any field to the interface fails `tsc`
+  // until it is named here) and the test then insists every key of that
+  // fixture is classified as either a secret or explicitly non-secret.
+  const NON_SECRET_IDENTITY_FIELDS = [
+    'base_url',
+    'runner_id',
+    'labels',
+    'capacity',
+    'os',
+    'agent_version',
+    'cli_version',
+    'plugin_version',
+    'heartbeat_interval_s',
+    'capabilities',
+  ] as const;
+
+  const fullyPopulated: Required<AgentIdentity> = {
+    base_url: 'https://cp.example.com',
+    runner_token: TOKEN,
+    oauth_client_secret: CLIENT_SECRET,
+    runner_id: RUNNER_ID,
+    labels: ['os:windows'],
+    capacity: 2,
+    os: 'windows',
+    agent_version: AGENT_VERSION,
+    cli_version: '1.2.3',
+    plugin_version: null,
+    heartbeat_interval_s: 30,
+    capabilities: { isolation: ['process'], gpu: false, os: 'windows', resources: { cpu_count: 8, total_memory_mb: 16384 } },
+  };
+
+  test('every field of a fully-populated identity is classified secret or non-secret', () => {
+    const classified = new Set<string>([...SECRET_IDENTITY_FIELDS, ...NON_SECRET_IDENTITY_FIELDS]);
+    const unclassified = Object.keys(fullyPopulated).filter((key) => !classified.has(key));
+    // A new AgentIdentity field lands here. If it holds a credential it must be
+    // added to SECRET_IDENTITY_FIELDS; if not, to the allowlist above — but it
+    // cannot be silently forgotten and then printed by `status`.
+    expect(unclassified).toEqual([]);
+    // …and the allowlist cannot be used to smuggle a known secret out.
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      expect(NON_SECRET_IDENTITY_FIELDS as readonly string[]).not.toContain(field);
+    }
+  });
+
+  test('redacts every field named in SECRET_IDENTITY_FIELDS, and nothing else', () => {
+    const safe = describeIdentity(fullyPopulated);
     for (const field of SECRET_IDENTITY_FIELDS) {
       expect(safe[field]).toBe(REDACTED);
     }
-    expect(SECRET_IDENTITY_FIELDS).toContain('oauth_client_secret');
+    for (const field of NON_SECRET_IDENTITY_FIELDS) {
+      expect(safe[field]).toEqual(fullyPopulated[field]); // untouched
+    }
+  });
+
+  test('no value of any secret field survives serialization of the full identity', () => {
+    const serialized = JSON.stringify(describeIdentity(fullyPopulated));
+    for (const field of SECRET_IDENTITY_FIELDS) {
+      const secret = fullyPopulated[field];
+      expect(typeof secret).toBe('string');
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(secret.slice(0, 8));
+    }
   });
 
   test('no secret value (or prefix) survives serialization', () => {

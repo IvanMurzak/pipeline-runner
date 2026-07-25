@@ -230,13 +230,18 @@ async function requestClientCredentialsToken(request: ClientCredentialsRequest):
 
   logger.debug(`mesh-oauth: requesting ${request.what} for ${request.subject}`);
 
-  // The deadline (when one is asked for). Deliberately NOT `AbortSignal.timeout`
-  // — under Bun that signal's `abort` event does not reach a plain listener, so
-  // a race against it would silently never fire and the "bounded" guarantee
-  // would be a lie. A timer on the INJECTED clock is portable, observable, and
-  // deterministic under the tests' `FakeClock`. The `AbortController` is still
-  // passed to `fetch` so a real in-flight request is actually cancelled rather
-  // than left running after we stop waiting for it.
+  // The deadline (when one is asked for), as a timer on the INJECTED clock.
+  //
+  // `AbortSignal.timeout()` would also work here — it fires correctly under Bun
+  // and Node, and passing it to `fetch` cancels the request. It is not used
+  // because its deadline runs on real wall-clock time, which this codebase
+  // deliberately does not do: every other timeout in the runner goes through
+  // `Clock` so tests drive it with `FakeClock` instead of sleeping. A
+  // wall-clock deadline here would make "does a hung token endpoint degrade to
+  // the legacy token?" a multi-second, flaky test — or, more likely, an
+  // untested path. The `AbortController` below is still handed to `fetch`, so a
+  // real in-flight request is genuinely cancelled rather than left running
+  // after we have stopped waiting for it.
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   let deadlineTimer: unknown = null;
   const deadline =

@@ -74,9 +74,19 @@ export const REDACTED = '<redacted>';
 
 /**
  * EVERY secret an `AgentIdentity` can carry. `describeIdentity` redacts exactly
- * this list, and `tests/config.test.ts` asserts the list is exhaustive against
- * a fully-populated identity — so adding a credential field without redacting
- * it fails the suite rather than leaking on the next `pipeline-runner status`.
+ * this list.
+ *
+ * The guarantee that this list stays complete is enforced in two places at
+ * once, because a comment alone is exactly how the next credential field leaks:
+ *
+ *   1. `tests/config.test.ts` builds its fixture as `Required<AgentIdentity>`,
+ *      so adding ANY field to the interface fails `tsc` until the fixture names
+ *      it; and
+ *   2. that test partitions the fixture's own keys into this list and an
+ *      explicit non-secret allowlist, failing on any key in neither.
+ *
+ * So a new `oauth_refresh_secret` cannot reach `pipeline-runner status` in the
+ * clear: it breaks the typecheck first, and then the classification assertion.
  */
 export const SECRET_IDENTITY_FIELDS = ['runner_token', 'oauth_client_secret'] as const;
 

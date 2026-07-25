@@ -51,7 +51,7 @@ import { consoleLogger } from './core/log';
 // department-mesh d5 (P6, 13 §10.2): which credential registers this runner,
 // and which secret authenticates it as an OAuth client. See
 // `./core/register-credential.ts` — the connection wires the provider itself.
-import { selectClientSecret, storeOAuthClientCredentials } from './core/register-credential';
+import { carryForwardLegacyToken, selectClientSecret, storeOAuthClientCredentials } from './core/register-credential';
 import { defaultTransports } from './core/transport';
 import type { RunnerStatus } from './core/wire';
 import { defaultDataDir, nodeShipperFs } from './shipper/fs';
@@ -173,10 +173,27 @@ async function runRegister(argv: string[]): Promise<void> {
   // longer required for a runner that was given OAuth client credentials — the
   // whole point of P6 — but it is still accepted, because that is what every
   // deployed runner has and the cloud dual-accepts it (c15).
-  const clientId = values['client-id'] ?? envValue(CLIENT_ID_ENV);
-  const clientSecret = values['client-secret'] ?? envValue(CLIENT_SECRET_ENV);
+  //
+  // The env vars are consulted ONLY when the operator asked for the OAuth path
+  // on the command line (either flag present). Otherwise a plain
+  // `register --token X` in a shell that happens to export
+  // PIPELINE_RUNNER_OAUTH_* would silently attach credentials nobody asked
+  // for. `set-credentials`, whose whole purpose is installing them, keeps the
+  // unconditional fallback.
+  const oauthRequested = values['client-id'] !== undefined || values['client-secret'] !== undefined;
+  const clientId = values['client-id'] ?? (oauthRequested ? envValue(CLIENT_ID_ENV) : undefined);
+  const clientSecret = values['client-secret'] ?? (oauthRequested ? envValue(CLIENT_SECRET_ENV) : undefined);
+  if (oauthRequested) {
+    // Say out loud which half came from the environment — a credential picked
+    // up invisibly is a credential nobody audits.
+    if (values['client-id'] === undefined && clientId !== undefined) console.log(`[pipeline-runner] client id from ${CLIENT_ID_ENV}`);
+    if (values['client-secret'] === undefined && clientSecret !== undefined) console.log(`[pipeline-runner] client secret from ${CLIENT_SECRET_ENV}`);
+  }
   if (clientSecret !== undefined && clientId === undefined) {
     fail(`--client-id <id> is required with --client-secret (or set ${CLIENT_ID_ENV}); it is the runner id shown when the credential was issued`);
+  }
+  if (clientId !== undefined && clientSecret === undefined) {
+    fail(`--client-secret <secret> is required with --client-id (or set ${CLIENT_SECRET_ENV})`);
   }
   if (!values.token && clientSecret === undefined) {
     fail(`--token <runner-token>, or --client-id + --client-secret (or ${CLIENT_ID_ENV}/${CLIENT_SECRET_ENV}), is required`);
@@ -227,8 +244,31 @@ async function runRegister(argv: string[]): Promise<void> {
     capabilities: detectCapabilities({ gpu: values.gpu === true, isolation }),
   };
   const store = new ConfigStore();
-  store.save(identity);
+  // d5 (P6): `register` overwrites the config wholesale, so migrating a LIVE
+  // runner with `--client-id/--client-secret` (and no `--token`) would
+  // otherwise delete the legacy fallback silently. Carry it forward and say so;
+  // removing it stays the explicit act it is in `set-credentials --drop-token`.
+  let previous: AgentIdentity | null = null;
+  try {
+    previous = store.load();
+  } catch {
+    previous = null; // an unreadable/incomplete old config is not a fallback
+  }
+  const { identity: toStore, carried } = carryForwardLegacyToken(previous, identity);
+  store.save(toStore);
   console.log(`[pipeline-runner] identity stored at ${store.path}`);
+  if (carried) {
+    console.log(
+      '[pipeline-runner] kept the existing legacy runner token as a fallback — remove it with ' +
+        '`pipeline-runner set-credentials --drop-token` once the control plane reports this runner clear.'
+    );
+  } else if (toStore.runner_token === undefined) {
+    console.warn(
+      '[pipeline-runner] warn: this identity has NO legacy runner token. If the OAuth token exchange fails, ' +
+        'this runner has nothing to fall back on and will retry with backoff until it succeeds. Pass --token ' +
+        'as well to keep a fallback.'
+    );
+  }
   if (values['store-only']) return;
 
   console.log('[pipeline-runner] connecting to validate registration...');
@@ -242,7 +282,7 @@ async function runRegister(argv: string[]): Promise<void> {
   });
   const client = new AgentClient({
     store,
-    transports: defaultTransports(identity.base_url, consoleLogger),
+    transports: defaultTransports(toStore.base_url, consoleLogger),
     logger: consoleLogger,
     events: {
       onOnline: () => settle('online'),

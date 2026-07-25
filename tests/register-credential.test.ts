@@ -15,6 +15,7 @@ import type { ClientCredentialsResult, FetchLike, RequestRunnerRegistrationToken
 import { REGISTRATION_TOKEN_TIMEOUT_MS, requestRunnerRegistrationToken } from '../src/core/mesh-oauth';
 import {
   canMintRegistrationToken,
+  carryForwardLegacyToken,
   RegisterCredentialProvider,
   selectClientSecret,
   storeOAuthClientCredentials,
@@ -112,6 +113,9 @@ describe('a runner that has not migrated (no OAuth client credentials)', () => {
         value: LEGACY_TOKEN,
         credentialClass: 'legacy',
         reason: 'no OAuth client credentials configured for this runner',
+        // NOT degraded: legacy is all this runner has, so a fatal reject of it
+        // is the real answer, not a token-endpoint blip to retry through.
+        degraded: false,
       },
     });
     expect(exchange.calls).toHaveLength(0);
@@ -149,7 +153,7 @@ describe('a migrated runner (DoD: the plaintext token is no longer required)', (
 
     expect(resolution).toEqual({
       ok: true,
-      credential: { value: REGISTER_JWT, credentialClass: 'oauth', reason: null },
+      credential: { value: REGISTER_JWT, credentialClass: 'oauth', reason: null, degraded: false },
     });
     expect(exchange.calls).toHaveLength(1);
     expect(exchange.calls[0]!.clientId).toBe(RUNNER_ID);
@@ -255,6 +259,19 @@ describe('R11 — every way the OAuth path can fail falls back to the legacy tok
     expect(second.ok && second.credential.credentialClass).toBe('oauth');
   });
 
+  test('the fallback is marked DEGRADED — the signal that a fatal reject of it must be retried', async () => {
+    const exchange = exchangeReturning({ ok: false, error: { error: 'network_error' } });
+    const provider = new RegisterCredentialProvider({ requestToken: exchange.requestToken });
+    const resolution = await provider.resolve(migrated());
+    expect(resolution.ok && resolution.credential.degraded).toBe(true);
+  });
+
+  test("an un-migrated runner's legacy token is NOT degraded — its fatal rejects are real", async () => {
+    const provider = new RegisterCredentialProvider({ requestToken: exchangeReturning(issued(900_000)).requestToken });
+    const resolution = await provider.resolve(identity());
+    expect(resolution.ok && resolution.credential.degraded).toBe(false);
+  });
+
   test('a migrated runner with NO legacy token reports a RETRYABLE failure, never a fatal one', async () => {
     const exchange = exchangeReturning({ ok: false, error: { error: 'network_error' } });
     const provider = new RegisterCredentialProvider({ requestToken: exchange.requestToken });
@@ -276,6 +293,90 @@ describe('forceLegacy — the safety net for a fatally refused OAuth credential'
     const resolution = await provider.resolve(migrated());
     expect(resolution.ok && resolution.credential.value).toBe(LEGACY_TOKEN);
     expect(exchange.calls).toHaveLength(1); // no further exchange attempted
+  });
+
+  test('the pin is NOT degraded — the one retry is spent, so the next fatal answer is the real one', async () => {
+    const provider = new RegisterCredentialProvider({ requestToken: exchangeReturning(issued(900_000)).requestToken });
+    provider.forceLegacy();
+    const resolution = await provider.resolve(migrated());
+    expect(resolution.ok && resolution.credential.degraded).toBe(false);
+  });
+
+  test('the pin LAPSES after the cooldown and the OAuth path is retried automatically', async () => {
+    const clock = new FakeClock();
+    const exchange = exchangeReturning(() => issued(clock.now() + 900_000));
+    const provider = new RegisterCredentialProvider({
+      requestToken: exchange.requestToken,
+      clock,
+      forceLegacyCooldownMs: 60_000,
+    });
+
+    provider.forceLegacy();
+    clock.advance(59_000);
+    expect(provider.legacyForced).toBe(true);
+    const pinned = await provider.resolve(migrated());
+    expect(pinned.ok && pinned.credential.credentialClass).toBe('legacy');
+    expect(exchange.calls).toHaveLength(0);
+
+    clock.advance(2_000); // cooldown lapsed
+    expect(provider.legacyForced).toBe(false);
+    const resolution = await provider.resolve(migrated());
+    expect(resolution.ok && resolution.credential.credentialClass).toBe('oauth');
+    expect(exchange.calls).toHaveLength(1);
+  });
+
+  test('the pin is re-stated at warn on EVERY register, so it is visible in logs, not scrolled away', async () => {
+    const logger = new CaptureLogger();
+    const provider = new RegisterCredentialProvider({
+      requestToken: exchangeReturning(issued(900_000)).requestToken,
+      logger,
+    });
+    provider.forceLegacy();
+    provider.immediate(migrated());
+    provider.immediate(migrated());
+    const warnings = logger.lines.filter((l) => l.startsWith('warn:') && l.includes('still using'));
+    expect(warnings).toHaveLength(2);
+    expect(logger.joined()).not.toContain(LEGACY_TOKEN);
+  });
+});
+
+// ── A2: `register` must never silently destroy the fallback ──────────────────
+
+describe('carryForwardLegacyToken (`register` overwrites the config wholesale)', () => {
+  test('migrating a live runner with --client-id/--client-secret KEEPS its legacy token', () => {
+    const previous = identity(); // a registered runner, legacy token on disk
+    const next = migrated({ runner_token: undefined }); // `register` rebuilt it
+    const { identity: stored, carried } = carryForwardLegacyToken(previous, next);
+    expect(carried).toBe(true);
+    expect(stored.runner_token).toBe(LEGACY_TOKEN);
+    expect(stored.oauth_client_secret).toBe(CLIENT_SECRET);
+  });
+
+  test('an explicit --token always wins — re-registering can replace the token', () => {
+    const previous = identity();
+    const next = identity({ runner_token: 'rt_freshly-minted' });
+    const { identity: stored, carried } = carryForwardLegacyToken(previous, next);
+    expect(carried).toBe(false);
+    expect(stored.runner_token).toBe('rt_freshly-minted');
+  });
+
+  test('a first-ever registration has nothing to carry and reports so', () => {
+    const { identity: stored, carried } = carryForwardLegacyToken(null, migrated({ runner_token: undefined }));
+    expect(carried).toBe(false);
+    expect(stored.runner_token).toBeUndefined();
+  });
+
+  test('a previous identity with no legacy token carries nothing', () => {
+    const previous = migrated({ runner_token: undefined });
+    const { carried } = carryForwardLegacyToken(previous, migrated({ runner_token: undefined }));
+    expect(carried).toBe(false);
+  });
+
+  test('the result is a NEW object — the caller\'s identity is not mutated', () => {
+    const next = migrated({ runner_token: undefined });
+    const { identity: stored } = carryForwardLegacyToken(identity(), next);
+    expect(next.runner_token).toBeUndefined();
+    expect(stored).not.toBe(next);
   });
 });
 
@@ -343,7 +444,8 @@ describe('requestRunnerRegistrationToken — the c15 contract', () => {
 
   test('an endpoint that never answers hits the deadline, aborts, and degrades to the legacy token', async () => {
     // A fetch that NEVER settles and ignores the signal entirely — the worst
-    // case, and the one `AbortSignal.timeout` alone would not have rescued.
+    // case, proving the deadline holds even against a transport that does not
+    // honour cancellation. Driven by `FakeClock`, so it costs no wall time.
     const seen: AbortSignal[] = [];
     const hangingFetch = ((_url: string, init?: RequestInit) => {
       if (init?.signal) seen.push(init.signal);

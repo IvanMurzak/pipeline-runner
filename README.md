@@ -73,10 +73,17 @@ puts the resulting token on the register frame.
 using its runner token, and the control plane keeps accepting it. Even a runner
 that *has* client credentials falls back to its runner token whenever the token
 exchange cannot complete — endpoint unreachable, credential refused, malformed
-response — so migrating can never leave a runner unable to register. Keep the
-runner token in the config until the control plane's
-`GET /api/v1/runners/credential-window` reports this runner clear; then remove
-it with `set-credentials --drop-token`.
+response, slow — so migrating can never leave a runner unable to register.
+
+The runner token is **kept, not replaced**: `register` carries an existing one
+forward when you do not pass `--token`, and says so. It is removed only by the
+explicit `set-credentials --drop-token`, which you should run once the control
+plane's `GET /api/v1/runners/credential-window` reports this runner clear.
+
+The `PIPELINE_RUNNER_OAUTH_*` variables are read by `register` only when you
+also pass `--client-id` or `--client-secret` on the command line, so exporting
+them cannot attach credentials to an unrelated `register --token`.
+`set-credentials`, whose whole purpose is installing them, always reads them.
 
 `set-credentials` flags:
 

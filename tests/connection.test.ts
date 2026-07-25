@@ -523,6 +523,108 @@ describe('d5 — register credential selection over the connection', () => {
     expect(world.wss.connections).toHaveLength(2); // it keeps trying
   });
 
+  // ── A1: the reject that must NOT be fatal ──────────────────────────────────
+  // A migrated runner whose token exchange blipped presents its legacy token as
+  // a STAND-IN. If the window is closed (`oauth_only`) the cloud answers
+  // `upgrade_required` — fatal by the protocol's vocabulary. Honouring it here
+  // would turn a recoverable failure on `/oauth/token` into a permanent outage
+  // over a WSS channel that was healthy the whole time. That is a NEW R11 path
+  // this migration must not create.
+  test('R11: a fatal reject of a DEGRADED legacy stand-in is retried, not honoured', async () => {
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'network_error' } }),
+      },
+    });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(TOKEN); // the stand-in
+
+    world.wss.last.serverSend({
+      type: 'register_reject',
+      reason: 'upgrade_required',
+      message: 'legacy runner token retired for this runner',
+    });
+    expect(world.client.state).not.toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(0);
+    expect(world.logger.joined()).toContain('STAND-IN');
+
+    await tick();
+    world.clock.advance(1_000);
+    await tick();
+    expect(world.wss.connections).toHaveLength(2); // it keeps trying
+  });
+
+  test('…and once the exchange recovers, the very next attempt registers with OAuth', async () => {
+    let failing = true;
+    const provider = new RegisterCredentialProvider({
+      requestToken: async () => (failing ? { ok: false, error: { error: 'network_error' } } : issuedToken),
+    });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: provider } });
+    world.client.start();
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required' });
+    await tick();
+    failing = false; // /oauth/token comes back
+    world.clock.advance(1_000);
+    await tick();
+    expect(world.wss.last.sent[0]!.runner_token).toBe(REGISTER_JWT);
+    world.wss.last.serverSend({ type: 'register_ack', id: world.wss.last.sent[0]!.id, protocol_version: 1, runner_id: 'r-1' });
+    expect(world.client.state).toBe('online');
+  });
+
+  test('a genuinely UN-MIGRATED runner is NOT rescued by that branch — it still stops on the first reject', async () => {
+    // The un-migrated identity can never mint, so its legacy token is never a
+    // "stand-in" and `upgrade_required` means what it has always meant.
+    const world = makeWorld();
+    world.client.start();
+    await tick();
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required', min_protocol_version: 2 });
+    expect(world.client.state).toBe('stopped_fatal');
+    expect(world.fatal).toHaveLength(1);
+    expect(world.wss.connections).toHaveLength(1);
+  });
+
+  test('the stand-in branch does not fire once the client secret is gone from the config', async () => {
+    // Reject arrives; by then the operator has removed the client secret, so
+    // this runner can no longer mint and the fatal answer is the true one.
+    const world = makeWorld({
+      seedIdentity: migratedIdentity(),
+      clientOverrides: {
+        registerCredentials: providerReturning({ ok: false, error: { error: 'network_error' } }),
+      },
+    });
+    world.client.start();
+    await tick();
+    world.store.save({ ...world.store.load()!, oauth_client_secret: undefined });
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'upgrade_required' });
+    expect(world.client.state).toBe('stopped_fatal');
+  });
+
+  // ── A3: the register deadline is re-armed when the frame actually leaves ────
+  test('a slow exchange does not eat the gateway’s answer budget — the timer restarts at send', async () => {
+    let release: (result: ClientCredentialsResult) => void = () => {};
+    const provider = new RegisterCredentialProvider({
+      requestToken: () => new Promise<ClientCredentialsResult>((resolve) => (release = resolve)),
+    });
+    const world = makeWorld({ seedIdentity: migratedIdentity(), clientOverrides: { registerCredentials: provider } });
+    world.client.start();
+    await tick();
+    world.clock.advance(7_000); // the exchange took 7 of the 10 seconds
+    release(issuedToken);
+    await tick();
+    expect(world.wss.last.sent).toHaveLength(1);
+    // Pre-fix this would have fired 3s later; the gateway now gets a full 10s.
+    world.clock.advance(9_000);
+    await tick();
+    expect(world.logger.joined()).not.toContain('register timed out');
+    expect(world.client.state).toBe('registering');
+    world.clock.advance(2_000);
+    await tick();
+    expect(world.logger.joined()).toContain('register timed out');
+  });
+
   test('a credential resolved after the connection dropped is discarded, never sent late', async () => {
     let release: (result: ClientCredentialsResult) => void = () => {};
     const provider = new RegisterCredentialProvider({

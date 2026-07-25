@@ -74,6 +74,24 @@ export interface RegisterCredential {
    * OAuth path failed"), always null for `oauth`.
    */
   reason: string | null;
+  /**
+   * **`legacy` presented as a STAND-IN for a `runner:register` token this
+   * runner could have minted, because the exchange failed this time.**
+   *
+   * This is the difference between "legacy is all this runner has" and
+   * "migrated, but `/oauth/token` blipped", and it is load-bearing at the
+   * reject site: if the cloud then answers `upgrade_required` (the window is
+   * closed and this runner's legacy class is retired), the correct response is
+   * to **back off and retry** — the next exchange may well succeed — not to
+   * stop. Classifying that as fatal would convert a recoverable failure on the
+   * token endpoint into a permanent outage driven by an unrelated one, which
+   * is a NEW R11 path this migration must not create.
+   *
+   * Deliberately false for the {@link RegisterCredentialProvider.forceLegacy}
+   * pin: there the OAuth credential was *itself* fatally refused, the one
+   * retry has already been spent, and a second fatal answer is the real one.
+   */
+  degraded: boolean;
 }
 
 export type RegisterCredentialResolution =
@@ -93,9 +111,26 @@ export interface RegisterCredentialProviderOptions {
    *  expiry, so a reconnect never presents a JWT that dies in flight.
    *  Default 30s (registration tokens live 15 minutes). */
   expiryLeewayMs?: number;
+  /** How long a {@link RegisterCredentialProvider.forceLegacy} pin lasts.
+   *  Default {@link DEFAULT_FORCE_LEGACY_COOLDOWN_MS}. */
+  forceLegacyCooldownMs?: number;
 }
 
 const DEFAULT_EXPIRY_LEEWAY_MS = 30_000;
+
+/**
+ * How long the legacy pin set by {@link RegisterCredentialProvider.forceLegacy}
+ * lasts before the OAuth path is tried again.
+ *
+ * Not permanent, and not immediate. Permanent was wrong: one transient fatal
+ * reject during an authorization-server key roll would pin a long-lived runner
+ * to the legacy credential for its whole life, holding c15's dual-accept window
+ * open indefinitely — and "restart to re-attempt" never fires, because nothing
+ * restarts a runner that is working. Immediate would be wrong too: it would
+ * spend a fatal-classified register on every reconnect. Half an hour costs one
+ * extra handshake per half hour in the bad case and self-heals in the good one.
+ */
+export const DEFAULT_FORCE_LEGACY_COOLDOWN_MS = 30 * 60_000;
 
 /**
  * Which secret authenticates this runner as an OAuth **client** at
@@ -124,6 +159,32 @@ export function canMintRegistrationToken(identity: AgentIdentity): boolean {
     identity.runner_id.length > 0 &&
     identity.base_url.length > 0
   );
+}
+
+/**
+ * Carry a previously-stored legacy `runner_token` forward onto an identity that
+ * does not name one.
+ *
+ * `pipeline-runner register` **overwrites** the config wholesale, so running
+ * the documented migration command — `register --url … --client-id …
+ * --client-secret …` on a live runner — would otherwise delete the legacy token
+ * silently, along with the fallback this entire migration depends on. An
+ * operator who then mistypes the secret (or hits a token-endpoint blip) has a
+ * runner that backs off forever and cannot recover without finding the old
+ * token again. Removing the legacy credential must be the explicit act it is in
+ * `set-credentials --drop-token`, never a side effect of re-registering.
+ *
+ * Returns `carried: true` when a token was actually preserved, so the caller
+ * can say so rather than change the config quietly.
+ */
+export function carryForwardLegacyToken(
+  previous: AgentIdentity | null,
+  next: AgentIdentity
+): { identity: AgentIdentity; carried: boolean } {
+  const existing = previous?.runner_token;
+  if (next.runner_token !== undefined && next.runner_token.length > 0) return { identity: next, carried: false };
+  if (existing === undefined || existing.length === 0) return { identity: next, carried: false };
+  return { identity: { ...next, runner_token: existing }, carried: true };
 }
 
 /**
@@ -156,21 +217,25 @@ export class RegisterCredentialProvider {
   private readonly logger: Logger;
   private readonly requestToken: (options: RequestRunnerRegistrationTokenOptions) => Promise<ClientCredentialsResult>;
   private readonly expiryLeewayMs: number;
+  private readonly forceLegacyCooldownMs: number;
 
   private cached: { value: string; expiresAt: number } | null = null;
   private inFlight: Promise<ClientCredentialsResult> | null = null;
-  private legacyForced_ = false;
+  /** Clock-ms at which a {@link forceLegacy} pin lapses; null ⇒ not pinned. */
+  private legacyForcedUntil: number | null = null;
 
   constructor(private readonly options: RegisterCredentialProviderOptions = {}) {
     this.clock = options.clock ?? systemClock;
     this.logger = options.logger ?? nullLogger;
     this.requestToken = options.requestToken ?? requestRunnerRegistrationToken;
     this.expiryLeewayMs = options.expiryLeewayMs ?? DEFAULT_EXPIRY_LEEWAY_MS;
+    this.forceLegacyCooldownMs = options.forceLegacyCooldownMs ?? DEFAULT_FORCE_LEGACY_COOLDOWN_MS;
   }
 
-  /** True once {@link forceLegacy} has pinned this process to the legacy path. */
+  /** Is a {@link forceLegacy} pin in force RIGHT NOW? Lapses on its own after
+   *  {@link RegisterCredentialProviderOptions.forceLegacyCooldownMs}. */
   get legacyForced(): boolean {
-    return this.legacyForced_;
+    return this.legacyForcedUntil !== null && this.clock.now() < this.legacyForcedUntil;
   }
 
   /**
@@ -182,15 +247,24 @@ export class RegisterCredentialProvider {
    * network dependency anywhere in it.
    */
   immediate(identity: AgentIdentity): RegisterCredentialResolution | null {
-    if (this.legacyForced_) {
-      return this.legacy(identity, 'the OAuth registration credential was refused earlier in this process');
+    if (this.legacyForced) {
+      // Re-stated on EVERY register while the pin holds, at warn, so an
+      // operator watching logs or `status` sees a runner that is silently
+      // still on the legacy credential — the state that holds c15's window
+      // open — rather than one warning scrolling away hours ago.
+      this.logger.warn(
+        'register: still using this runner\'s LEGACY token because its OAuth registration credential was ' +
+          'refused. Fix the client secret (`pipeline-runner set-credentials`); the OAuth path is retried ' +
+          'automatically once the cooldown lapses.'
+      );
+      return this.legacy(identity, 'the OAuth registration credential was refused earlier in this process', false);
     }
     if (!canMintRegistrationToken(identity)) {
-      return this.legacy(identity, 'no OAuth client credentials configured for this runner');
+      return this.legacy(identity, 'no OAuth client credentials configured for this runner', false);
     }
     const cached = this.cached;
     if (cached !== null && cached.expiresAt - this.expiryLeewayMs > this.clock.now()) {
-      return { ok: true, credential: { value: cached.value, credentialClass: 'oauth', reason: null } };
+      return { ok: true, credential: { value: cached.value, credentialClass: 'oauth', reason: null, degraded: false } };
     }
     return null;
   }
@@ -207,7 +281,10 @@ export class RegisterCredentialProvider {
     const result = await this.exchange(identity);
     if (result.ok) {
       this.cached = { value: result.token.accessToken, expiresAt: result.token.expiresAt };
-      return { ok: true, credential: { value: result.token.accessToken, credentialClass: 'oauth', reason: null } };
+      return {
+        ok: true,
+        credential: { value: result.token.accessToken, credentialClass: 'oauth', reason: null, degraded: false },
+      };
     }
 
     // Every refusal, every network failure, every malformed body lands here.
@@ -218,7 +295,9 @@ export class RegisterCredentialProvider {
     this.logger.warn(
       `register: ${reason} — falling back to the legacy runner token (the cloud dual-accepts during the P6 window)`
     );
-    return this.legacy(identity, reason);
+    // `degraded` — this runner CAN mint, the exchange just failed. See the
+    // field doc: a fatal reject of this stand-in must be retried, not honoured.
+    return this.legacy(identity, reason, true);
   }
 
   /**
@@ -239,21 +318,24 @@ export class RegisterCredentialProvider {
    * valid legacy token, would have stayed online. So `AgentClient` calls this
    * and retries with legacy once before honouring a fatal reject.
    *
-   * Sticky for the process on purpose: a *rejected* OAuth credential is a
-   * configuration fault, not a transient one, and re-trying it on every
-   * reconnect would spend a fatal-classified register each time. A restart
-   * re-attempts the migration; the loud warning says so.
+   * The pin is time-boxed ({@link DEFAULT_FORCE_LEGACY_COOLDOWN_MS}) rather
+   * than permanent: a *rejected* OAuth credential is usually a configuration
+   * fault, but "usually" is not "always" — an authorization-server key roll
+   * looks identical and heals itself. A permanent pin would hold c15's window
+   * open for the life of a runner that nothing ever restarts, so the OAuth path
+   * is retried once the cooldown lapses, and the pin is re-stated at `warn` on
+   * every register while it holds.
    *
    * This does not defeat c15's telemetry — the fallback registers as `legacy`,
    * which is exactly what the readiness gate must see about a runner that
    * currently depends on the legacy credential.
    */
   forceLegacy(): void {
-    this.legacyForced_ = true;
+    this.legacyForcedUntil = this.clock.now() + this.forceLegacyCooldownMs;
     this.invalidate();
   }
 
-  private legacy(identity: AgentIdentity, reason: string): RegisterCredentialResolution {
+  private legacy(identity: AgentIdentity, reason: string, degraded: boolean): RegisterCredentialResolution {
     const token = identity.runner_token;
     if (token === undefined || token.length === 0) {
       return {
@@ -261,7 +343,7 @@ export class RegisterCredentialProvider {
         reason: `${reason}, and this runner holds no legacy runner_token to fall back on`,
       };
     }
-    return { ok: true, credential: { value: token, credentialClass: 'legacy', reason } };
+    return { ok: true, credential: { value: token, credentialClass: 'legacy', reason, degraded } };
   }
 
   private exchange(identity: AgentIdentity): Promise<ClientCredentialsResult> {
