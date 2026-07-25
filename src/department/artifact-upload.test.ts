@@ -13,11 +13,18 @@
  *     `send` is called, with a reason naming the offending size and the cap;
  *   - a `path` artifact is size-checked via `statSize` BEFORE `readFile` is
  *     ever called — an over-cap file on disk is never read into memory;
- *   - a connection drop mid-chunk-stream is reported rejected, not retried.
+ *   - a connection drop mid-chunk-stream is reported rejected, not retried;
+ *   - `nodeArtifactFs` — the REAL filesystem implementation (a fake was the
+ *     only thing exercised above; a code-review finding correctly pointed out
+ *     the real implementation was never actually run) — including its bounded
+ *     read closing the `statSize`/`readFile` TOCTOU window.
  */
 
 import { createHash } from 'node:crypto';
-import { describe, expect, test } from 'bun:test';
+import { closeSync, mkdtempSync, openSync, rmSync, writeSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { DeptArtifactMessageSchema } from '@baizor/pipeline-protocol';
 import { CaptureLogger } from '../../tests/_helpers';
 import type { WireFrame } from '../core/wire';
@@ -27,6 +34,7 @@ import {
   INLINE_ARTIFACT_BYTES_LIMIT,
   MAX_ARTIFACT_BYTES,
   MAX_TASK_ARTIFACT_BYTES,
+  nodeArtifactFs,
   uploadDepartmentArtifact,
 } from './artifact-upload';
 
@@ -297,5 +305,104 @@ describe('uploadDepartmentArtifact — caps are enforced runner-first, rejection
     expect(outcome.reason).toContain('aborted mid-transfer');
     expect(sink.frames).toHaveLength(1); // only chunk 0 actually landed in the sink
     expect(logger.lines.some((l) => l.startsWith('warn:') && l.includes('aborted mid-transfer'))).toBe(true);
+  });
+});
+
+describe('nodeArtifactFs — the REAL filesystem (code-review finding: both prior test files only ever exercised a fake)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pipeline-runner-artifact-upload-'));
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeRealFile(name: string, bytes: Uint8Array): string {
+    const path = join(dir, name);
+    const fd = openSync(path, 'w');
+    writeSync(fd, bytes, 0, bytes.length, 0);
+    closeSync(fd);
+    return path;
+  }
+
+  test('a real file under the cap uploads end-to-end (chunked, checksummed, byte-exact) through the real fs, not a fake', () => {
+    const bytes = content(300 * 1024); // 300 KiB -> 2 chunks
+    const path = writeRealFile('report.md', bytes);
+
+    const sink = new FrameSink();
+    const outcome = uploadDepartmentArtifact(baseInput({ name: 'report.md', path }), {
+      send: sink.send,
+      bytesAlreadySentForTask: 0,
+      fs: nodeArtifactFs(),
+    });
+
+    expect(outcome).toEqual({ status: 'sent', size: bytes.byteLength, checksum: sha256Hex(bytes), chunkTotal: 2 });
+    const reassembled = reassemble(sink.frames);
+    expect(Buffer.compare(Buffer.from(reassembled), Buffer.from(bytes))).toBe(0);
+  });
+
+  test('a missing real path is rejected explicitly through the real fs', () => {
+    const sink = new FrameSink();
+    const outcome = uploadDepartmentArtifact(baseInput({ path: join(dir, 'does-not-exist.bin') }), {
+      send: sink.send,
+      bytesAlreadySentForTask: 0,
+      fs: nodeArtifactFs(),
+    });
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status !== 'rejected') throw new Error('unreachable');
+    expect(outcome.reason).toContain('could not be read');
+    expect(sink.frames).toHaveLength(0);
+  });
+
+  test('a real over-cap file on disk is rejected via the real statSize, before send is ever called', () => {
+    const path = writeRealFile('huge.bin', content(MAX_ARTIFACT_BYTES + 1));
+    const sink = new FrameSink();
+    const outcome = uploadDepartmentArtifact(baseInput({ name: 'huge.bin', path }), {
+      send: sink.send,
+      bytesAlreadySentForTask: 0,
+      fs: nodeArtifactFs(),
+    });
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status !== 'rejected') throw new Error('unreachable');
+    expect(outcome.reason).toContain('per-artifact limit');
+    expect(sink.frames).toHaveLength(0);
+  });
+
+  test('nodeArtifactFs().readFile bounds a read to MAX_ARTIFACT_BYTES + 1 bytes even when the real file is several MiB larger', () => {
+    const path = writeRealFile('big.bin', content(MAX_ARTIFACT_BYTES + 5 * 1024 * 1024)); // ~6 MiB, well past the cap
+    const result = nodeArtifactFs().readFile(path);
+    expect(result).not.toBeNull();
+    // Bounded — never the file's real ~6 MiB size, only cap + 1: proves the
+    // read itself cannot be turned into an unbounded-memory read by an
+    // oversize (or growing) file.
+    expect(result!.byteLength).toBe(MAX_ARTIFACT_BYTES + 1);
+  });
+
+  test('a file that GROWS between statSize and readFile (a genuine TOCTOU race) is still rejected, never silently truncated and never fully loaded', () => {
+    // Below the cap when statSize observes it...
+    const path = writeRealFile('grows.bin', content(1024));
+    const realFs = nodeArtifactFs();
+    const growsBetweenStatAndRead: ArtifactFileSystem = {
+      statSize: realFs.statSize,
+      readFile: (p) => {
+        // ...but grows to several MiB past the cap in the window before
+        // readFile actually runs — simulates the race the statSize check
+        // alone cannot close.
+        const fd = openSync(p, 'w');
+        const bigger = content(MAX_ARTIFACT_BYTES + 2 * 1024 * 1024);
+        writeSync(fd, bigger, 0, bigger.length, 0);
+        closeSync(fd);
+        return realFs.readFile(p); // the REAL bounded read
+      },
+    };
+
+    const sink = new FrameSink();
+    const outcome = uploadDepartmentArtifact(baseInput({ name: 'grows.bin', path }), {
+      send: sink.send,
+      bytesAlreadySentForTask: 0,
+      fs: growsBetweenStatAndRead,
+    });
+
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status !== 'rejected') throw new Error('unreachable');
+    expect(outcome.reason).toContain('per-artifact limit');
+    expect(sink.frames).toHaveLength(0); // never sent, despite the race
   });
 });

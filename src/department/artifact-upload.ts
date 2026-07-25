@@ -9,10 +9,13 @@
  * BEFORE a single byte crosses the wire:
  *
  *   - a declared `path` is STAT'd first and refused if it is already over
- *     the per-artifact cap — a hostile or buggy runtime cannot make this
- *     process read an arbitrarily large file into memory just to reject it
- *     (mirrors the cloud assembler's own "refuse before buffering anything",
- *     `mesh-artifacts/reassembly.ts`'s module doc);
+ *     the per-artifact cap (mirrors the cloud assembler's own "refuse before
+ *     buffering anything", `mesh-artifacts/reassembly.ts`'s module doc); the
+ *     REAL filesystem (`nodeArtifactFs`, below) additionally bounds the
+ *     subsequent read itself to `MAX_ARTIFACT_BYTES + 1` bytes, so even a
+ *     file that GROWS in the window between `statSize` and `readFile` (a
+ *     genuine TOCTOU — two separate syscalls) is never pulled fully into
+ *     memory before the over-cap check rejects it;
  *   - inline `bytes` (no `path`) are legal only under
  *     {@link INLINE_ARTIFACT_BYTES_LIMIT} (64 KiB, 07 §3) — `jsonl-process.ts`
  *     already enforces this at parse time for ITS runtimes, but this is
@@ -80,9 +83,19 @@ export interface ArtifactFileSystem {
   /** File size in bytes, or null if the file does not exist / is not a
    *  regular file / cannot be stat'd. Called BEFORE any read. */
   statSize(path: string): number | null;
-  /** Read the whole file. Only ever called after `statSize` returned a
-   *  value at/under {@link MAX_ARTIFACT_BYTES}. Returns null on any read
-   *  error (e.g. the file vanished between stat and read). */
+  /**
+   * Read the file's content. Only ever called after `statSize` returned a
+   * value at/under {@link MAX_ARTIFACT_BYTES}. Returns null on any read
+   * error (e.g. the file vanished between stat and read).
+   *
+   * `statSize` and `readFile` are two separate calls (a TOCTOU window) — a
+   * REAL implementation SHOULD bound how much it ever reads (see
+   * `nodeArtifactFs`'s bounded read below) so a file that GROWS in that
+   * window is still never pulled fully into memory before the caller's
+   * over-cap check rejects it; a test fake need not replicate this (its
+   * fixture sizes are already caller-controlled), but should not claim to be
+   * a faithful stand-in for `nodeArtifactFs` if it skips it.
+   */
   readFile(path: string): Uint8Array | null;
 }
 
@@ -97,10 +110,28 @@ export function nodeArtifactFs(): ArtifactFileSystem {
       }
     },
     readFile: (path) => {
+      // Bounded read (closes the statSize/readFile TOCTOU window, per
+      // code-review finding): read at most MAX_ARTIFACT_BYTES + 1 bytes,
+      // never the file's full CURRENT size. If the file grew after
+      // `statSize` observed it, this still never loads more than one byte
+      // past the cap into memory — `uploadDepartmentArtifact`'s own
+      // over-cap check (`content.byteLength > MAX_ARTIFACT_BYTES`) then
+      // rejects the result exactly as it would have if `statSize` had seen
+      // the true (larger) size to begin with.
+      let fd: number;
       try {
-        return new Uint8Array(nodeFs.readFileSync(path));
+        fd = nodeFs.openSync(path, 'r');
       } catch {
         return null;
+      }
+      try {
+        const buf = Buffer.alloc(MAX_ARTIFACT_BYTES + 1);
+        const bytesRead = nodeFs.readSync(fd, buf, 0, buf.length, 0);
+        return buf.subarray(0, bytesRead);
+      } catch {
+        return null;
+      } finally {
+        nodeFs.closeSync(fd);
       }
     },
   };
@@ -114,10 +145,14 @@ export interface ArtifactUploadInput {
   name: string;
   mediaType: string;
   /** Inline payload — legal only under {@link INLINE_ARTIFACT_BYTES_LIMIT}.
-   *  Exactly one of `bytes`/`path` is expected (mirrors `RuntimeEvent`'s
-   *  `artifact` variant, `./adapter.ts`); both absent, or both present, is
-   *  tolerated by preferring `bytes` (matches `jsonl-process.ts`'s own
-   *  narrowing, which never produces both). */
+   *  Normally exactly one of `bytes`/`path` is set (mirrors `RuntimeEvent`'s
+   *  `artifact` variant, `./adapter.ts`), but neither is REQUIRED to be
+   *  mutually exclusive by construction: `jsonl-process.ts`'s
+   *  `narrowRuntimeEvent` narrows `raw.bytes` and `raw.path` independently
+   *  (no either/or check), so a `task.artifact` line that legitimately
+   *  carries both (inline bytes under 64 KiB AND a path) produces a
+   *  `RuntimeEvent` with both set too. Both absent, or both present, is
+   *  tolerated here by preferring `bytes`. */
   bytes?: Uint8Array;
   /** A path on disk — read, size-checked, then uploaded (07 §3). */
   path?: string;

@@ -14,7 +14,7 @@
  * swallowing it.
  */
 
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock } from '../../tests/_helpers';
 import { Dispatcher } from '../core/dispatcher';
@@ -51,13 +51,20 @@ class FrameSink {
 
 class FakeArtifactFs implements ArtifactFileSystem {
   files = new Map<string, Uint8Array>();
+  /** Every path `statSize`/`readFile` was actually called with, in order —
+   *  lets a test assert the EXACT resolved path the manager passed down (or
+   *  that neither was ever called at all, for the container-tier refusal). */
+  statSizeCalls: string[] = [];
+  readFileCalls: string[] = [];
   put(path: string, bytes: Uint8Array): void {
     this.files.set(path, bytes);
   }
   statSize(path: string): number | null {
+    this.statSizeCalls.push(path);
     return this.files.get(path)?.byteLength ?? null;
   }
   readFile(path: string): Uint8Array | null {
+    this.readFileCalls.push(path);
     return this.files.get(path) ?? null;
   }
 }
@@ -244,5 +251,151 @@ describe('DepartmentManager — department.artifact_ack handling (d3, 08 §6)', 
 
     expect(() => dispatcher.dispatch({ type: 'department.artifact_ack', accepted: true })).not.toThrow();
     expect(logger.lines.some((l) => l.startsWith('warn:') && l.includes('malformed department.artifact_ack'))).toBe(true);
+  });
+});
+
+describe('DepartmentManager — artifact path resolution (d3, code-review finding)', () => {
+  test('a RELATIVE task.artifact path is resolved against the department\'s own RuntimeConfig.cwd, not the daemon\'s cwd', async () => {
+    const fs = new FakeArtifactFs();
+    const expectedPath = resolvePath('/work/dept-a', './out/review.md');
+    fs.put(expectedPath, content(1024));
+    const { manager, adapter, runtimes, sink } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', cwd: '/work/dept-a' });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'artifact', name: 'review.md', mediaType: 'text/markdown', path: './out/review.md' });
+
+    expect(fs.statSizeCalls).toEqual([expectedPath]);
+    expect(fs.readFileCalls).toEqual([expectedPath]);
+    expect(sink.artifactFrames()).toHaveLength(1);
+  });
+
+  test('a RELATIVE path with no declared cwd is passed through unchanged — existing (pre-fix) behaviour, now explicit', async () => {
+    const fs = new FakeArtifactFs();
+    fs.put('./out/review.md', content(1024)); // no cwd to resolve against
+    const { manager, adapter, runtimes, sink } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' }); // no cwd
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'artifact', name: 'review.md', mediaType: 'text/markdown', path: './out/review.md' });
+
+    expect(fs.statSizeCalls).toEqual(['./out/review.md']);
+    expect(sink.artifactFrames()).toHaveLength(1);
+  });
+
+  test('an ABSOLUTE path is used as-is even when cwd is declared', async () => {
+    const fs = new FakeArtifactFs();
+    fs.put('/abs/review.md', content(1024));
+    const { manager, adapter, runtimes, sink } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x', cwd: '/work/dept-a' });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'artifact', name: 'review.md', mediaType: 'text/markdown', path: '/abs/review.md' });
+
+    expect(fs.statSizeCalls).toEqual(['/abs/review.md']);
+    expect(sink.artifactFrames()).toHaveLength(1);
+  });
+
+  test('a container-tier department\'s task.artifact path is refused explicitly — the fs is NEVER touched, never misread from the wrong filesystem', async () => {
+    const fs = new FakeArtifactFs();
+    // Deliberately present at the WOULD-BE-resolved-if-mishandled location,
+    // so a regression that falls back to reading from the daemon's own fs
+    // would silently "succeed" instead of failing loudly — this proves the
+    // fs is never even asked.
+    fs.put(resolvePath(process.cwd(), './out/review.md'), content(1024));
+    const { manager, adapter, runtimes, sink, logger } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', {
+      adapterId: 'fake',
+      command: 'x',
+      container: { image: 'some-department-image', mounts: [] },
+    });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'artifact', name: 'review.md', mediaType: 'text/markdown', path: './out/review.md' });
+
+    expect(sink.artifactFrames()).toHaveLength(0);
+    expect(fs.statSizeCalls).toEqual([]);
+    expect(fs.readFileCalls).toEqual([]);
+    expect(
+      logger.lines.some(
+        (l) => l.startsWith('warn:') && l.includes('review.md') && l.includes("'container'-tier") && l.includes('cannot read directly'),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('DepartmentManager — per-task artifact budget reclamation (d3, code-review finding)', () => {
+  test('the per-task budget is reclaimed once the execution reaches task.completed — a second execution of the SAME task gets a fresh 8 MiB budget', async () => {
+    const fs = new FakeArtifactFs();
+    for (let i = 0; i < 8; i++) fs.put(`/e1-${i}.bin`, content(MAX_ARTIFACT_BYTES));
+    fs.put('/e2-0.bin', content(MAX_ARTIFACT_BYTES));
+    const { manager, adapter, runtimes, sink } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+
+    // Execution 1: fill the 8 MiB budget exactly, then complete.
+    await manager.admitTask(makeOffer({ executionId: 'dexec-1', taskId: 'dtask-1' }));
+    for (let i = 0; i < 8; i++) {
+      adapter.emitLatest({ type: 'artifact', name: `e1-${i}.bin`, mediaType: 'application/octet-stream', path: `/e1-${i}.bin` });
+    }
+    expect(sink.artifactFrames().length).toBeGreaterThan(0);
+    adapter.emitLatest({ type: 'completed', summary: 'done' });
+
+    // Execution 2: a NEW executionId, the SAME taskId. If the budget were
+    // never reclaimed, this 1 MiB upload would be rejected outright (0 new
+    // frames, a warn naming the per-task limit) — 8 MiB already "spent" by
+    // execution 1. It must succeed instead: at least one new frame sent.
+    await manager.admitTask(makeOffer({ executionId: 'dexec-2', taskId: 'dtask-1' }));
+    const framesBeforeE2 = sink.artifactFrames().length;
+    adapter.emitLatest({ type: 'artifact', name: 'e2-0.bin', mediaType: 'application/octet-stream', path: '/e2-0.bin' });
+
+    expect(sink.artifactFrames().length).toBeGreaterThan(framesBeforeE2);
+  });
+
+  test('the per-task budget is reclaimed after department.lease_revoked too — that path deliberately bypasses reportTerminal and needs its own reclamation', async () => {
+    const fs = new FakeArtifactFs();
+    for (let i = 0; i < 8; i++) fs.put(`/e1-${i}.bin`, content(MAX_ARTIFACT_BYTES));
+    fs.put('/e2-0.bin', content(MAX_ARTIFACT_BYTES));
+    const { manager, adapter, runtimes, sink, dispatcher } = makeManager({ artifactFs: fs });
+    manager.attach(dispatcher);
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+
+    await manager.admitTask(makeOffer({ executionId: 'dexec-1', taskId: 'dtask-1' }));
+    for (let i = 0; i < 8; i++) {
+      adapter.emitLatest({ type: 'artifact', name: `e1-${i}.bin`, mediaType: 'application/octet-stream', path: `/e1-${i}.bin` });
+    }
+    expect(sink.artifactFrames().length).toBeGreaterThan(0);
+
+    dispatcher.dispatch({ type: 'department.lease_revoked', execution_id: 'dexec-1', reason: 'reassigned to another runner' });
+
+    await manager.admitTask(makeOffer({ executionId: 'dexec-2', taskId: 'dtask-1' }));
+    const framesBeforeE2 = sink.artifactFrames().length;
+    adapter.emitLatest({ type: 'artifact', name: 'e2-0.bin', mediaType: 'application/octet-stream', path: '/e2-0.bin' });
+
+    expect(sink.artifactFrames().length).toBeGreaterThan(framesBeforeE2);
+  });
+
+  test('the budget is NOT reclaimed while ANOTHER execution of the same task is still live — a redelivered-offer execution keeps its running total', async () => {
+    // Two concurrent (non-terminal) executions of the SAME taskId: e1 spends
+    // most of the budget; if terminating some OTHER, unrelated bookkeeping
+    // ever accidentally cleared the shared per-task entry while e1 is still
+    // live, e2 would wrongly get a fresh budget. Guard against that by
+    // proving a third execution's rejection still reflects e1's spend.
+    const fs = new FakeArtifactFs();
+    for (let i = 0; i < 8; i++) fs.put(`/e1-${i}.bin`, content(MAX_ARTIFACT_BYTES));
+    const { manager, adapter, runtimes, sink, logger } = makeManager({ artifactFs: fs });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+
+    await manager.admitTask(makeOffer({ executionId: 'dexec-1', taskId: 'dtask-1' }));
+    for (let i = 0; i < 8; i++) {
+      adapter.emitLatest({ type: 'artifact', name: `e1-${i}.bin`, mediaType: 'application/octet-stream', path: `/e1-${i}.bin` });
+    }
+    expect(sink.artifactFrames().length).toBeGreaterThan(0);
+    // dexec-1 is NEVER terminated in this test — it stays live.
+
+    fs.put('/e2-0.bin', content(2048));
+    await manager.admitTask(makeOffer({ executionId: 'dexec-2', taskId: 'dtask-1' }));
+    adapter.emitLatest({ type: 'artifact', name: 'e2-0.bin', mediaType: 'application/octet-stream', path: '/e2-0.bin' });
+
+    expect(logger.lines.some((l) => l.startsWith('warn:') && l.includes('e2-0.bin') && l.includes('per-task limit'))).toBe(true);
   });
 });
