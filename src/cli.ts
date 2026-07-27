@@ -33,6 +33,20 @@
  *       holds this home. `--home <path>` (or the PIPELINE_RUNNER_HOME env
  *       var it sets) roots this instance's config dir, data dir, and job-
  *       workspace root, isolating it from every other home on the host.
+ *
+ *   bind --department <id> --command <cmd> [--adapter <id>] [--arg <a>]...
+ *        [--cwd <path>] [--lifecycle <l>] [--spec <json>] [--home <path>]
+ *   unbind --department <id> [--home <path>]
+ *   bindings [--json] [--home <path>]
+ *       simplified-onboarding b1 (design 05 §5 step 6, D14): the LOCAL
+ *       department runtime bindings — which `department_id` this machine will
+ *       actually execute, and how. They live in a file-backed store
+ *       (`./department/bindings.ts`) that a RUNNING supervisor reloads, so
+ *       `pipeline department serve` on a machine that is already serving ends
+ *       in `● online` instead of "restart the supervisor". This is also the
+ *       seam another package shells out to rather than writing this package's
+ *       config store itself (D26's rule, applied to the binding too).
+ *
  *   status   Print the stored identity (token redacted).
  */
 
@@ -46,7 +60,16 @@ import { AgentClient } from './core/connection';
 // workspace-root resolver — see `./core/home.ts`'s module doc for the full
 // picture (config/data dir home-awareness lives in `core/config.ts` /
 // `shipper/fs.ts` themselves).
-import { acquireHomeLock, HomeLockError, type HomeLockHandle, PIPELINE_RUNNER_HOME_ENV, resolveLockHomeDir, resolveWorkspaceRoot } from './core/home';
+import {
+  acquireHomeLock,
+  HomeLockError,
+  type HomeLockHandle,
+  isProcessAlive,
+  PIPELINE_RUNNER_HOME_ENV,
+  readHomeLockPid,
+  resolveLockHomeDir,
+  resolveWorkspaceRoot,
+} from './core/home';
 import { consoleLogger } from './core/log';
 // department-mesh d5 (P6, 13 §10.2): which credential registers this runner,
 // and which secret authenticates it as an OAuth client. See
@@ -80,10 +103,12 @@ import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './re
 import { runService } from './service';
 // department-mesh (task d1): a SECOND, PARALLEL admission surface for
 // department tasks (`department.offer`/`.message`/`.cancel`) — mirrors
-// attachJobExecution's construction shape without touching pipeline
-// dispatch. `parseDepartmentRuntimesEnv` is a placeholder until department
-// install/config_update (task c2) lands — see `./department/config.ts`.
-import { parseDepartmentRuntimesEnv } from './department/config';
+// attachJobExecution's construction shape without touching pipeline dispatch.
+// simplified-onboarding b1 (D14): what a `department_id` resolves to now comes
+// from the file-backed, RELOADABLE binding store — `PIPELINE_RUNNER_DEPARTMENTS`
+// survives inside it as a deprecated, boot-time-only fallback.
+import { BindingStoreError, DepartmentBindingStore } from './department/bindings';
+import { DEPARTMENT_RUNTIMES_ENV } from './department/config';
 // department-mesh d8 (D17): the `container` isolation-tier adapter — an
 // ADDITIONAL entry in the manager's adapter registry, resolved by
 // `RuntimeConfig.adapterId` exactly like `jsonl-process`; a department only
@@ -139,11 +164,20 @@ function usage(): never {
       '           [--gpu] [--container] [--store-only]',
       '  set-credentials --client-id <id> --client-secret <secret> [--drop-token] [--home <path>]',
       '  start [--home <path>]',
+      '  bind --department <id> --command <cmd> [--adapter <id>] [--arg <a>]...',
+      '       [--cwd <path>] [--lifecycle <per-task|per-context|daemon>]',
+      '       [--spec <json>] [--home <path>]',
+      '  unbind --department <id> [--home <path>]',
+      '  bindings [--json] [--home <path>]',
       '  status',
       '  service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
       '',
       `  ${CLIENT_ID_ENV} / ${CLIENT_SECRET_ENV} may supply the OAuth client`,
       '  credentials instead of the flags (keeps the secret out of argv).',
+      '',
+      `  ${DEPARTMENT_RUNTIMES_ENV} is DEPRECATED — it is read only when no binding`,
+      '  file exists, and a supervisor configured that way cannot learn about a new',
+      '  department without a restart. Use `bind` instead.',
       '',
       `pipeline-runner ${AGENT_VERSION} (protocol v1)`,
     ].join('\n')
@@ -520,7 +554,31 @@ function runStart(argv: string[] = []): void {
   // graceful shutdown's drain/suspend sequence below — draining new offers
   // (via `client.draining || shuttingDown`) is wired today, in-flight
   // executions are not yet suspended on SIGTERM/SIGINT.
-  const departmentRuntimes = parseDepartmentRuntimesEnv(process.env.PIPELINE_RUNNER_DEPARTMENTS, consoleLogger);
+  //
+  // simplified-onboarding b1 (D14, design 05 §5 step 6): runtime resolution is
+  // no longer a boot-time snapshot. `DepartmentBindingStore` re-reads its
+  // file on a debounced directory watch, on SIGHUP, and on a slow safety-net
+  // poll, and `resolveRuntimeConfig` below reads the LIVE snapshot on every
+  // offer — so a department bound while this supervisor is running is served
+  // without a restart, and an unbound one stops being accepted. Every failure
+  // mode (missing, unreadable, malformed, group/world-writable) resolves to
+  // ZERO bindings: a broken file can only ever narrow what this machine runs.
+  const departmentBindings = new DepartmentBindingStore({ logger: consoleLogger });
+  departmentBindings.reload();
+  const stopBindingWatch = departmentBindings.watch((snapshot, changed) => {
+    if (!changed) return;
+    consoleLogger.info(`department bindings reloaded: ${snapshot.bindings.size} bound (${snapshot.source})`);
+  });
+  // The explicit reload trigger. POSIX only: on Windows SIGHUP means "the
+  // console window closed" and the process is torn down ~10s later regardless,
+  // so installing a handler there would misrepresent a shutdown as a reload —
+  // the directory watch is the Windows mechanism and needs no signal.
+  if (process.platform !== 'win32') {
+    process.on('SIGHUP', () => {
+      consoleLogger.info('SIGHUP — re-reading department bindings');
+      departmentBindings.reload();
+    });
+  }
   // d6: live accessors (not captured values) — same idiom as `runnerId`/
   // `labels`/`capacity` just above, so a manager constructed before
   // `register_ack` still works once `store.load()` starts returning a
@@ -547,7 +605,7 @@ function runStart(argv: string[] = []): void {
       new ContainerAdapter({ logger: consoleLogger }),
       new PipelineDriveAdapter({ logger: consoleLogger }),
     ],
-    resolveRuntimeConfig: (departmentId) => departmentRuntimes.get(departmentId) ?? null,
+    resolveRuntimeConfig: (departmentId) => departmentBindings.get(departmentId),
     send: (frame) => client.send(frame),
     dispatcher: client.dispatcher,
     journal: nodeJournalWriter(),
@@ -588,7 +646,12 @@ function runStart(argv: string[] = []): void {
     // d7 (D17): release the per-home lock on a clean shutdown. Best-effort —
     // a hard death (SCM stop, kill -9) skips this and relies on the next
     // `start`'s stale-pid self-heal (`core/home.ts`) instead.
-    releaseLock: () => lock.release(),
+    // b1: the binding watcher's timers/handle go with it. It is created with
+    // `persistent: false`, so this is tidiness rather than a hang fix.
+    releaseLock: () => {
+      stopBindingWatch();
+      lock.release();
+    },
     exit: (code) => process.exit(code),
     logger: consoleLogger,
   });
@@ -597,6 +660,171 @@ function runStart(argv: string[] = []): void {
 
   client.start();
   // Active timers/sockets keep the Bun event loop alive; nothing else to do.
+}
+
+// ── simplified-onboarding b1: the local runtime-binding surface ────────────
+
+/**
+ * Tell a RUNNING supervisor for this home to re-read its bindings.
+ *
+ * The directory watch already picks the change up on every platform; SIGHUP
+ * is the explicit trigger that does not depend on `fs.watch` being delivered
+ * (network mounts, some container overlays). On Windows SIGHUP is not a
+ * reload signal at all — it means the console closed — so we say what will
+ * happen instead of sending it.
+ */
+function signalSupervisorReload(): void {
+  const pid = readHomeLockPid(resolveLockHomeDir());
+  if (pid === null || !isProcessAlive(pid)) {
+    console.log('[pipeline-runner] no supervisor is running for this home — the change applies at the next `start`.');
+    return;
+  }
+  if (process.platform === 'win32') {
+    console.log(`[pipeline-runner] supervisor pid ${pid} is running — it picks this up automatically (file watch).`);
+    return;
+  }
+  try {
+    process.kill(pid, 'SIGHUP');
+    console.log(`[pipeline-runner] signalled supervisor pid ${pid} (SIGHUP) to reload.`);
+  } catch (err) {
+    console.log(
+      `[pipeline-runner] could not signal pid ${pid} (${err instanceof Error ? err.message : String(err)}) — ` +
+        'its file watch still picks the change up.'
+    );
+  }
+}
+
+function bindingStoreFor(home: string | undefined, quiet = false): DepartmentBindingStore {
+  // Same idiom as `runStart`/`runSetCredentials`: set the env var FIRST so
+  // every path resolver below lands in the right home.
+  if (home) process.env[PIPELINE_RUNNER_HOME_ENV] = home;
+  // `quiet` drops the store's own INFO summary (the command prints its own,
+  // better one) while keeping every WARN — a deprecation or a skipped entry
+  // must never be swallowed by a presentation choice.
+  return new DepartmentBindingStore({ logger: quiet ? { ...consoleLogger, info: () => {} } : consoleLogger });
+}
+
+function runBind(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      department: { type: 'string' },
+      adapter: { type: 'string' },
+      command: { type: 'string' },
+      arg: { type: 'string', multiple: true },
+      cwd: { type: 'string' },
+      lifecycle: { type: 'string' },
+      spec: { type: 'string' },
+      home: { type: 'string' },
+    },
+  });
+  if (!values.department) fail('--department <id> is required');
+
+  // `--spec` is the escape hatch for the specs no flag set should carry —
+  // `container` sandboxes (d8) and `pipeline-drive` targets (d4) are nested
+  // objects. The flags layer ON TOP of it so the common case stays flat and
+  // the complex case stays possible, without two ways to spell one field.
+  let base: Record<string, unknown> = {};
+  if (values.spec !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(values.spec);
+    } catch {
+      fail('--spec must be a JSON object describing the runtime');
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) fail('--spec must be a JSON object');
+    base = parsed as Record<string, unknown>;
+  }
+  const spec: Record<string, unknown> = { adapterId: 'jsonl-process', ...base };
+  if (values.adapter !== undefined) spec.adapterId = values.adapter;
+  if (values.command !== undefined) spec.command = values.command;
+  if (values.arg !== undefined) spec.args = values.arg;
+  if (values.cwd !== undefined) spec.cwd = values.cwd;
+  if (values.lifecycle !== undefined) spec.lifecycle = values.lifecycle;
+  if (typeof spec.command !== 'string' || spec.command.length === 0) {
+    fail('--command <cmd> is required (or a `command` field in --spec)');
+  }
+
+  const store = bindingStoreFor(values.home);
+  let stored;
+  try {
+    stored = store.bind(values.department, spec);
+  } catch (err) {
+    if (err instanceof BindingStoreError) fail(`could not write the runtime binding: ${store.path} (${err.message})`);
+    throw err;
+  }
+  console.log(`[pipeline-runner] bound ${values.department} -> ${stored.adapterId}: ${stored.command} (${store.path})`);
+  // The store narrows rather than rejects on optional fields (dropping one can
+  // only narrow what runs) — but a silently dropped flag is a lie, so say it.
+  if (values.lifecycle !== undefined && stored.lifecycle === undefined) {
+    console.warn(
+      `[pipeline-runner] warn: lifecycle '${values.lifecycle}' is not one of per-task|per-context|daemon — dropped; ` +
+        'the adapter default applies'
+    );
+  }
+  signalSupervisorReload();
+}
+
+function runUnbind(argv: string[]): void {
+  const { values } = parseArgs({ args: argv, options: { department: { type: 'string' }, home: { type: 'string' } } });
+  if (!values.department) fail('--department <id> is required');
+  const store = bindingStoreFor(values.home);
+  let removed: boolean;
+  try {
+    removed = store.unbind(values.department);
+  } catch (err) {
+    if (err instanceof BindingStoreError) fail(`could not update the runtime binding: ${store.path} (${err.message})`);
+    throw err;
+  }
+  if (!removed) {
+    console.log(`[pipeline-runner] ${values.department} was not bound in ${store.path} — nothing to do.`);
+    return;
+  }
+  console.log(`[pipeline-runner] unbound ${values.department} (${store.path}) — new offers for it will be rejected.`);
+  console.log('[pipeline-runner] executions already running for it are NOT cancelled; they finish on their own terms.');
+  signalSupervisorReload();
+}
+
+function runBindings(argv: string[]): void {
+  const { values } = parseArgs({ args: argv, options: { json: { type: 'boolean' }, home: { type: 'string' } } });
+  const store = bindingStoreFor(values.home, true);
+  const snapshot = store.reload();
+  if (values.json === true) {
+    console.log(
+      JSON.stringify(
+        {
+          path: snapshot.path,
+          source: snapshot.source,
+          refusal: snapshot.refusal,
+          departments: Object.fromEntries(snapshot.bindings),
+        },
+        null,
+        2
+      )
+    );
+    // A refused store is a failure an operator (or a script) must be able to
+    // see without parsing prose.
+    if (snapshot.refusal !== null) process.exit(1);
+    return;
+  }
+  console.log(`store: ${snapshot.path} (source: ${snapshot.source})`);
+  if (snapshot.refusal !== null) {
+    console.error(`[pipeline-runner] error: REFUSED — ${snapshot.refusal}`);
+    console.error('[pipeline-runner] no departments are configured; every offer will be rejected.');
+    process.exit(1);
+  }
+  if (snapshot.bindings.size === 0) {
+    console.log(`no departments bound. Bind one with: pipeline-runner bind --department <id> --command <cmd>`);
+    return;
+  }
+  for (const id of store.ids()) {
+    const config = snapshot.bindings.get(id)!;
+    const args = config.args !== undefined && config.args.length > 0 ? ` ${config.args.join(' ')}` : '';
+    console.log(`  ${id}  ${config.adapterId}  ${config.command}${args}${config.lifecycle ? `  [${config.lifecycle}]` : ''}`);
+  }
+  if (snapshot.source === 'env') {
+    console.warn(`[pipeline-runner] warn: these come from ${DEPARTMENT_RUNTIMES_ENV}, which is DEPRECATED and cannot be reloaded.`);
+  }
 }
 
 function runStatus(): void {
@@ -616,6 +844,16 @@ switch (command) {
     break;
   case 'start':
     runStart(rest);
+    break;
+  // simplified-onboarding b1: the local runtime-binding surface.
+  case 'bind':
+    runBind(rest);
+    break;
+  case 'unbind':
+    runUnbind(rest);
+    break;
+  case 'bindings':
+    runBindings(rest);
     break;
   case 'status':
     runStatus();

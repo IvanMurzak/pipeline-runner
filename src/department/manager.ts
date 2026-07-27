@@ -231,10 +231,16 @@ export type AdmitResult = { accepted: true } | { accepted: false; reason: Depart
 export interface DepartmentManagerOptions {
   adapters: AgentRuntimeAdapter[];
   /** Resolve a `department_id` to how to run it. Null ⇒ unknown department
-   *  (`capability` reject). This is the STATIC/base config (today:
-   *  `PIPELINE_RUNNER_DEPARTMENTS`, task c2's env placeholder, `./config.ts`)
-   *  — a live `department.config_update` frame (below) layers a per-department
-   *  override on TOP of whatever this returns; it does not replace it. */
+   *  (`capability` reject). This is the BASE config, sourced from the
+   *  file-backed binding store (`./bindings.ts`; `PIPELINE_RUNNER_DEPARTMENTS`
+   *  survives inside it as a deprecated fallback) — a live
+   *  `department.config_update` frame (below) layers a per-department override
+   *  on TOP of whatever this returns; it does not replace it.
+   *
+   *  It MUST be a live accessor, never a captured Map: b1 made the binding
+   *  store reloadable precisely so a running supervisor picks up a department
+   *  bound after it started, and it does that by returning a different answer
+   *  from this call, at admission, without any frame or restart. */
   resolveRuntimeConfig(departmentId: string): RuntimeConfig | null;
   send(frame: WireFrame): boolean;
   /** The agent connection's dispatcher — both for `attach()`'s inbound

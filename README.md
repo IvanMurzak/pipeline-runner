@@ -39,6 +39,12 @@ bun src/cli.ts status
 
 # install/uninstall/status as a native OS service
 bun src/cli.ts service <install|uninstall|status> [--dry-run]
+
+# department runtime bindings — what this machine will actually execute
+bun src/cli.ts bind --department <id> --command <cmd> [--arg=<a>]... \
+    [--adapter <id>] [--cwd <path>] [--lifecycle <l>] [--spec <json>]
+bun src/cli.ts unbind --department <id>
+bun src/cli.ts bindings [--json]
 ```
 
 `register` flags:
@@ -182,6 +188,48 @@ fallback) with restrictive file permissions where the OS supports them. The
 runner token is a secret: it is persisted (it is the runner's credential) but
 never logged.
 
+## Department runtime bindings
+
+A **binding** says which `department_id` this machine will execute and how. It
+is the local half of a department: the control plane holds the advertised
+manifest and structurally refuses to store `command` / `args` /
+`workingDirectory` / `environment`, so nothing remote can change what runs
+here.
+
+```sh
+bun src/cli.ts bind --department 018f…-uuid --command unity-department --arg=--stdio
+bun src/cli.ts bindings
+bun src/cli.ts unbind --department 018f…-uuid
+```
+
+Bindings live in `departments.json` next to `config.json` (so
+`PIPELINE_RUNNER_HOME` isolates them per instance), written mode `0600` inside
+a `0700` directory. **A running runner re-reads the file** — on a filesystem
+watch, on `SIGHUP` (POSIX), and on a slow safety-net poll — so binding or
+unbinding a department takes effect without a restart. Unbinding stops new
+offers being accepted; executions already running are left to finish.
+
+Everything about the file **fails closed**: missing, unreadable, not JSON, the
+wrong shape, an `apiVersion` this runner does not know, or a file that is
+group-/world-writable or owned by another account all resolve to *no
+departments configured*, with the reason stated in the log. A broken or
+half-written file can therefore only ever narrow what this machine runs, never
+widen it. (On Windows POSIX modes are meaningless, so the per-user profile ACL
+is the control there — the same posture `config.json` has always had.)
+
+`bindings` exits non-zero when the store is refused, so a script can tell.
+
+### `PIPELINE_RUNNER_DEPARTMENTS` is deprecated
+
+The old environment variable still works, unchanged, **when no binding file
+exists** — and it now prints a deprecation warning. It is boot-time immutable
+by construction: a runner configured that way cannot learn about a new
+department without a restart, which is the whole reason the file exists.
+
+If a binding file exists, the file is the **sole authority** and the variable
+is ignored with a warning naming both. There is no merge: a security-critical
+answer gets one author.
+
 ## Run-stats sync and the `sync_local_stats` flag
 
 A registered runner syncs per-run **statistics records** to the control plane
@@ -233,7 +281,8 @@ src/jobs/                # lease -> accept -> workspace -> `pipeline drive`
 src/shipper/             # event shipper: tails run artifacts, batches, uploads
 src/relay/               # needs-input relay over the WSS channel
 src/service/             # OS service install/uninstall/status (systemd/launchd/Windows)
-src/cli.ts               # thin CLI: register / start / status / service
+src/department/bindings.ts # file-backed, reloadable department runtime bindings
+src/cli.ts               # thin CLI: register / start / status / service / bind
 ```
 
 ## Wire protocol

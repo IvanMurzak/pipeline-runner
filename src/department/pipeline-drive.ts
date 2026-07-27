@@ -652,10 +652,10 @@ export class PipelineDriveAdapter implements AgentRuntimeAdapter {
 }
 
 /**
- * Narrow an unknown value (loaded from `PIPELINE_RUNNER_DEPARTMENTS`,
- * `./config.ts`'s placeholder department-runtime resolution) back into a
- * `PipelineDriveSpec`, or `undefined` if it is not well-formed enough to
- * drive a run from — same tolerant-parse philosophy `./container.ts`'s own
+ * Narrow an unknown value (loaded from the department binding store,
+ * `./bindings.ts`, or its deprecated `PIPELINE_RUNNER_DEPARTMENTS` fallback)
+ * back into a `PipelineDriveSpec`, or `undefined` if it is not well-formed
+ * enough to drive a run from — same tolerant-parse philosophy `./container.ts`'s
  * `narrowContainerSpec` already uses. Deliberately strict about the two
  * REQUIRED fields (`pipelineRoot`, `startIteration` — a spec missing either
  * cannot build a valid `--root`/`--start` invocation) but tolerant of
