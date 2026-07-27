@@ -185,6 +185,22 @@ function usage(): never {
   process.exit(0);
 }
 
+/**
+ * x11: an unrecognized subcommand is a USAGE ERROR, not the intentional
+ * `--help`/no-args path above — that one prints to stdout and exits 0
+ * because asking for help is not a failure. This is the opposite case (a
+ * typo, or a verb this build has never heard of), so it goes through `fail()`
+ * — stderr, exit 1 — exactly like every other usage failure in this file
+ * (e.g. `--url is required`). Before this fix EVERY unmatched command fell
+ * into `usage()` and exited 0, so a caller shelling out to this binary (the
+ * `pipeline` CLI's `department serve`, invoking `bind`) could not tell "ran
+ * and failed" apart from "this runner build predates that verb" — an older
+ * installed runner would silently no-op a command added in a later release.
+ */
+function unknownCommand(command: string): never {
+  fail(`unknown command '${command}' — run \`pipeline-runner --help\` for the command list`);
+}
+
 async function runRegister(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -865,6 +881,15 @@ switch (command) {
   case '--version':
     console.log(AGENT_VERSION);
     break;
-  default:
+  // Asking for help is not an error: no verb at all, `--help`, and `-h` all
+  // print the usage text and exit 0.
+  case undefined:
+  case '--help':
+  case '-h':
     usage();
+    break;
+  default:
+    // x11: anything else unmatched is a genuinely unknown subcommand — see
+    // `unknownCommand()`'s doc comment for why this must NOT reuse `usage()`.
+    unknownCommand(command);
 }
