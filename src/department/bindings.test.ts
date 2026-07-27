@@ -14,7 +14,7 @@
  *      a Map.
  */
 
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
@@ -556,7 +556,11 @@ describe('real filesystem', () => {
   test('a world-writable real file is refused', () => {
     if (process.platform === 'win32') return; // modes are synthesised there
     const path = join(dir, BINDINGS_FILE_NAME);
-    writeFileSync(path, doc({ 'dept-a': JSONL }), { mode: 0o666 });
+    writeFileSync(path, doc({ 'dept-a': JSONL }));
+    // `writeFileSync`'s `mode` is masked by the process umask (022 on most CI
+    // images, which would silently produce a harmless 0644) — chmod after the
+    // fact is the only way to actually get the mode under test.
+    chmodSync(path, 0o666);
     const store = new DepartmentBindingStore({ dir, fs: nodeBindingFs(), env: {}, logger: new CaptureLogger() });
     const snapshot = store.reload();
     expect(snapshot.bindings.size).toBe(0);
