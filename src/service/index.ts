@@ -167,8 +167,9 @@ function parseInstanceFlags(rest: string[]): { name?: string; home?: string } {
 
 /**
  * Handle `pipeline-runner service ...`. Prints outcome lines and exits non-zero
- * on a `ServiceError` (unsupported platform, privilege, session hints) — never
- * crashes with a raw stack.
+ * on a `ServiceError` (unsupported platform, privilege, session hints, or an
+ * unrecognized verb — see the `default` case below) — never crashes with a
+ * raw stack.
  */
 export function runService(argv: string[]): void {
   const [sub, ...rest] = argv;
@@ -193,9 +194,23 @@ export function runService(argv: string[]): void {
       case 'status':
         printResult(serviceStatus(opts));
         return;
-      default:
+      // Asking for help is not an error: no verb at all, `--help`, and `-h`
+      // all print the usage text and exit 0 — mirrors src/cli.ts's top-level
+      // dispatcher.
+      case undefined:
+      case '--help':
+      case '-h':
         serviceUsage();
         return;
+      default:
+        // x11 (follow-up): a genuinely unrecognized `service` verb is a
+        // usage ERROR, not a no-op. This is on the SAME false-success path
+        // as the top-level fix — the plugin's `runner-enrol.ts` shells out
+        // to `pipeline-runner service install` as `department serve`'s
+        // supervisor step and checks the exit code, so a version-skewed
+        // runner that predates a verb must fail loudly here too, not print
+        // usage to stdout and exit 0.
+        throw new ServiceError(`unknown service command '${sub}' — run \`pipeline-runner service --help\` for usage`);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -56,3 +56,41 @@ describe('cli dispatch', () => {
     expect(stdout).toContain('usage: pipeline-runner <command>');
   });
 });
+
+/**
+ * x11 follow-up: `pipeline-runner service <sub>` is a SECOND, nested
+ * dispatcher with the identical unknown-verb shape as the top-level one
+ * above — and it sits on the same false-success path that produced the
+ * original bug report. The plugin's `runner-enrol.ts` shells out to
+ * `pipeline-runner service install` as `department serve`'s supervisor
+ * step and checks the exit code; an unrecognized `service` verb exiting 0
+ * would let `serve` report the supervisor installed when it never ran.
+ */
+describe('cli dispatch — service subcommand', () => {
+  test('an unknown service verb exits non-zero with the error on stderr, not stdout', () => {
+    const { exitCode, stdout, stderr } = run(['service', 'totally-fake-verb']);
+    expect(exitCode).not.toBe(0);
+    expect(exitCode).toBe(1);
+    expect(stdout).toBe('');
+    expect(stderr).toContain("unknown service command 'totally-fake-verb'");
+  });
+
+  test('service --help prints usage to stdout and exits 0', () => {
+    const { exitCode, stdout, stderr } = run(['service', '--help']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('usage: pipeline-runner service <install|uninstall|status>');
+    expect(stderr).toBe('');
+  });
+
+  test('service -h behaves the same as service --help', () => {
+    const { exitCode, stdout } = run(['service', '-h']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('usage: pipeline-runner service <install|uninstall|status>');
+  });
+
+  test('service with no sub-verb also prints usage and exits 0', () => {
+    const { exitCode, stdout } = run(['service']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('usage: pipeline-runner service <install|uninstall|status>');
+  });
+});
