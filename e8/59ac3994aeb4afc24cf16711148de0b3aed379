@@ -1,0 +1,21 @@
+src/cli.ts
+  s_cea351c0f0ef15::t_d9cb8e3475bc34 188-203,884-888,890-894
+tests/cli.test.ts
+  s_cea351c0f0ef15::t_3e3a29f034e72f 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "e859ac3994aeb4afc24cf16711148de0b3aed379",
+  "prompts": {},
+  "sessions": {
+    "s_cea351c0f0ef15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aef5783ea60d7a2e9",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
