@@ -1,12 +1,28 @@
 /**
- * Placeholder department-runtime resolution (task d1). Department install,
- * manifest fetch, and `department.config_update` caching (task c2 /
- * `06-department-registry.md`) do not exist on the runner yet — this reads
- * an optional env var so the adapter + supervisor wiring (`./manager.ts`,
- * `./jsonl-process.ts`) can be exercised end-to-end (local dev, manual
- * integration testing) without that machinery. Production department
- * resolution replaces this wholesale; nothing else in `./manager.ts` depends
- * on HOW a `department_id` resolves to a `RuntimeConfig`, only that it can.
+ * `RuntimeConfig` narrowing, plus the DEPRECATED `PIPELINE_RUNNER_DEPARTMENTS`
+ * fallback.
+ *
+ * `narrowRuntimeConfig` is the one place a `department_id`'s runtime spec is
+ * validated, shared by both sources: the file-backed store (`./bindings.ts`,
+ * the supported one) and the env var below.
+ *
+ * ## The env var is deprecated (simplified-onboarding b1, D14)
+ *
+ * This was task d1's placeholder: department install and manifest fetch did
+ * not exist on the runner, so an env var stood in. It has a fatal property for
+ * the onboarding path — it is BOOT-TIME IMMUTABLE. `cli.ts` parsed it once and
+ * closed over the resulting Map, so a supervisor that was already running
+ * could never learn about a department created after it started, and
+ * `department.config_update` is not an escape hatch (`./manager.ts`: it
+ * carries `limits.parkExpiry` only and drops frames for departments the map
+ * does not know). `pipeline department serve` therefore ended in "restart the
+ * supervisor" instead of `● online`.
+ *
+ * `./bindings.ts` replaces it with a reloadable file. This module stays for
+ * one reason: an existing local setup that exports the variable must keep
+ * working. It does — but only when NO binding file exists, and always with a
+ * deprecation warning (emitted by the store, which is the thing that knows
+ * which source won). Nothing here is deleted until the variable is removed.
  */
 
 import type { Logger } from '../core/log';
@@ -29,6 +45,10 @@ const LIFECYCLES: readonly RuntimeLifecycle[] = ['per-task', 'per-context', 'dae
  * RuntimeConfig-ish }` — into a lookup map. Unset/blank/malformed fails
  * CLOSED to an empty map (no configured departments — every offer gets a
  * `capability` reject) rather than crashing the daemon.
+ *
+ * @deprecated Use `./bindings.ts`'s `DepartmentBindingStore`. Kept so an
+ * existing local setup does not break; consulted only when no binding file
+ * exists, and always behind a deprecation warning.
  */
 export function parseDepartmentRuntimesEnv(raw: string | undefined, logger: Logger = nullLogger): Map<string, RuntimeConfig> {
   const map = new Map<string, RuntimeConfig>();
@@ -57,7 +77,18 @@ export function parseDepartmentRuntimesEnv(raw: string | undefined, logger: Logg
   return map;
 }
 
-function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
+/**
+ * Narrow an untrusted value into a `RuntimeConfig`, or null when it cannot be
+ * one. Deliberately tolerant on OPTIONAL fields (an unrecognized `lifecycle`,
+ * a non-numeric timeout, a malformed `container` spec are dropped, not fatal)
+ * and strict on the two that decide what executes: `adapterId` and `command`
+ * must both be present, non-empty strings. Dropping a field can only narrow
+ * what a runtime is allowed to do; inventing one could widen it.
+ *
+ * Shared by `./bindings.ts` (the file store) and the deprecated env var above,
+ * so both sources apply byte-identical validation.
+ */
+export function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.adapterId !== 'string' || r.adapterId.length === 0) return null;

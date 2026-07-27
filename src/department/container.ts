@@ -253,10 +253,10 @@ export function buildContainerArgs(params: BuildContainerArgsParams): BuiltConta
 }
 
 /**
- * Narrow an unknown value (loaded from `PIPELINE_RUNNER_DEPARTMENTS`,
- * `./config.ts`'s placeholder department-runtime resolution) back into a
- * `ContainerSpec`, or `undefined` if it is not well-formed enough to build a
- * sandbox from — same tolerant-parse philosophy `./config.ts`'s own
+ * Narrow an unknown value (loaded from the department binding store,
+ * `./bindings.ts`, or its deprecated `PIPELINE_RUNNER_DEPARTMENTS` fallback)
+ * back into a `ContainerSpec`, or `undefined` if it is not well-formed enough
+ * to build a sandbox from — same tolerant-parse philosophy `./config.ts`'s own
  * `narrowRuntimeConfig` and `../core/capabilities.ts`'s
  * `narrowRunnerCapabilities` already use. Deliberately strict about `image`
  * (a `ContainerSpec` with no image is useless) but tolerant of malformed

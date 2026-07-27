@@ -206,6 +206,21 @@ export function acquireHomeLock(homeDir: string, options: AcquireHomeLockOptions
   return { path, release: () => lfs.remove(path) };
 }
 
+/**
+ * The pid recorded in this home's lock file, or null when there is none (no
+ * daemon has run, or the file is unreadable/corrupt). This does NOT prove the
+ * process is alive — pair it with `isProcessAlive`.
+ *
+ * Used by `pipeline-runner bind` (simplified-onboarding b1) to signal a
+ * RUNNING supervisor to reload its department bindings: the lock file is
+ * already the one authoritative "who owns this home" record, so the reload
+ * signal needs no second pidfile to drift out of sync with it.
+ */
+export function readHomeLockPid(homeDir: string, lfs: HomeLockFs = nodeHomeLockFs()): number | null {
+  const payload = readLockPayload(lfs, join(homeDir, LOCK_FILE_NAME));
+  return payload === null ? null : payload.pid;
+}
+
 function readLockPayload(lfs: HomeLockFs, path: string): LockPayload | null {
   const text = lfs.readFileText(path);
   if (text === null) return null;
