@@ -17,7 +17,16 @@ import { buildDepartmentJournalEnvelope, DEPARTMENT_JOURNAL_EVENT_TYPES, type De
 import type { RuntimeEvent } from '../src/department/adapter';
 import { filterEventForTier, MESSAGE_PARTS_PLACEHOLDER, QUESTION_PLACEHOLDER, type PrivacyTier } from '../src/shipper/privacy';
 
-const ENVELOPE = { executionId: 'dexec-1', taskId: 'dtask-1', contextId: 'dctx-1', nowIso: '2026-07-23T00:00:00.000Z' };
+const ENVELOPE = {
+  executionId: 'dexec-1',
+  taskId: 'dtask-1',
+  contextId: 'dctx-1',
+  // journal schema 2 (simplified-onboarding b4, 05 §6).
+  departmentId: 'unity-department',
+  sender: 'ivan@acme',
+  engine: 'claude-code',
+  nowIso: '2026-07-23T00:00:00.000Z',
+};
 
 /** `DepartmentJournalEnvelope` is a plain interface, not `Record<string,
  *  unknown>` — spreading into a fresh object literal picks up TS's implicit
@@ -67,6 +76,27 @@ describe('department-mesh privacy allowlist coverage (DoD)', () => {
     expect(filtered.task_id).toBe('dtask-1');
     expect(filtered.context_id).toBe('dctx-1');
     expect(filtered.run_id).toBe('dexec-1');
+  });
+
+  test('schema-2 department_id/engine survive the metadata tier; sender is fingerprinted, never verbatim (b4)', () => {
+    const envelope = buildDepartmentJournalEnvelope({ ...ENVELOPE, event: SAMPLE_EVENTS[0]! });
+    const filtered = filterDept(envelope, 'metadata');
+    expect(filtered.department_id).toBe('unity-department');
+    expect(filtered.engine).toBe('claude-code');
+    expect(filtered.sender).toMatch(/^fp:[0-9a-f]{16}$/);
+    expect(JSON.stringify(filtered)).not.toContain('ivan@acme');
+  });
+
+  test('a null sender/engine passes through as null rather than being dropped (05 §6 renders `—`)', () => {
+    const envelope = buildDepartmentJournalEnvelope({
+      ...ENVELOPE,
+      sender: null,
+      engine: null,
+      event: SAMPLE_EVENTS[0]!,
+    });
+    const filtered = filterDept(envelope, 'metadata');
+    expect(filtered.sender).toBeNull();
+    expect(filtered.engine).toBeNull();
   });
 });
 

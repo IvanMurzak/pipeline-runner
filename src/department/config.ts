@@ -106,6 +106,12 @@ export function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   if (typeof r.parkExpirySeconds === 'number' && Number.isFinite(r.parkExpirySeconds)) {
     config.parkExpirySeconds = r.parkExpirySeconds;
   }
+  // b4: `0` is MEANINGFUL here (it disables the stuck watchdog for this
+  // department), so the guard admits it and only rejects a negative one —
+  // unlike the timeouts above, where any finite number is passed through.
+  if (typeof r.stuckAfterSeconds === 'number' && Number.isFinite(r.stuckAfterSeconds) && r.stuckAfterSeconds >= 0) {
+    config.stuckAfterSeconds = r.stuckAfterSeconds;
+  }
   if (typeof r.lifecycle === 'string' && (LIFECYCLES as readonly string[]).includes(r.lifecycle)) {
     config.lifecycle = r.lifecycle as RuntimeLifecycle;
   }
