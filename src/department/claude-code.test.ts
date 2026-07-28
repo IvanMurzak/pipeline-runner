@@ -30,6 +30,8 @@ import {
   ClaudeCodeAdapter,
   DEPARTMENT_MCP_SERVER_NAME,
   EXECUTION_ID_PATTERN,
+  BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON,
+  backgroundTaskIds,
   initFrameListsReceiverTools,
   MAX_TRACKED_RECEIVER_CALLS,
   mcpServerStatus,
@@ -40,6 +42,8 @@ import {
   receiverToolUseIds,
   redactSensitive,
   sanitizeMcpToolName,
+  TERMINAL_RECEIVER_TOOLS,
+  terminalReceiverToolNames,
   toolResultOutcomes,
   UNREPORTED_FAILURE_REASON,
 } from './claude-code';
@@ -1101,6 +1105,255 @@ describe('a session that parks on task.request_input still completes its turn (D
     spawn.last.emitJson(toolAnswer('toolu_ask', { content: 'PARKED: the question was delivered to the sender.' }));
     spawn.last.emitJson({ type: 'result', is_error: false, result: 'waiting on the sender' });
     expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'waiting on the sender' });
+  });
+});
+
+// ── x31: a completed for work that had not finished ────────────────────────
+
+/**
+ * The CLI's `system`/`background_tasks_changed` snapshot, captured shape from
+ * v2.1.220 — one entry the instant a `run_in_background` command starts, and
+ * `tasks:[]` the instant the last one ends.
+ */
+function backgroundTasksFrame(...taskIds: string[]): Record<string, unknown> {
+  return {
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: taskIds.map((taskId) => ({ task_id: taskId, task_type: 'local_bash', description: 'Run x31 background probe' })),
+  };
+}
+
+/** The captured `tool_result` for a backgrounded `Bash` — the CLI answers the
+ *  call immediately, which is exactly why nothing downstream looks unfinished. */
+const BACKGROUNDED =
+  'Command running in background with ID: b5n82zftn. Output is being written to: …\\tasks\\b5n82zftn.output. ' +
+  'You will be notified when it completes.';
+
+describe('x31: a session that ended its turn with its own work still running has not completed', () => {
+  test('the captured case: healthy channel, `sleep 40` backgrounded, turn ends, result says completed', async () => {
+    // Driven frame for frame from a live v2.1.220 capture against a CONNECTED
+    // stub gateway (all nine receiver tools in hand, task.update_progress
+    // acknowledged). The session backgrounds `sleep 40`, ends its turn, and
+    // the CLI emits `is_error:false` / `terminal_reason:"completed"` carrying
+    // the session's own words that it is still waiting. Forty seconds later a
+    // SECOND turn read the output and called task.complete — the turn this
+    // module never sees, because it finalizes on the first `result`.
+    //
+    // Neither existing guard reaches it: nothing failed (x16 is null) and the
+    // server was connected with a landed call (x27 is disarmed). On today's
+    // `main` this is a `completed`, and the sender is told a running task
+    // succeeded.
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const events: RuntimeEvent[] = [];
+    const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+    spawn.last.emitJson(initFrame('connected'));
+    await started;
+
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_p'));
+    spawn.last.emitJson(toolAnswer('toolu_p', { content: 'ACK: task.update_progress recorded.' }));
+    spawn.last.emitJson(toolCall('Bash', 'toolu_bg'));
+    spawn.last.emitJson(backgroundTasksFrame('b5n82zftn'));
+    spawn.last.emitJson(toolAnswer('toolu_bg', { content: BACKGROUNDED }));
+    spawn.last.emitJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Background task `b5n82zftn` started — waiting for it to finish before reporting completion.' }] },
+    });
+    spawn.last.emitJson({
+      type: 'result',
+      is_error: false,
+      subtype: 'success',
+      terminal_reason: 'completed',
+      result: 'Background task `b5n82zftn` started — waiting for it to finish before reporting completion.',
+    });
+
+    expect(events[events.length - 1]).toEqual({
+      type: 'failed',
+      reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON,
+      // Not retry-safe, unlike x16 and x27: those fail on a transport fault a
+      // fresh spawn gets past. Nothing about a respawn changes what this
+      // session did, and the abandoned process may still be writing in the
+      // same department folder.
+      retrySafe: false,
+    });
+    expect(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON).toBe('background_work_outstanding');
+    // The detail is in the log; the wire value stays a bare word.
+    expect(logger.lines.join('\n')).toContain('b5n82zftn');
+    expect(logger.lines.join('\n')).toContain('still running');
+  });
+
+  test('four failures, four words — an operator is sent somewhere different by each', () => {
+    // `stuck` sends them to a hang, `unreported` to a token, `no_report_channel`
+    // to the gateway's connect, and this one to a background command.
+    expect(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON).not.toBe(UNREPORTED_FAILURE_REASON);
+    expect(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON).not.toBe(NO_REPORT_CHANNEL_FAILURE_REASON);
+    expect(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON).not.toBe('stuck');
+    expect(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON).not.toBe('isolation_unsupported');
+  });
+
+  test('a background task that FINISHED before the turn ended is not held against the session', async () => {
+    // The snapshot is exactly that — the CLI emits `tasks:[]` when the last
+    // one ends, so a session that waited for its own background work and then
+    // reported is an ordinary completion.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall('Bash', 'toolu_bg'));
+    spawn.last.emitJson(backgroundTasksFrame('b5n82zftn'));
+    spawn.last.emitJson(toolAnswer('toolu_bg', { content: BACKGROUNDED }));
+    spawn.last.emitJson(backgroundTasksFrame());
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_c'));
+    spawn.last.emitJson(toolAnswer('toolu_c', { content: 'ACK: task marked complete.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'the build finished clean' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'the build finished clean' });
+  });
+
+  test('the snapshot is REPLACED, never accumulated — two started, one still running, one left', async () => {
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const events: RuntimeEvent[] = [];
+    const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+    spawn.last.emitJson(initFrame('connected'));
+    await started;
+    spawn.last.emitJson(backgroundTasksFrame('bg_one', 'bg_two'));
+    spawn.last.emitJson(backgroundTasksFrame('bg_two'));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'still going' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON, retrySafe: false });
+    // One outstanding, not three: the count came from the LAST snapshot.
+    expect(logger.lines.join('\n')).toContain('1 background task(s) it started were still running (bg_two)');
+  });
+
+  test('a session that already reported through task.complete keeps its completion, stray task and all', async () => {
+    // The narrowing that keeps this out of healthy sessions' way: a model that
+    // leaves a dev server or a log tailer running after saying how the task
+    // ended has not lost a report, and failing it would be a regression.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall('Bash', 'toolu_server'));
+    spawn.last.emitJson(backgroundTasksFrame('bg_devserver'));
+    spawn.last.emitJson(toolAnswer('toolu_server', { content: BACKGROUNDED }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_c'));
+    spawn.last.emitJson(toolAnswer('toolu_c', { content: 'ACK: task marked complete.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'reviewed the save system' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'reviewed the save system' });
+  });
+
+  test('task.fail is a report too — a session that stated its failure is not re-judged', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson(toolCall(receiver('task_fail'), 'toolu_f'));
+    spawn.last.emitJson(toolAnswer('toolu_f', { content: 'ACK: task marked failed.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'reported the failure to the sender' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'reported the failure to the sender' });
+  });
+
+  test('a terminal call that did NOT land is no report at all — x16 keeps its more specific reason', async () => {
+    // Both judgements are true of this session. `unreported` says more: the
+    // channel was refusing, which is the thing to go and fix.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_401'));
+    spawn.last.emitJson(toolAnswer('toolu_401', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'all done!' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: UNREPORTED_FAILURE_REASON, retrySafe: true });
+  });
+
+  test('x27 keeps precedence too — a channel that never came up is the more fundamental failure', async () => {
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'backgrounded a check and stopped' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: NO_REPORT_CHANNEL_FAILURE_REASON, retrySafe: true });
+  });
+
+  test('a stated failure keeps its own reason — `background_work_outstanding` never overwrites one', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson({ type: 'result', is_error: true, terminal_reason: 'api_error', result: 'Overloaded' });
+    const failure = events[events.length - 1] as Extract<RuntimeEvent, { type: 'failed' }>;
+    expect(failure.reason).toContain('api_error');
+    expect(failure.reason).toContain('Overloaded');
+  });
+
+  test('the snapshot frame emits no supervisor event — b4 times out on the same signals as before', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson(backgroundTasksFrame());
+    expect(events).toEqual([]);
+  });
+
+  test('backgroundTaskIds reads the snapshot, and says null to everything that is not one', () => {
+    expect(backgroundTaskIds(backgroundTasksFrame('bg_one', 'bg_two'))).toEqual(['bg_one', 'bg_two']);
+    // An empty snapshot is real evidence — "nothing outstanding" — not absence.
+    expect(backgroundTaskIds(backgroundTasksFrame())).toEqual([]);
+    // An entry the frame does not name still COUNTS; dropping it would
+    // under-report the very thing being measured.
+    expect(backgroundTaskIds({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_type: 'local_bash' }] })).toEqual(['#0']);
+    expect(backgroundTaskIds({ type: 'system', subtype: 'task_started', task_id: 'bg_one' })).toBeNull();
+    expect(backgroundTaskIds({ type: 'system', subtype: 'init', tasks: [] })).toBeNull();
+    expect(backgroundTaskIds({ type: 'system', subtype: 'background_tasks_changed', tasks: 'not a list' })).toBeNull();
+    expect(backgroundTaskIds({ type: 'system', subtype: 'background_tasks_changed' })).toBeNull();
+  });
+
+  test('the terminal pair is a SUBSET of the receiver tools, spelled the same way', () => {
+    for (const tool of TERMINAL_RECEIVER_TOOLS) expect(RECEIVER_TOOLS).toContain(tool);
+    for (const name of terminalReceiverToolNames()) expect(receiverToolNames()).toContain(name);
+    expect(terminalReceiverToolNames()).toEqual([receiver('task_complete'), receiver('task_fail')]);
+  });
+});
+
+// ── Parking (D34/x17) is untouched by x31 either ───────────────────────────
+
+describe('parking is out of x31 reach: a parked session emits no background task at all', () => {
+  test('the captured park: update_progress, request_input, end of turn — and ZERO background_tasks_changed frames', async () => {
+    // Captured live against the same CONNECTED stub gateway, same argv, in the
+    // same session as the x31 capture above. The parked session's `result` is
+    // shape-identical to the premature one — `is_error:false`,
+    // `terminal_reason:"completed"` — and the ONLY thing telling them apart is
+    // that this one never backgrounded anything. Twelve frames, not one of
+    // them a `background_tasks_changed`. So the snapshot this judgement reads
+    // is empty for its whole life and the judgement cannot reach it: parking
+    // becoming its own terminal state is still [D34]/`x17`, undecided.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_p'));
+    spawn.last.emitJson(toolAnswer('toolu_p', { content: 'ACK: task.update_progress recorded.' }));
+    spawn.last.emitJson(toolCall(receiver('task_request_input'), 'toolu_ask'));
+    spawn.last.emitJson(
+      toolAnswer('toolu_ask', {
+        content:
+          'PARKED: the question was delivered to the sender. Their answer will arrive as a new user message in this session — ' +
+          'stop and wait for it, do not guess.',
+      })
+    );
+    spawn.last.emitJson({
+      type: 'result',
+      is_error: false,
+      subtype: 'success',
+      terminal_reason: 'completed',
+      result: 'Progress note sent, and the question is parked with the sender. Waiting for their answer.',
+    });
+
+    expect(events).toEqual([
+      { type: 'progress', note: `using ${receiver('task_update_progress')}` },
+      { type: 'progress', note: `using ${receiver('task_request_input')}` },
+      { type: 'completed', summary: 'Progress note sent, and the question is parked with the sender. Waiting for their answer.' },
+    ]);
+    // Still no synthesized input_required — the gateway is the parking
+    // authority, and x31 did not change who asks.
+    expect(events.every((event) => event.type !== 'input_required')).toBe(true);
+  });
+
+  test('a park that DOES leave a background task running is still judged — the task is the trigger, not the park', async () => {
+    // The honest edge of the narrowing above. A session that backgrounds work,
+    // parks a question and stops has outstanding work AND no terminal report,
+    // so it is judged — not because it parked, but because nothing it started
+    // is finished and nothing has been said about how the task ended. The
+    // captured park does not do this; the case is pinned so a future reader
+    // can see the boundary was chosen rather than missed.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson(toolCall(receiver('task_request_input'), 'toolu_ask'));
+    spawn.last.emitJson(toolAnswer('toolu_ask', { content: 'PARKED: the question was delivered to the sender.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'asked while the check runs' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON, retrySafe: false });
   });
 });
 

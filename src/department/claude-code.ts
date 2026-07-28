@@ -46,8 +46,20 @@
  *
  * `--strict-mcp-config` is deliberately NOT passed ([D28]): it would ignore
  * every other MCP configuration, which includes the department's own servers,
- * and "makes the folder promise false". The trust decision for those is
- * recorded by `serve` at bind time, not here.
+ * and "makes the folder promise false".
+ *
+ * x28: an earlier version of this comment went on to assert that the trust
+ * decision for those servers "is recorded by `serve` at bind time". It is not,
+ * and no such code exists in any repo — the requirement it forward-referenced
+ * was falsified by both P4 gate runs. On v2.1.220 in `--print` mode with
+ * `--setting-sources project,local`, a department folder carrying NO trust
+ * record at all had its `.claude/settings.json`, its `.claude/agents/` and its
+ * `.mcp.json` honoured in full: a `permissions.deny` rule was enforced, a
+ * department-local subagent ran, and a project-scoped MCP server reported
+ * `"status":"connected"`. Workspace trust is an INTERACTIVE-mode gate, exactly
+ * as `--print`'s own help text says and as the `--print` entry in the flag
+ * surface above already documents; nothing has to record anything for these
+ * servers to load here. [D28] is annotated accordingly.
  *
  * ── Wiring the department MCP server (D23) ─────────────────────────────────
  * `--mcp-config` accepts an inline JSON STRING (`claude --help`: "Load MCP
@@ -150,6 +162,53 @@
  * arrive, and it made a receiver call that LANDED over a channel that WAS
  * confirmed — so nothing here touches it. Parking becoming its own terminal
  * state is [D34]/`x17`, and is not this module's to invent.
+ *
+ * ── The work that was still running (x31) ──────────────────────────────────
+ * x16 and x27 both judge a channel. x31 is the same governing principle —
+ * a `completed` means the PROCESS exited claiming success, which is not the
+ * same as the WORK being done — arriving through a healthy channel.
+ *
+ * Captured from the shipped binary (v2.1.220), connected server, all nine
+ * receiver tools in hand, `task.update_progress` acknowledged: the session
+ * started `sleep 40` as a BACKGROUND task (`Bash`, `run_in_background:true`)
+ * and ended its turn. The CLI immediately emitted
+ *
+ *   {"type":"result","is_error":false,"terminal_reason":"completed",
+ *    "result":"Background task `b5n82zftn` started — waiting for it to finish
+ *              before reporting completion."}
+ *
+ * The text says in plain words that the work is unfinished; the frame says
+ * `completed`. Forty seconds later the CLI opened a SECOND turn (a fresh
+ * `system`/`init`, `origin:{"kind":"task-notification"}` on its result), read
+ * the output and only THEN called `task.complete`. `routeActiveLine` treats
+ * the FIRST `result` as terminal, so on today's `main` the sender is told the
+ * task succeeded while it is still running, the summary it is told is the
+ * session's own "waiting for it to finish", and the second turn — the one
+ * carrying the real report — never happens, because the supervisor finalizes
+ * and disposes the process.
+ *
+ * Neither existing guard sees it: nothing failed, so x16's `unlandedReport`
+ * is null; the server was `connected` and a receiver call landed, so x27's
+ * pair is disarmed. The evidence that IS in the stream is the CLI's own
+ * `system`/`background_tasks_changed` frame, which carries a full SNAPSHOT of
+ * the session's outstanding background tasks — non-empty when they start,
+ * `[]` when the last one ends. A `result` that claims success while that
+ * snapshot is non-empty is reported
+ * {@link BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON} instead of `completed`.
+ *
+ * Two narrowings, and both are the point:
+ *
+ *  1. It is keyed on BACKGROUND TASKS specifically, never on "ended its turn".
+ *     A parked session ends its turn on purpose, and the captured park emits
+ *     ZERO `background_tasks_changed` frames in its entire life — so the
+ *     snapshot is empty and this judgement cannot reach it. [D34]/`x17` stays
+ *     exactly as unimplemented as it was.
+ *  2. A session that DID make its terminal report — `task.complete` or
+ *     `task.fail` came back without an error ({@link
+ *     ClaudeCodeHandle.terminalReportLanded}) — is left alone even with a task
+ *     still running, because it said its piece and a stray background process
+ *     it no longer needs is not a lost report. Only a session that ended
+ *     WITHOUT reporting, while its own work was still outstanding, is judged.
  */
 
 import { existsSync } from 'node:fs';
@@ -216,6 +275,19 @@ export const RECEIVER_TOOLS = [
 ] as const;
 
 /**
+ * x31: the two receiver tools that ARE the session's report of how the task
+ * ended. A subset of {@link RECEIVER_TOOLS}, not a second list — the strings
+ * are those strings, so a rename cannot leave the two out of step.
+ *
+ * Used for exactly one narrowing (see {@link ClaudeCodeHandle.terminalReportLanded}):
+ * a session that already said how it ended is not judged for leaving a
+ * background process running. Deliberately NOT used to require a terminal
+ * report — "no `task.complete` ever landed" describes every parked session
+ * too, and demanding one here would invent [D34]/`x17`.
+ */
+export const TERMINAL_RECEIVER_TOOLS = ['task.complete', 'task.fail'] as const satisfies readonly (typeof RECEIVER_TOOLS)[number][];
+
+/**
  * x16: the CODED terminal reason for a session that ended claiming success
  * while its report could not reach the gateway — "nothing was reported", as
  * distinct from `b4`'s `stuck`, which means "nothing was said". They are not
@@ -264,6 +336,31 @@ export const UNREPORTED_FAILURE_REASON = 'unreported';
  * follow-up.
  */
 export const NO_REPORT_CHANNEL_FAILURE_REASON = 'no_report_channel';
+
+/**
+ * x31: the CODED terminal reason for a session that ended its turn claiming
+ * success while its OWN background tasks were still running, without ever
+ * saying how the task ended.
+ *
+ * A fourth word, for the same reason there is a third. `stuck` means nothing
+ * was said; `unreported` means it was said and refused; `no_report_channel`
+ * means there was never a channel to say it on. This one means the channel
+ * worked perfectly and the session simply spoke too early — the operator's
+ * question is "what was that background command, and did it finish?", and no
+ * other word sends anyone to look at it.
+ *
+ * Same hardcoding rationale as `UNREPORTED_FAILURE_REASON`,
+ * `NO_REPORT_CHANNEL_FAILURE_REASON`, `./manager.ts`'s `STUCK_FAILURE_REASON`
+ * and its `ISOLATION_UNSUPPORTED_FAILURE_REASON`: this package exact-pins
+ * `@baizor/pipeline-protocol@0.4.0`, whose `DEPT_FAILURE_REASONS` is merged
+ * but unpublished. The value rides the existing `failed` event's `reason`
+ * (already `z.string().min(1)`), so no consumer needs a schema change and the
+ * cloud passes a reason it has never heard of through verbatim ([D35], proven
+ * live by the P4 gate). The STRING is the contract and is identical either
+ * way; adding it to that constant when it next ships is a protocol-side
+ * follow-up.
+ */
+export const BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON = 'background_work_outstanding';
 
 /** Claude Code session startup (process spawn → `system`/`init` line) is a
  *  cold binary start plus MCP connect; 60s is generous rather than tight, and
@@ -429,6 +526,13 @@ export function sanitizeMcpToolName(name: string): string {
  *  `DEPARTMENT_MCP_SERVER_NAME` is chosen to need no normalizing anyway. */
 export function receiverToolNames(serverName: string = DEPARTMENT_MCP_SERVER_NAME): string[] {
   return RECEIVER_TOOLS.map((tool) => `mcp__${serverName}__${sanitizeMcpToolName(tool)}`);
+}
+
+/** x31: the same callables for {@link TERMINAL_RECEIVER_TOOLS} — always a
+ *  subset of {@link receiverToolNames}, built the same way so the two can
+ *  never disagree about how a name is spelled. */
+export function terminalReceiverToolNames(serverName: string = DEPARTMENT_MCP_SERVER_NAME): string[] {
+  return TERMINAL_RECEIVER_TOOLS.map((tool) => `mcp__${serverName}__${sanitizeMcpToolName(tool)}`);
 }
 
 /**
@@ -646,6 +750,34 @@ export function initFrameListsReceiverTools(initFrame: Record<string, unknown>, 
   return tools.some((tool) => typeof tool === 'string' && receiverNames.has(tool));
 }
 
+/** x31: the `system` frame subtype that carries the session's outstanding
+ *  background tasks. Named once, because the judgement rests entirely on it. */
+const BACKGROUND_TASKS_FRAME_SUBTYPE = 'background_tasks_changed';
+
+/**
+ * x31 — the session's OUTSTANDING background tasks, or `null` when this frame
+ * is not that announcement.
+ *
+ * The CLI emits `system`/`background_tasks_changed` as a full SNAPSHOT, not a
+ * delta: captured on v2.1.220, one entry the instant a `run_in_background`
+ * command starts and `tasks:[]` the instant the last one ends. So the caller
+ * REPLACES what it holds rather than accumulating, and a task that finished
+ * before the session ended can never be counted against it.
+ *
+ * An entry the frame does not name still counts — the judgement is about how
+ * MANY tasks are outstanding, and dropping an unnamed one would under-report
+ * the very thing being measured. Its positional label is for the log line
+ * only.
+ */
+export function backgroundTaskIds(frame: Record<string, unknown>): string[] | null {
+  if (frame.type !== 'system' || frame.subtype !== BACKGROUND_TASKS_FRAME_SUBTYPE) return null;
+  const tasks = frame.tasks;
+  if (!Array.isArray(tasks)) return null;
+  return tasks.map((task, index) =>
+    isRecord(task) && typeof task.task_id === 'string' && task.task_id.length > 0 ? task.task_id : `#${index}`
+  );
+}
+
 /** The terminal `result` frame, normalized. `is_error` is the ONLY reliable
  *  discriminator: a not-logged-in session emits `subtype:"success"` alongside
  *  `is_error:true` (observed on v2.1.220), so keying off `subtype` would
@@ -860,6 +992,21 @@ class ClaudeCodeHandle implements RuntimeHandle {
    *  state of a session that never called a receiver tool at all: THAT is the
    *  gap x27 closes, so it needs a flag that only a landed call can set. */
   receiverCallLanded = false;
+  /** x31: `tool_use` ids of the subset of {@link pendingReceiverCalls} that
+   *  address a TERMINAL receiver tool. Kept as its own set rather than by
+   *  re-reading the call's name later, because the name is on the `assistant`
+   *  frame and the outcome is on a different `user` frame. */
+  readonly pendingTerminalCalls = new Set<string>();
+  /** x31: `true` once `task.complete` or `task.fail` has come back without an
+   *  error — this session has SAID how the task ended. Never un-set: a later
+   *  broken call is x16's to judge, and cannot make an earlier landed report
+   *  un-happen. Used only to WITHHOLD the x31 judgement. */
+  terminalReportLanded = false;
+  /** x31: the session's outstanding background tasks as of the last
+   *  `system`/`background_tasks_changed` snapshot — replaced wholesale, never
+   *  accumulated ({@link backgroundTaskIds}). Empty on every session that
+   *  never backgrounded anything, which is every parked session captured. */
+  outstandingBackgroundTasks: readonly string[] = [];
 
   constructor(
     readonly taskId: string,
@@ -911,6 +1058,9 @@ export class ClaudeCodeAdapter implements EngineModule {
   /** x16: the sanitized callables that count as REPORTING — computed once
    *  from the same `receiverToolNames()` the allow-list is built from. */
   private readonly receiverNames: ReadonlySet<string>;
+  /** x31: the subset of {@link receiverNames} that reports how the task ended,
+   *  computed once from the same builder for the same reason. */
+  private readonly terminalReceiverNames: ReadonlySet<string>;
 
   constructor(options: ClaudeCodeAdapterOptions = {}) {
     this.spawnSeam = options.spawn ?? nodeJobSpawn();
@@ -925,6 +1075,7 @@ export class ClaudeCodeAdapter implements EngineModule {
     this.helperScriptPath = options.helperScriptPath ?? DEFAULT_HELPER_SCRIPT_PATH;
     this.helperScriptExists = options.helperScriptExists ?? existsSync;
     this.receiverNames = new Set(receiverToolNames(this.serverName));
+    this.terminalReceiverNames = new Set(terminalReceiverToolNames(this.serverName));
   }
 
   /**
@@ -1343,7 +1494,20 @@ export class ClaudeCodeAdapter implements EngineModule {
         // `b4`'s signal count and change what the supervisor times out on.
         this.noteToolResults(handle, parsed);
         return;
-      case 'system':
+      case 'system': {
+        // x31: the CLI's own account of what this session still has running.
+        // A SNAPSHOT, so it is assigned rather than merged — and it is read
+        // before the x27 branch below because the two answer different
+        // questions about the same frame type and neither excludes the other.
+        const backgroundTasks = backgroundTaskIds(parsed);
+        if (backgroundTasks !== null) {
+          handle.outstandingBackgroundTasks = backgroundTasks;
+          this.logger.debug(
+            `claude-code[${handle.taskId}]: ${backgroundTasks.length} background task(s) outstanding` +
+              (backgroundTasks.length === 0 ? '' : ` (${backgroundTasks.join(', ')})`)
+          );
+          return;
+        }
         // x27: one system frame is worth a second look. The CLI re-emits
         // `system`/`init` with a REFRESHED `mcp_servers` status (captured: a
         // never-connecting server listed `pending` on the first and `failed`
@@ -1361,6 +1525,7 @@ export class ClaudeCodeAdapter implements EngineModule {
           this.logger.debug(`claude-code[${handle.taskId}]: department MCP server reported connected after a pending start`);
         }
         return;
+      }
       case 'stream_event':
       case 'rate_limit_event':
         // Hook lifecycle, partial deltas, quota notices: real frames with
@@ -1376,12 +1541,25 @@ export class ClaudeCodeAdapter implements EngineModule {
    *  `tool_result` that answers one can be told apart from every other tool's.
    *  Bounded — see `MAX_TRACKED_RECEIVER_CALLS`. */
   private trackReceiverCalls(handle: ClaudeCodeHandle, parsed: Record<string, unknown>): void {
+    // x31: which of this frame's calls address a TERMINAL receiver tool, so
+    // the `tool_result` answering a `task.complete` can be told from the one
+    // answering a progress note. Computed first and consulted INSIDE the loop
+    // below, so an id enters the terminal set only in the same step it enters
+    // the tracked set — that is what makes the one a true subset of the other,
+    // and what keeps the bound below binding on both.
+    const terminalIds = new Set(receiverToolUseIds(parsed, this.terminalReceiverNames));
     for (const id of receiverToolUseIds(parsed, this.receiverNames)) {
       if (handle.pendingReceiverCalls.size >= MAX_TRACKED_RECEIVER_CALLS) {
         const oldest = handle.pendingReceiverCalls.values().next();
-        if (!oldest.done) handle.pendingReceiverCalls.delete(oldest.value);
+        if (!oldest.done) {
+          handle.pendingReceiverCalls.delete(oldest.value);
+          // An id the bound forgets is forgotten in both, so the two can never
+          // drift apart.
+          handle.pendingTerminalCalls.delete(oldest.value);
+        }
       }
       handle.pendingReceiverCalls.add(id);
+      if (terminalIds.has(id)) handle.pendingTerminalCalls.add(id);
     }
   }
 
@@ -1405,6 +1583,9 @@ export class ClaudeCodeAdapter implements EngineModule {
       // `unlandedReport` above, this one is never un-set: a later failure is
       // x16's to judge, and cannot make an earlier landed call un-happen.
       if (!outcome.isError) handle.receiverCallLanded = true;
+      // x31: and whether the call that came back was the session SAYING how
+      // the task ended. Same never-un-set rule, same reason.
+      if (handle.pendingTerminalCalls.delete(outcome.toolUseId) && !outcome.isError) handle.terminalReportLanded = true;
     }
   }
 
@@ -1449,6 +1630,33 @@ export class ClaudeCodeAdapter implements EngineModule {
           // token, so a gateway that was slow, restarting or briefly
           // unreachable is exactly what a later attempt gets past.
           retrySafe: true,
+        };
+      }
+      // x31: and the shape where the channel was never the problem. The
+      // session's own background tasks were still running when it ended its
+      // turn, and it never said how the task ended — so `completed` here means
+      // "the process exited", not "the work is done", and the summary it would
+      // carry is the session's own account of what it was still waiting for.
+      // Checked LAST: a broken channel is the more fundamental failure and
+      // keeps its more specific word.
+      if (handle.outstandingBackgroundTasks.length > 0 && !handle.terminalReportLanded) {
+        this.logger.warn(
+          `claude-code[${handle.taskId}]: the session ended claiming success while ${handle.outstandingBackgroundTasks.length} ` +
+            `background task(s) it started were still running (${handle.outstandingBackgroundTasks.join(', ')}) and it never ` +
+            `called ${TERMINAL_RECEIVER_TOOLS.join(' or ')} — reporting '${BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON}' ` +
+            'rather than a completion for work that had not finished'
+        );
+        return {
+          type: 'failed',
+          reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON,
+          // NOT retry-safe, and this is where x31 parts company with x16 and
+          // x27. Those two fail on a TRANSPORT fault a fresh spawn genuinely
+          // gets past — a new execution token, a gateway that has come back.
+          // Nothing about a respawn changes what this session did, and the
+          // background process it abandoned may still be running in the same
+          // cwd: starting a second session on top of it would have two
+          // writers in one department folder to fix one report.
+          retrySafe: false,
         };
       }
       return { type: 'completed', ...(result.text === null ? {} : { summary: truncate(result.text, MAX_SUMMARY) }) };

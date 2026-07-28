@@ -256,6 +256,26 @@ describe('stuck detection — shape 2: the session ends having reported nothing 
     expect(DeptEventMessageSchema.safeParse(sink.events()[sink.events().length - 1]).success).toBe(true);
   });
 
+  test("x31's shape passes straight through too: `background_work_outstanding` is NOT relabelled `stuck`", async () => {
+    // The fourth shape (`./claude-code.ts`'s
+    // `BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON`): a session that ended its
+    // turn while its own background work was still running. Loud, not silent,
+    // so this file cannot see it either — and it arrives `retrySafe:false`,
+    // which is also the one thing that must survive the trip: respawning onto
+    // an abandoned background process is what that flag exists to prevent.
+    const { manager, adapter, runtimes, sink, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'claude-code', command: 'claude' });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'progress', note: 'using mcp__pipeline-department__task_update_progress' });
+    adapter.emitLatest({ type: 'progress', note: 'using Bash' });
+    adapter.emitLatest({ type: 'failed', reason: 'background_work_outstanding', retrySafe: false });
+
+    expect(reportedFailure(sink)).toEqual({ reason: 'background_work_outstanding', retry_safe: false });
+    expect(journalledTypes(journal)).not.toContain('department.completed');
+    expect(DeptEventMessageSchema.safeParse(sink.events()[sink.events().length - 1]).success).toBe(true);
+  });
+
   test('a silent `completed` from an engine that does not claim to stream (pipeline) stands untouched', async () => {
     const { manager, adapter, runtimes, sink, journal } = makeManager({ adapterId: 'pipeline-drive' });
     runtimes.set('review-department', { adapterId: 'pipeline-drive', command: 'pipeline' });
