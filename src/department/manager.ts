@@ -144,6 +144,16 @@
  * (`./engine.ts`'s `supportsStreaming: 'yes'`) — see `resolveStuckAfterMs`.
  * Silence only breaks a promise an engine actually made.
  *
+ * A THIRD shape exists and is deliberately NOT here: a session that reported
+ * for a while and was then CUT OFF (its execution token expired, so every
+ * receiver tool started refusing) still ends with a `completed` — and it has
+ * plenty of signals, so neither mechanism above can see it. Judging that one
+ * needs the runtime's own tool-call outcomes, which the supervisor never sees;
+ * it belongs to the engine module that reads the frames, and lives in
+ * `./claude-code.ts` (x16, `UNREPORTED_FAILURE_REASON`). The `failed` it
+ * produces arrives here as an ordinary terminal and passes through
+ * `judgeTerminalEvent` untouched.
+ *
  * ── Lifecycle policy, concretely ────────────────────────────────────────────
  *   - `per-task`: one `adapter.start()` per execution; disposed at terminal.
  *   - `per-context`: same as `per-task` at the wire-contract level (07 §3:
@@ -1052,6 +1062,14 @@ export class DepartmentManager {
    * - Only ZERO signals, not "few". One `progress`, one `message`, one
    *   `input_required` — any evidence the session was reporting — and the
    *   `completed` stands untouched.
+   *
+   * That last condition is what makes this blind to x16's shape — a session
+   * cut off mid-task has hundreds of signals — and widening it here is not the
+   * fix: "few signals" is not evidence of anything, and the evidence that IS
+   * conclusive (a receiver-tool call that came back an error) exists only in
+   * the runtime's own stream, which the supervisor does not read. So the
+   * supervisor keeps the judgement it can actually make, and the engine module
+   * makes the one it can — see this file's module doc.
    */
   private judgeTerminalEvent(
     state: ExecutionState,
