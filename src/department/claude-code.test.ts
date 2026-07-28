@@ -1,0 +1,609 @@
+/**
+ * `claude-code` engine-module tests (simplified-onboarding b3; design
+ * `06-engine-modules.md` §4, `07-approval-policy.md` §8, D23/D24/D28).
+ *
+ * Three things are worth proving about a module whose whole job is to spawn
+ * someone else's CLI: that the invocation it builds is the one the vendor
+ * actually accepts (asserted against flags verified from `claude --help`
+ * v2.1.220), that no credential ever reaches a place a credential must not be,
+ * and that every way the session can fail produces a STATED reason rather than
+ * a silence. The stream frames driven below are real, captured shapes from a
+ * live `claude --print --output-format stream-json` run — including the one
+ * that would have been guessed wrong: an unauthenticated session reports
+ * `subtype:"success"` alongside `is_error:true`.
+ */
+
+import { describe, expect, test } from 'bun:test';
+import type { Clock } from '../core/clock';
+import type { Logger } from '../core/log';
+import type { InvocationEnvelope, RuntimeEvent } from './adapter';
+import { RuntimeAdapterError } from './adapter';
+import {
+  assistantProgressNotes,
+  buildClaudeArgs,
+  buildDepartmentMcpConfig,
+  buildPromptLines,
+  buildSessionContext,
+  ClaudeCodeAdapter,
+  DEPARTMENT_MCP_SERVER_NAME,
+  mcpServerStatus,
+  narrowResultFrame,
+  RECEIVER_TOOLS,
+  receiverToolNames,
+  sanitizeMcpToolName,
+} from './claude-code';
+import { ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, EngineMcpUnavailableError } from './engine';
+import { FakeJobSpawn, makeMessage, makeTaskSpec } from './_test-helpers';
+
+const MCP_URL = 'https://ai-pipeline.dev/mcp';
+const TOKEN = 'eyJhbGciOi-super-secret-execution-token';
+
+/** A clock whose timers never fire on their own — every test that needs one to
+ *  fire drives it explicitly, so nothing here depends on wall time. */
+function fakeClock(): Clock & { fire(): void; pending: number } {
+  const timers: (() => void)[] = [];
+  return {
+    setTimeout(fn: () => void) {
+      timers.push(fn);
+      return timers.length - 1;
+    },
+    clearTimeout(handle: unknown) {
+      const index = handle as number;
+      if (typeof index === 'number' && timers[index] !== undefined) timers[index] = () => {};
+    },
+    now: () => 1_700_000_000_000,
+    fire() {
+      const pending = [...timers];
+      timers.length = 0;
+      for (const fn of pending) fn();
+    },
+    get pending() {
+      return timers.length;
+    },
+  };
+}
+
+function capturingLogger(): Logger & { lines: string[] } {
+  const lines: string[] = [];
+  const push = (line: string): void => {
+    lines.push(line);
+  };
+  return { lines, debug: push, info: push, warn: push, error: push };
+}
+
+function makeMcpInvocation(overrides: Partial<InvocationEnvelope['runtime']> = {}): InvocationEnvelope {
+  return {
+    runtime: {
+      adapterId: 'claude-code',
+      command: 'claude',
+      cwd: '/srv/departments/save-system',
+      env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN },
+      ...overrides,
+    },
+    task: makeTaskSpec({ messages: [makeMessage({ parts: [{ text: 'review the save system' }] })] }),
+  };
+}
+
+/** The `system`/`init` line Claude Code emits first, trimmed to the fields
+ *  this module reads. */
+function initFrame(status = 'connected', serverName = DEPARTMENT_MCP_SERVER_NAME): Record<string, unknown> {
+  return {
+    type: 'system',
+    subtype: 'init',
+    session_id: 'sess-1',
+    cwd: '/srv/departments/save-system',
+    mcp_servers: [{ name: serverName, status }],
+    permissionMode: 'acceptEdits',
+  };
+}
+
+/** Start a session and return everything a test needs to drive it. */
+async function startSession(
+  options: { status?: string; adapter?: ClaudeCodeAdapter; spawn?: FakeJobSpawn; invocation?: InvocationEnvelope } = {}
+): Promise<{ spawn: FakeJobSpawn; adapter: ClaudeCodeAdapter; events: RuntimeEvent[]; handle: Awaited<ReturnType<ClaudeCodeAdapter['start']>> }> {
+  const spawn = options.spawn ?? new FakeJobSpawn();
+  const adapter = options.adapter ?? new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+  const events: RuntimeEvent[] = [];
+  const started = adapter.start(options.invocation ?? makeMcpInvocation(), (event) => events.push(event));
+  spawn.last.emitJson(initFrame(options.status ?? 'connected'));
+  const handle = await started;
+  return { spawn, adapter, events, handle };
+}
+
+// ── The invocation it builds ───────────────────────────────────────────────
+
+describe('the argv (verified against `claude --help`, v2.1.220)', () => {
+  test('is a headless stream-json session whose prompt arrives on stdin, not argv', () => {
+    const args = buildClaudeArgs({ sessionContext: 'ctx' });
+    expect(args).toContain('--print');
+    // Not decorative: the CLI exits with "When using --print,
+    // --output-format=stream-json requires --verbose" without it.
+    expect(args).toContain('--verbose');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json');
+    // Responsibility 2: stdin is the prompt channel AND the mid-task channel.
+    expect(args[args.indexOf('--input-format') + 1]).toBe('stream-json');
+  });
+
+  test('states a permission mode and the department-only setting scopes (07 §8)', () => {
+    const args = buildClaudeArgs({ sessionContext: 'ctx' });
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    // The department folder's own settings, not the operator's personal ones.
+    expect(args[args.indexOf('--setting-sources') + 1]).toBe('project,local');
+    expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  test('never passes --strict-mcp-config (D28) — it would disable the department\'s own servers', () => {
+    expect(buildClaudeArgs({ sessionContext: 'ctx' })).not.toContain('--strict-mcp-config');
+  });
+
+  test('pre-approves exactly the nine receiver tools, by name', () => {
+    const args = buildClaudeArgs({ sessionContext: 'ctx' });
+    const allowed = args[args.indexOf('--allowedTools') + 1]!.split(',');
+    expect(allowed).toEqual(receiverToolNames());
+    expect(allowed).toHaveLength(9);
+    expect(allowed).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_update_progress`);
+    expect(allowed).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_complete`);
+    expect(new Set(RECEIVER_TOOLS).size).toBe(9);
+  });
+
+  test('the allow-list carries the CALLABLE names, not the wire names — dots become underscores', () => {
+    // Observed for real before this was handled: a live session ended with
+    // "Both department tool calls were denied at the permission prompt, so
+    // nothing was reported to the sender". Claude Code normalizes an MCP tool
+    // name with `[^a-zA-Z0-9_] → _`, so an allow-list spelled
+    // `…__task.complete` matches the callable `…__task_complete` never.
+    expect(sanitizeMcpToolName('task.update_progress')).toBe('task_update_progress');
+    for (const name of receiverToolNames()) expect(name).not.toContain('.');
+    // …and the wire names, which the gateway actually registers, keep theirs.
+    for (const tool of RECEIVER_TOOLS) expect(tool).toContain('.');
+  });
+
+  test('the MCP server key can never contain `__`, which would make every tool name unparseable', () => {
+    // `mcp__<server>__<tool>` is split on `__` and index 1 is taken as the
+    // server, so a key carrying `__` silently renames every tool.
+    expect(DEPARTMENT_MCP_SERVER_NAME).not.toContain('__');
+  });
+
+  test('metadata is context, never concatenated into the prompt (06 §4)', () => {
+    const task = makeTaskSpec({
+      messages: [makeMessage({ parts: [{ text: 'review the save system' }], metadata: { sender: 'ivan@acme', skill: 'review' } })],
+    });
+    const args = buildClaudeArgs({ sessionContext: buildSessionContext(task) });
+    const context = args[args.indexOf('--append-system-prompt') + 1]!;
+    expect(context).toContain(task.taskId);
+    expect(context).toContain('ivan@acme');
+    // …and the prompt line itself carries the sender's text and nothing else.
+    const prompt = JSON.parse(buildPromptLines(task)[0]!) as { message: { content: { text: string }[] } };
+    expect(prompt.message.content[0]!.text).toBe('review the save system');
+    expect(prompt.message.content[0]!.text).not.toContain('ivan@acme');
+    expect(prompt.message.content[0]!.text).not.toContain(task.taskId);
+  });
+
+  test('a replayed history contributes the sender\'s turns only — never the session\'s own past output', () => {
+    const task = makeTaskSpec({
+      messages: [
+        makeMessage({ messageId: 'm1', role: 'ROLE_USER', parts: [{ text: 'first' }] }),
+        makeMessage({ messageId: 'm2', role: 'ROLE_AGENT', parts: [{ text: 'my own earlier answer' }] }),
+        makeMessage({ messageId: 'm3', role: 'ROLE_USER', parts: [{ text: 'second' }] }),
+      ],
+    });
+    const texts = buildPromptLines(task).map((line) => (JSON.parse(line) as { message: { content: { text: string }[] } }).message.content[0]!.text);
+    expect(texts).toEqual(['first', 'second']);
+  });
+
+  test('the session context tells the model the one thing it cannot discover: unreported work reaches nobody', () => {
+    const context = buildSessionContext(makeTaskSpec());
+    expect(context).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_complete`);
+    expect(context).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_fail`);
+    expect(context).toContain('reaches nobody');
+  });
+});
+
+describe('the --mcp-config payload (D23)', () => {
+  test('carries `${VAR}` references, so neither the URL nor the bearer is ever on a command line', () => {
+    const json = buildDepartmentMcpConfig();
+    expect(json).toContain(`\${${ENGINE_MCP_URL_ENV}}`);
+    expect(json).toContain(`Bearer \${${ENGINE_MCP_TOKEN_ENV}}`);
+    const parsed = JSON.parse(json) as { mcpServers: Record<string, { type: string; url: string; headers: Record<string, string> }> };
+    const server = parsed.mcpServers[DEPARTMENT_MCP_SERVER_NAME]!;
+    expect(server.type).toBe('http');
+    expect(server.url).toBe(`\${${ENGINE_MCP_URL_ENV}}`);
+    expect(server.headers.Authorization).toBe(`Bearer \${${ENGINE_MCP_TOKEN_ENV}}`);
+  });
+
+  test('a configured headersHelper REPLACES the static header rather than joining it', () => {
+    const json = buildDepartmentMcpConfig({ headersHelper: '/opt/runner/mcp-headers' });
+    const server = (JSON.parse(json) as { mcpServers: Record<string, Record<string, unknown>> }).mcpServers[DEPARTMENT_MCP_SERVER_NAME]!;
+    expect(server.headersHelper).toBe('/opt/runner/mcp-headers');
+    // Both at once would let a stale static header win the connect that the
+    // helper exists to refresh.
+    expect(server.headers).toBeUndefined();
+  });
+});
+
+// ── Responsibility 4: refusing rather than running blind (D24) ─────────────
+
+describe('refusing rather than running blind (D24)', () => {
+  test('declares the contract b3 exists to satisfy', () => {
+    const adapter = new ClaudeCodeAdapter();
+    expect(adapter.id).toBe('claude-code');
+    expect(adapter.engine).toBe('claude-code');
+    expect(adapter.requiresMcpConnection).toBe(true);
+    expect(adapter.engineCapabilities.acceptsMidTaskInput).toBe('yes');
+  });
+
+  test('no MCP env ⇒ start() rejects and NOTHING is spawned', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const invocation = makeMcpInvocation({ env: {} });
+    await expect(adapter.start(invocation, () => {})).rejects.toThrow(EngineMcpUnavailableError);
+    // The point of the refusal: no session exists to leave orphaned.
+    expect(spawn.calls).toHaveLength(0);
+  });
+
+  test('a session whose department server did not connect is refused, not run', async () => {
+    for (const status of ['failed', 'needs-auth', 'disabled', 'absent-from-the-list']) {
+      const spawn = new FakeJobSpawn();
+      const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+      const started = adapter.start(makeMcpInvocation(), () => {});
+      spawn.last.emitJson(
+        status === 'absent-from-the-list' ? initFrame('connected', 'some-other-server') : initFrame(status)
+      );
+      await expect(started).rejects.toThrow(EngineMcpUnavailableError);
+      // …and the half-started session is force-killed, not left running.
+      expect(spawn.last.killedGroupWith).toContain('SIGKILL');
+    }
+  });
+
+  test('an older CLI that reports no server list is tolerated with a warning, not refused', async () => {
+    const spawn = new FakeJobSpawn();
+    const logger = capturingLogger();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const started = adapter.start(makeMcpInvocation(), () => {});
+    const frame = initFrame();
+    delete frame.mcp_servers;
+    spawn.last.emitJson(frame);
+    await expect(started).resolves.toBeDefined();
+    expect(logger.lines.some((line) => line.includes('could not be verified'))).toBe(true);
+  });
+
+  test('the refusal never names the URL or the token', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const started = adapter.start(makeMcpInvocation(), () => {});
+    spawn.last.emitJson(initFrame('needs-auth'));
+    await started.then(
+      () => {
+        throw new Error('expected a refusal');
+      },
+      (err: unknown) => {
+        expect((err as Error).message).not.toContain(MCP_URL);
+        expect((err as Error).message).not.toContain(TOKEN);
+        expect((err as Error).message).toContain('needs-auth');
+      }
+    );
+  });
+
+  test('mcpServerStatus tells `cannot verify` (null) apart from `did not load` (absent)', () => {
+    expect(mcpServerStatus({ type: 'system' }, 'x')).toBeNull();
+    expect(mcpServerStatus({ mcp_servers: [] }, 'x')).toBe('absent');
+    expect(mcpServerStatus({ mcp_servers: [{ name: 'x', status: 'connected' }] }, 'x')).toBe('connected');
+    expect(mcpServerStatus({ mcp_servers: [{ name: 'x' }] }, 'x')).toBe('unknown');
+  });
+});
+
+// ── Secrets discipline (10-security.md §6, a6's precedent) ─────────────────
+
+describe('the bearer never leaves the environment', () => {
+  test('it is absent from argv, from every log line, and from every event', async () => {
+    const spawn = new FakeJobSpawn();
+    const logger = capturingLogger();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const { events } = await startSession({ spawn, adapter });
+
+    const call = spawn.calls[0]!;
+    expect(call.cmd).toBe('claude');
+    for (const arg of call.args) {
+      expect(arg).not.toContain(TOKEN);
+      expect(arg).not.toContain(MCP_URL);
+    }
+    // It travels the ONE way it is allowed to: the child's environment.
+    expect(call.opts?.env?.[ENGINE_MCP_TOKEN_ENV]).toBe(TOKEN);
+
+    spawn.last.emitJson({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } });
+    spawn.last.emitStderr('some diagnostic chatter');
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+
+    const written = spawn.last.written.join('\n');
+    const logged = logger.lines.join('\n');
+    const emitted = JSON.stringify(events);
+    for (const haystack of [written, logged, emitted]) {
+      expect(haystack).not.toContain(TOKEN);
+      expect(haystack).not.toContain(MCP_URL);
+    }
+  });
+});
+
+// ── Start / inject / observe ───────────────────────────────────────────────
+
+describe('starting a session', () => {
+  test('runs in the department folder, so its own .claude/ is what governs', async () => {
+    const { spawn } = await startSession();
+    expect(spawn.calls[0]!.opts?.cwd).toBe('/srv/departments/save-system');
+  });
+
+  test('the prompt is written BEFORE the handshake completes — waiting for init first deadlocks', async () => {
+    // Verified against the real CLI (v2.1.220): under
+    // `--input-format stream-json` nothing but hook frames is emitted until a
+    // first input message arrives, so a "wait for init, then write" ordering
+    // hangs until `startupTimeoutSeconds`. This assertion is the regression
+    // guard for that — it must be written by the time `start()` is pending.
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const started = adapter.start(makeMcpInvocation(), () => {});
+    expect(JSON.parse(spawn.last.written[0]!)).toEqual({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: 'review the save system' }] },
+    });
+    spawn.last.emitJson(initFrame());
+    await started;
+    // Open stdin is what makes `acceptsMidTaskInput: 'yes'` true.
+    expect(spawn.last.ended).toBe(false);
+  });
+
+  test('the handle negotiates mid-task input true and artifacts false', async () => {
+    const { handle } = await startSession();
+    expect(handle.capabilities).toEqual({ midTaskInput: true, artifacts: false });
+    expect(handle.adapterId).toBe('claude-code');
+  });
+
+  test('extra RuntimeConfig args are appended verbatim', async () => {
+    const { spawn } = await startSession({ invocation: makeMcpInvocation({ args: ['--model', 'sonnet'] }) });
+    const args = spawn.calls[0]!.args;
+    expect(args.slice(-2)).toEqual(['--model', 'sonnet']);
+  });
+
+  test('an envelope with no sender text is refused before spawning', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const invocation = makeMcpInvocation();
+    invocation.task = makeTaskSpec({ messages: [makeMessage({ parts: [{ url: 'https://example.test/x' }] })] });
+    await expect(adapter.start(invocation, () => {})).rejects.toThrow(RuntimeAdapterError);
+    expect(spawn.calls).toHaveLength(0);
+  });
+
+  test('a lifecycle this module cannot honour is refused rather than silently downgraded', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    await expect(adapter.start(makeMcpInvocation({ lifecycle: 'per-context' }), () => {})).rejects.toThrow(
+      /lifecycle must be 'per-task'/
+    );
+    expect(spawn.calls).toHaveLength(0);
+  });
+
+  test('a missing `claude` binary is a stated, actionable failure', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const started = adapter.start(makeMcpInvocation(), () => {});
+    spawn.last.emitExit({ code: 127, error: 'spawn claude ENOENT' });
+    await expect(started).rejects.toThrow(/was not found — install Claude Code/);
+  });
+
+  test('a startup that never reports a session fails with the window it was given', async () => {
+    const spawn = new FakeJobSpawn();
+    const clock = fakeClock();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock });
+    const started = adapter.start(makeMcpInvocation({ startupTimeoutSeconds: 5 }), () => {});
+    clock.fire();
+    await expect(started).rejects.toThrow(/did not report a started session within 5000ms/);
+  });
+
+  test('a CLI that rejects its own invocation is surfaced immediately, not at the timeout', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const started = adapter.start(makeMcpInvocation(), () => {});
+    spawn.last.emitJson({ type: 'result', is_error: true, result: 'Unknown option --nope' });
+    await expect(started).rejects.toThrow(/ended before it started: Unknown option --nope/);
+  });
+});
+
+// ── Responsibilities 5 + 6: how it ended, and that it is still alive ───────
+
+describe('observing the session', () => {
+  test('assistant text and tool calls both become progress — the signal b4 times out against', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'text', text: 'Reading the save system…' },
+          { type: 'tool_use', name: `mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_update_progress`, input: { note: 'x' } },
+        ],
+      },
+    });
+    expect(events).toEqual([
+      { type: 'progress', note: 'Reading the save system…' },
+      { type: 'progress', note: `using mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_update_progress` },
+    ]);
+  });
+
+  test('a receiver-tool call is named but never has its arguments repeated', () => {
+    const notes = assistantProgressNotes({
+      message: {
+        content: [{ type: 'tool_use', name: `mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_request_input`, input: { question: 'which branch?' } }],
+      },
+    });
+    expect(notes).toEqual([`using mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_request_input`]);
+    expect(notes.join('')).not.toContain('which branch?');
+  });
+
+  test('a request_input tool call does NOT become an input_required — the gateway already parked it', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: `mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_request_input`, input: {} }] },
+    });
+    // Synthesizing one here would ask the sender the same question twice.
+    expect(events.every((event) => event.type !== 'input_required')).toBe(true);
+  });
+
+  test('hook, tool-result, partial and quota frames are noise, not events', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({ type: 'system', subtype: 'hook_started', hook_name: 'SessionStart:startup' });
+    spawn.last.emitJson({ type: 'user', message: { content: [{ type: 'tool_result', content: 'ok' }] } });
+    spawn.last.emitJson({ type: 'stream_event', event: { delta: { type: 'text_delta', text: 'partial' } } });
+    spawn.last.emitJson({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning' } });
+    spawn.last.emitLine('not json at all');
+    expect(events).toEqual([]);
+  });
+
+  test('a clean result completes the task with the session\'s own summary', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({ type: 'result', is_error: false, subtype: 'success', terminal_reason: 'completed', result: 'PONG' });
+    expect(events).toEqual([{ type: 'completed', summary: 'PONG' }]);
+  });
+
+  test('an unauthenticated session FAILS, even though it reports subtype:"success"', async () => {
+    // The captured shape from a real not-logged-in run: `subtype` says
+    // success and `is_error` says otherwise. Keying off `subtype` would report
+    // a broken machine as a finished task.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'Not logged in · Please run /login' }] },
+      error: 'authentication_failed',
+      is_api_error_message: true,
+    });
+    spawn.last.emitJson({
+      type: 'result',
+      is_error: true,
+      subtype: 'success',
+      terminal_reason: 'api_error',
+      result: 'Not logged in · Please run /login',
+    });
+    const failure = events[events.length - 1] as Extract<RuntimeEvent, { type: 'failed' }>;
+    expect(failure.type).toBe('failed');
+    expect(failure.reason).toContain('api_error');
+    expect(failure.reason).toContain('Not logged in');
+    // The half an operator can act on — the runner is not what is broken.
+    expect(failure.reason).toContain('run `claude` once as that user and sign in');
+  });
+
+  test('narrowResultFrame reads is_error, never subtype', () => {
+    expect(narrowResultFrame({ type: 'result', is_error: true, subtype: 'success', result: 'x', terminal_reason: 'api_error' })).toEqual({
+      isError: true,
+      terminalReason: 'api_error',
+      text: 'x',
+    });
+    expect(narrowResultFrame({ type: 'assistant' })).toBeNull();
+  });
+
+  test('a session that dies mid-stream is a retry-safe failure, never a silence', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitExit({ code: 1, signal: 'SIGKILL' });
+    expect(events).toEqual([
+      { type: 'failed', reason: 'claude-code: the session exited without reporting a result (code 1, signal SIGKILL)', retrySafe: true },
+    ]);
+  });
+
+  test('the exit that FOLLOWS a result is not a second, spurious failure', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    spawn.last.emitExit({ code: 0 });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe('completed');
+  });
+});
+
+// ── send / cancel / dispose ────────────────────────────────────────────────
+
+describe('reaching and ending a live session', () => {
+  test('a mid-task message reaches the running session as a stream-json user turn', async () => {
+    const { spawn, adapter, handle } = await startSession();
+    await adapter.send(handle, { kind: 'message', message: makeMessage({ parts: [{ text: 'use the develop branch' }] }) });
+    expect(JSON.parse(spawn.last.written[1]!)).toEqual({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: 'use the develop branch' }] },
+    });
+  });
+
+  test('a message to an already-finished session is refused, not silently dropped', async () => {
+    const { spawn, adapter, handle } = await startSession();
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    await expect(adapter.send(handle, { kind: 'message', message: makeMessage() })).rejects.toThrow(/already ended/);
+  });
+
+  test('a second task.start is refused — this module is per-task only', async () => {
+    const { adapter, handle } = await startSession();
+    await expect(adapter.send(handle, { kind: 'task.start', task: makeTaskSpec() })).rejects.toThrow(/per-task/);
+  });
+
+  test('a handle from another adapter is rejected rather than acted on', async () => {
+    const adapter = new ClaudeCodeAdapter();
+    const foreign = { adapterId: 'jsonl-process', taskId: 't', contextId: 'c', capabilities: { midTaskInput: true, artifacts: true } };
+    await expect(adapter.cancel(foreign)).rejects.toThrow(/was not minted by this adapter/);
+  });
+
+  test('cancel is the polite ask; dispose is what actually ends it', async () => {
+    const spawn = new FakeJobSpawn();
+    const clock = fakeClock();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock });
+    const { handle } = await startSession({ spawn, adapter });
+
+    await adapter.cancel(handle, 'sender cancelled');
+    expect(spawn.last.ended).toBe(true);
+    // Nothing was killed yet — a tool call mid-write is not torn out.
+    expect(spawn.last.killedGroupWith).toHaveLength(0);
+
+    const disposed = adapter.dispose(handle);
+    expect(spawn.last.killedGroupWith).toEqual(['SIGTERM']);
+    clock.fire(); // the graceful window elapses
+    expect(spawn.last.killedGroupWith).toEqual(['SIGTERM', 'SIGKILL']);
+    spawn.last.emitExit({ code: null, signal: 'SIGKILL' });
+    await disposed;
+  });
+
+  test('a result that lands after cancel is dropped — the supervisor already moved on', async () => {
+    const { spawn, adapter, handle, events } = await startSession();
+    await adapter.cancel(handle, 'lease revoked');
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'too late' });
+    expect(events).toEqual([]);
+  });
+
+  test('dispose is idempotent and resolves on a confirmed exit', async () => {
+    const spawn = new FakeJobSpawn();
+    const clock = fakeClock();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock });
+    const { handle } = await startSession({ spawn, adapter });
+    const first = adapter.dispose(handle);
+    spawn.last.emitExit({ code: 0 });
+    await first;
+    await adapter.dispose(handle); // no second kill, no hang
+    expect(spawn.last.killedGroupWith).toEqual(['SIGTERM']);
+  });
+});
+
+// ── probe ──────────────────────────────────────────────────────────────────
+
+describe('probe', () => {
+  test('reports the installed version', async () => {
+    const adapter = new ClaudeCodeAdapter({
+      exec: { run: async () => ({ code: 0, stdout: '2.1.220 (Claude Code)\n', stderr: '' }) },
+    });
+    await expect(adapter.probe({ adapterId: 'claude-code', command: 'claude' })).resolves.toEqual({
+      ok: true,
+      runtime: 'claude-code',
+      capabilities: { midTaskInput: true, artifacts: false },
+      version: '2.1.220 (Claude Code)',
+    });
+  });
+
+  test('a missing binary is reported as something an operator can fix', async () => {
+    const adapter = new ClaudeCodeAdapter({
+      exec: { run: async () => ({ code: 127, stdout: '', stderr: '', error: 'ENOENT' }) },
+    });
+    const result = await adapter.probe({ adapterId: 'claude-code', command: 'claude' });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("make it reachable on this machine's PATH");
+  });
+});

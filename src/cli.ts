@@ -109,6 +109,12 @@ import { runService } from './service';
 // survives inside it as a deprecated, boot-time-only fallback.
 import { BindingStoreError, DepartmentBindingStore } from './department/bindings';
 import { DEPARTMENT_RUNTIMES_ENV } from './department/config';
+// simplified-onboarding b3 (D9/D23/D24, design 06 §4): the `claude-code`
+// engine module — the first one that REFUSES to start without its department
+// MCP connection, because everything it reports it reports by calling a
+// receiver tool. Registered exactly like the other three: reachable only by a
+// department whose resolved `RuntimeConfig.adapterId === 'claude-code'`.
+import { ClaudeCodeAdapter } from './department/claude-code';
 // department-mesh d8 (D17): the `container` isolation-tier adapter — an
 // ADDITIONAL entry in the manager's adapter registry, resolved by
 // `RuntimeConfig.adapterId` exactly like `jsonl-process`; a department only
@@ -628,6 +634,12 @@ function runStart(argv: string[] = []): void {
       new JsonlProcessAdapter({ logger: consoleLogger }),
       new ContainerAdapter({ logger: consoleLogger }),
       new PipelineDriveAdapter({ logger: consoleLogger }),
+      // b3: constructed with defaults — its permission mode, setting scopes
+      // and MCP server key are all module-level decisions (design 06 §4,
+      // 07 §8), not per-machine ones. `headersHelper` is deliberately left
+      // unset; see `ClaudeCodeAdapterOptions.headersHelper` for why the runner
+      // has nothing honest to point it at yet.
+      new ClaudeCodeAdapter({ logger: consoleLogger }),
     ],
     resolveRuntimeConfig: (departmentId) => departmentBindings.get(departmentId),
     send: (frame) => client.send(frame),
