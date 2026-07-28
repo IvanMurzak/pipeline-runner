@@ -235,6 +235,27 @@ describe('stuck detection — shape 2: the session ends having reported nothing 
     });
   });
 
+  test('x16\'s shape passes straight through: a cut-off session\'s `unreported` is NOT relabelled `stuck`', async () => {
+    // The third shape (`./claude-code.ts`'s `UNREPORTED_FAILURE_REASON`): a
+    // session that reported for a while and then lost its receiver tools. It
+    // has plenty of signals, so nothing in this file can see it — the engine
+    // module judged it from the tool-call outcomes only it can read, and the
+    // supervisor's job is to carry that verdict, not to second-guess it.
+    const { manager, adapter, runtimes, sink, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'claude-code', command: 'claude' });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'progress', note: 'using mcp__pipeline-department__task_update_progress' });
+    adapter.emitLatest({ type: 'progress', note: 'using mcp__pipeline-department__task_check_cancelled' });
+    adapter.emitLatest({ type: 'failed', reason: 'unreported', retrySafe: true });
+
+    expect(reportedFailure(sink)).toEqual({ reason: 'unreported', retry_safe: true });
+    expect(journalledTypes(journal)).not.toContain('department.completed');
+    // Same frame shape as `stuck`: a reason value on the existing `failed`
+    // event, so no consumer needs a schema change to receive it (p1).
+    expect(DeptEventMessageSchema.safeParse(sink.events()[sink.events().length - 1]).success).toBe(true);
+  });
+
   test('a silent `completed` from an engine that does not claim to stream (pipeline) stands untouched', async () => {
     const { manager, adapter, runtimes, sink, journal } = makeManager({ adapterId: 'pipeline-drive' });
     runtimes.set('review-department', { adapterId: 'pipeline-drive', command: 'pipeline' });

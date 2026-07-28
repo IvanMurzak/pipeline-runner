@@ -8,9 +8,11 @@
  * v2.1.220), that no credential ever reaches a place a credential must not be,
  * and that every way the session can fail produces a STATED reason rather than
  * a silence. The stream frames driven below are real, captured shapes from a
- * live `claude --print --output-format stream-json` run — including the one
+ * live `claude --print --output-format stream-json` run — including the two
  * that would have been guessed wrong: an unauthenticated session reports
- * `subtype:"success"` alongside `is_error:true`.
+ * `subtype:"success"` alongside `is_error:true`, and a session whose receiver
+ * tools have ALL started refusing still ends `is_error:false` (x16 — the P4
+ * gate's false `completed`, driven frame for frame below).
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -26,11 +28,16 @@ import {
   buildSessionContext,
   ClaudeCodeAdapter,
   DEPARTMENT_MCP_SERVER_NAME,
+  MAX_TRACKED_RECEIVER_CALLS,
   mcpServerStatus,
   narrowResultFrame,
   RECEIVER_TOOLS,
   receiverToolNames,
+  receiverToolUseIds,
+  redactSensitive,
   sanitizeMcpToolName,
+  toolResultOutcomes,
+  UNREPORTED_FAILURE_REASON,
 } from './claude-code';
 import { ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, EngineMcpUnavailableError } from './engine';
 import { FakeJobSpawn, makeMessage, makeTaskSpec } from './_test-helpers';
@@ -512,6 +519,197 @@ describe('observing the session', () => {
     spawn.last.emitExit({ code: 0 });
     expect(events).toHaveLength(1);
     expect(events[0]!.type).toBe('completed');
+  });
+});
+
+// ── x16: a completion nothing vouches for ──────────────────────────────────
+
+/** The captured 401 shape, verbatim from a live v2.1.220 run against a
+ *  bearer-protected MCP server that had stopped accepting the session's
+ *  token — the exact text the P4 gate produced. */
+const EXPIRED = 'MCP server "pipeline-department" requires re-authorization (token expired)';
+
+/** One `assistant` frame calling one tool, and the `user` frame answering it —
+ *  the two-frame exchange every tool call really is on the stream. */
+function toolCall(name: string, id: string): Record<string, unknown> {
+  return { type: 'assistant', message: { content: [{ type: 'tool_use', name, id, input: {} }] } };
+}
+function toolAnswer(id: string, options: { isError?: boolean; content?: unknown } = {}): Record<string, unknown> {
+  return {
+    type: 'user',
+    message: {
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: id,
+          ...(options.isError === true ? { is_error: true } : {}),
+          content: options.content ?? 'ACK',
+        },
+      ],
+    },
+  };
+}
+const receiver = (tool: string): string => `mcp__${DEPARTMENT_MCP_SERVER_NAME}__${tool}`;
+
+describe('x16: a session that exited claiming success is not the same as one that succeeded', () => {
+  test('the P4 gate case: the token expires mid-task, every report is refused, and the session still ends is_error:false', async () => {
+    // Reproduces the live gate failure frame for frame. The session works
+    // normally, loses its receiver tools to an expired execution token, says
+    // in plain words that it cannot finish — and `result` still carries
+    // `is_error:false`. Before x16 this was a `completed`, and the sender was
+    // told a task had succeeded when nothing was reported and nothing done.
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const { events } = await startSession({ spawn, adapter });
+
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_ok'));
+    spawn.last.emitJson(toolAnswer('toolu_ok'));
+    spawn.last.emitJson(toolCall(receiver('task_check_cancelled'), 'toolu_401'));
+    spawn.last.emitJson(toolAnswer('toolu_401', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({
+      type: 'result',
+      is_error: false,
+      subtype: 'success',
+      terminal_reason: 'completed',
+      result: 'my single task_check_cancelled call failed … the remaining steps go through that same server',
+    });
+
+    const terminal = events[events.length - 1]!;
+    expect(terminal).toEqual({ type: 'failed', reason: UNREPORTED_FAILURE_REASON, retrySafe: true });
+    expect(UNREPORTED_FAILURE_REASON).toBe('unreported');
+    // The detail an operator needs is in the log, never in the wire value.
+    expect(logger.lines.join('\n')).toContain('did not land');
+    expect(logger.lines.join('\n')).toContain('token expired');
+  });
+
+  test('the terminal tool call itself failing is the same verdict', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'all done!' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: UNREPORTED_FAILURE_REASON, retrySafe: true });
+  });
+
+  test('a receiver call that works AFTER the failure disarms it — the channel recovered', async () => {
+    // Exactly what D23's `headersHelper` is for: a 401 is retried once with
+    // fresh headers. A session that lost its tools for a moment and then
+    // reported properly has not failed, and must not be relabelled.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_1'));
+    spawn.last.emitJson(toolAnswer('toolu_1', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_2'));
+    spawn.last.emitJson(toolAnswer('toolu_2', { content: [{ type: 'text', text: 'ACK: task marked complete.' }] }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'reviewed the save system' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'reviewed the save system' });
+  });
+
+  test('an ORDINARY tool failing is not evidence of anything — a failed Read is session business', async () => {
+    // The false-positive guard. A model works around a failing `Read` or a
+    // denied `Bash` constantly; only the receiver tools report to the sender.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall('Read', 'toolu_read'));
+    spawn.last.emitJson(toolAnswer('toolu_read', { isError: true, content: 'ENOENT: no such file' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done anyway' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done anyway' });
+  });
+
+  test('a session whose reports all land completes exactly as before', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_a'));
+    spawn.last.emitJson(toolAnswer('toolu_a'));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_b'));
+    spawn.last.emitJson(toolAnswer('toolu_b'));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'PONG' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'PONG' });
+  });
+
+  test('a stated failure keeps its own more specific reason — `unreported` never overwrites it', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_x'));
+    spawn.last.emitJson(toolAnswer('toolu_x', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: true, terminal_reason: 'api_error', result: 'Overloaded' });
+    const failure = events[events.length - 1] as Extract<RuntimeEvent, { type: 'failed' }>;
+    expect(failure.reason).toContain('api_error');
+    expect(failure.reason).toContain('Overloaded');
+  });
+
+  test('watching a tool call emits no extra event — b4 times out on the same signals as before', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_1'));
+    spawn.last.emitJson(toolAnswer('toolu_1', { isError: true, content: EXPIRED }));
+    // One `progress` for the CALL, nothing at all for the answer: a tool
+    // result is not a signal, and counting it would change what the
+    // supervisor's watchdog measures.
+    expect(events).toEqual([{ type: 'progress', note: `using ${receiver('task_update_progress')}` }]);
+  });
+
+  test('receiverToolUseIds picks out receiver calls and ignores every other tool', () => {
+    const names = new Set(receiverToolNames());
+    const frame = {
+      message: {
+        content: [
+          { type: 'tool_use', name: receiver('task_complete'), id: 'a' },
+          { type: 'tool_use', name: 'Bash', id: 'b' },
+          { type: 'tool_use', name: receiver('task_fail') }, // no id ⇒ unusable
+          { type: 'text', text: 'hello' },
+        ],
+      },
+    };
+    expect(receiverToolUseIds(frame, names)).toEqual(['a']);
+    expect(receiverToolUseIds({ message: { content: 'not a list' } }, names)).toEqual([]);
+  });
+
+  test('toolResultOutcomes reads is_error, and treats its ABSENCE as success (captured shape)', () => {
+    expect(toolResultOutcomes(toolAnswer('id-1', { isError: true, content: EXPIRED }))).toEqual([
+      { toolUseId: 'id-1', isError: true, text: EXPIRED },
+    ]);
+    expect(toolResultOutcomes(toolAnswer('id-2', { content: 'ACK' }))).toEqual([
+      { toolUseId: 'id-2', isError: false, text: 'ACK' },
+    ]);
+    expect(toolResultOutcomes(toolAnswer('id-3', { content: [{ type: 'text', text: 'ok' }] }))).toEqual([
+      { toolUseId: 'id-3', isError: false, text: 'ok' },
+    ]);
+    // A block with no `tool_use_id` cannot be attributed to a call at all.
+    expect(toolResultOutcomes({ message: { content: [{ type: 'tool_result', content: 'ok' }] } })).toEqual([]);
+  });
+
+  test('third-party tool-result text is scrubbed before it is ever logged (D24)', async () => {
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const { events } = await startSession({ spawn, adapter });
+
+    // A transport-level failure legitimately names the endpoint it could not
+    // reach, and an auth failure can echo the header it sent.
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_leak'));
+    spawn.last.emitJson(toolAnswer('toolu_leak', { isError: true, content: `connect ECONNREFUSED ${MCP_URL} (Bearer ${TOKEN})` }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+
+    expect(events[events.length - 1]!.type).toBe('failed');
+    const logged = logger.lines.join('\n');
+    expect(logged).not.toContain(TOKEN);
+    expect(logged).not.toContain(MCP_URL);
+    expect(logged).toContain('<url>');
+  });
+
+  test('redactSensitive removes urls, bearers and jwt-shaped strings, and leaves the rest readable', () => {
+    expect(redactSensitive(EXPIRED)).toBe(EXPIRED);
+    expect(redactSensitive('POST https://ai-pipeline.dev/mcp failed')).toBe('POST <url> failed');
+    expect(redactSensitive('sent Bearer eyJhbGciOiJIUzI1NiJ9.abc')).toBe('sent Bearer <redacted>');
+    expect(redactSensitive('token eyJhbGciOiJIUzI1NiJ9.abc expired')).toBe('token <redacted> expired');
+  });
+
+  test('the set of watched calls is bounded — a daemon runs for weeks', async () => {
+    const { spawn, events } = await startSession();
+    for (let i = 0; i < MAX_TRACKED_RECEIVER_CALLS + 10; i += 1) {
+      spawn.last.emitJson(toolCall(receiver('task_update_progress'), `toolu_${i}`));
+    }
+    // The oldest ids were forgotten; the newest is still judged. Forgetting
+    // costs the ability to judge THAT call — never a false failure.
+    spawn.last.emitJson(toolAnswer('toolu_0', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]!.type).toBe('completed');
   });
 });
 

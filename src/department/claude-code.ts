@@ -72,6 +72,28 @@
  * that call, and asking the sender a second time from here would double every
  * question. The tool call is surfaced as `progress`, which is what the
  * supervisor's timers actually consume (responsibility 6, and `b4`'s input).
+ *
+ * ── Observing that the report actually LANDED (x16) ────────────────────────
+ * One thing about the result IS this module's business, and it is the half
+ * responsibility 5 was missing: a `result` frame says the PROCESS exited, and
+ * `is_error:false` says it exited claiming success — neither says the
+ * session's terminal receiver-tool call reached the gateway. The two are not
+ * the same event, and the P4 gate proved it: an execution token expired
+ * mid-task, every receiver tool went 401 from that moment on, the session
+ * ended its turn stating in plain words that it could not finish — and the
+ * `result` frame still carried `is_error:false`, so this module emitted
+ * `completed` and the sender was told a task had succeeded when nothing was
+ * reported and nothing was done.
+ *
+ * The evidence needed to tell those apart is in the stream and nowhere else,
+ * which is why the judgement lives here rather than in the supervisor: a
+ * failed tool call comes back as a `user` frame carrying a `tool_result`
+ * block with `is_error:true` (captured shape, v2.1.220 — see
+ * {@link toolResultOutcomes}). This module therefore tracks the OUTCOME of
+ * the receiver-tool calls specifically, and a `result` that claims success
+ * while the report channel is still broken is reported
+ * {@link UNREPORTED_FAILURE_REASON} instead of `completed`
+ * ({@link ClaudeCodeHandle.unlandedReport}).
  */
 
 import type { Clock } from '../core/clock';
@@ -125,6 +147,29 @@ export const RECEIVER_TOOLS = [
   'task.check_cancelled',
 ] as const;
 
+/**
+ * x16: the CODED terminal reason for a session that ended claiming success
+ * while its report could not reach the gateway — "nothing was reported", as
+ * distinct from `b4`'s `stuck`, which means "nothing was said". They are not
+ * the same failure and must not share a word: a stuck session went quiet with
+ * its tools intact; this one was talking the whole time and was CUT OFF, and
+ * an operator reading `stuck` would go looking for a hang that never happened.
+ *
+ * A bare word, for the same reason `./manager.ts`'s `STUCK_FAILURE_REASON` is
+ * one: it rides the existing `failed` event's `reason` (already
+ * `z.string().min(1)`), so no consumer needs a schema change and one that does
+ * not recognize it reads an ordinary failure. The human detail — which tool
+ * did not land, and what the MCP client said about it — goes to the log, never
+ * into the wire value.
+ *
+ * NOT imported from `@baizor/pipeline-protocol`: this package exact-pins
+ * `0.4.0`, and `p1`'s `DEPT_FAILURE_REASONS` is merged but unpublished, so
+ * `b4` hardcoded its string and this follows that precedent exactly. Adding
+ * this value to that constant when it next ships is a protocol-side follow-up;
+ * the STRING is the contract and is identical either way.
+ */
+export const UNREPORTED_FAILURE_REASON = 'unreported';
+
 /** Claude Code session startup (process spawn → `system`/`init` line) is a
  *  cold binary start plus MCP connect; 60s is generous rather than tight, and
  *  a department may override it with `RuntimeConfig.startupTimeoutSeconds`. */
@@ -134,6 +179,13 @@ export const DEFAULT_PROBE_TIMEOUT_S = 20;
 /** Same safety net as `./jsonl-process.ts`'s: how long `dispose()` waits for a
  *  confirmed exit after the group SIGKILL before resolving anyway. */
 export const KILL_SETTLE_GRACE_MS = 2_000;
+
+/** x16: how many receiver-tool calls may be awaiting their result before the
+ *  oldest tracked id is forgotten. A session has at most a couple outstanding;
+ *  the bound exists so an unforeseen frame order can never grow the set
+ *  without limit in a daemon that runs for weeks. Forgetting an id only costs
+ *  the ability to judge THAT call — never a false failure. */
+export const MAX_TRACKED_RECEIVER_CALLS = 64;
 
 /** `--permission-mode`'s accepted values (verified against `claude --help`,
  *  v2.1.220). `default` is NOT among them any more — `manual` is its current
@@ -437,6 +489,95 @@ function truncate(text: string, max: number): string {
 }
 
 /**
+ * A last line of defence for D24, applied to every piece of THIRD-PARTY text
+ * this module logs. A `tool_result` error string is written by the CLI's MCP
+ * client, not by us, and a transport-level failure ("connect ECONNREFUSED
+ * http://…/mcp") can legitimately contain the endpoint — so the text is
+ * scrubbed before it reaches a log line rather than trusted to be clean. Done
+ * by SHAPE, so it needs neither the URL nor the token to be held anywhere in
+ * this module (the alternative — retaining the bearer in order to redact it —
+ * would add a copy of the secret to defend against printing the secret).
+ */
+export function redactSensitive(text: string): string {
+  return text
+    .replace(/[Bb]earer\s+\S+/g, 'Bearer <redacted>')
+    .replace(/https?:\/\/\S+/g, '<url>')
+    .replace(/\beyJ[A-Za-z0-9_\-.]{8,}/g, '<redacted>');
+}
+
+/**
+ * The `tool_use` ids in one `assistant` frame that address a RECEIVER tool —
+ * the calls whose outcome decides whether this session reported anything at
+ * all. Matched against the sanitized callables (`mcp__<server>__task_…`), the
+ * same strings `--allowedTools` carries, so the set watched here and the set
+ * permitted there can never disagree.
+ *
+ * Every OTHER tool is deliberately ignored: a failing `Read` or a denied
+ * `Bash` is ordinary session business the model routinely works around, and
+ * treating it as evidence of a lost report would fail healthy tasks.
+ */
+export function receiverToolUseIds(raw: Record<string, unknown>, receiverNames: ReadonlySet<string>): string[] {
+  const message = isRecord(raw.message) ? raw.message : null;
+  if (message === null || !Array.isArray(message.content)) return [];
+  const ids: string[] = [];
+  for (const block of message.content) {
+    if (!isRecord(block) || block.type !== 'tool_use') continue;
+    if (typeof block.name !== 'string' || !receiverNames.has(block.name)) continue;
+    if (typeof block.id === 'string' && block.id.length > 0) ids.push(block.id);
+  }
+  return ids;
+}
+
+/** One `tool_result` block, normalized. `isError` is `true` ONLY on an
+ *  explicit `is_error:true` — the field is absent on a success (captured
+ *  shape), so anything else is "it came back", not "it failed". */
+export interface ToolResultOutcome {
+  toolUseId: string;
+  isError: boolean;
+  text: string | null;
+}
+
+/**
+ * Tool outcomes carried by one `user` frame. This is the frame Claude Code
+ * feeds a tool's answer back to the model on, and the ONLY place in the stream
+ * where "did that call work?" is stated — the assistant frame says a call was
+ * MADE, the result frame says the process ended, neither says the call landed.
+ *
+ * Captured against the real binary (v2.1.220) with a bearer-protected MCP
+ * server answering 401:
+ *
+ *   {"type":"user","message":{"content":[{"type":"tool_result",
+ *     "tool_use_id":"toolu_…","is_error":true,
+ *     "content":"MCP server \"pipeline-department\" requires re-authorization
+ *                (token expired)"}]}}
+ *
+ * `content` is a plain string there; the block-array form is accepted too,
+ * because the same field is an array for tools that answer with structured
+ * content.
+ */
+export function toolResultOutcomes(raw: Record<string, unknown>): ToolResultOutcome[] {
+  const message = isRecord(raw.message) ? raw.message : null;
+  if (message === null || !Array.isArray(message.content)) return [];
+  const outcomes: ToolResultOutcome[] = [];
+  for (const block of message.content) {
+    if (!isRecord(block) || block.type !== 'tool_result') continue;
+    if (typeof block.tool_use_id !== 'string' || block.tool_use_id.length === 0) continue;
+    outcomes.push({ toolUseId: block.tool_use_id, isError: block.is_error === true, text: toolResultText(block.content) });
+  }
+  return outcomes;
+}
+
+function toolResultText(content: unknown): string | null {
+  if (typeof content === 'string') return content.length > 0 ? content : null;
+  if (!Array.isArray(content)) return null;
+  const texts: string[] = [];
+  for (const part of content) {
+    if (isRecord(part) && part.type === 'text' && typeof part.text === 'string' && part.text.length > 0) texts.push(part.text);
+  }
+  return texts.length === 0 ? null : texts.join(' ');
+}
+
+/**
  * Progress notes for one `assistant` frame: one per text block (what the
  * session is saying) and one per tool call (what it is doing). This is the
  * whole of responsibility 6 — the signal `b4`'s stuck detection times out
@@ -505,6 +646,19 @@ class ClaudeCodeHandle implements RuntimeHandle {
   /** The last provider-side error the CLI reported, used to make the terminal
    *  failure actionable. */
   lastApiError: string | null = null;
+  /** x16: `tool_use` ids of receiver-tool calls whose result has not come back
+   *  yet. Entries are removed the moment their `tool_result` arrives, so this
+   *  holds one or two ids in practice; `MAX_TRACKED_RECEIVER_CALLS` bounds it
+   *  anyway, because a set that only ever grows in some unforeseen frame order
+   *  would be a leak in a process that runs for weeks. */
+  readonly pendingReceiverCalls = new Set<string>();
+  /** x16: what the MCP client said about the most recent receiver-tool call
+   *  that came back `is_error:true`, and has NOT since been followed by one
+   *  that worked — i.e. the report channel is broken RIGHT NOW. Null means
+   *  either nothing ever failed or a later call proved the channel recovered
+   *  (which a `headersHelper` re-authorization legitimately does), and a
+   *  completion may be believed. */
+  unlandedReport: string | null = null;
 
   constructor(
     readonly taskId: string,
@@ -542,6 +696,9 @@ export class ClaudeCodeAdapter implements EngineModule {
   private readonly settingSources: string | null;
   private readonly serverName: string;
   private readonly headersHelper: string | undefined;
+  /** x16: the sanitized callables that count as REPORTING — computed once
+   *  from the same `receiverToolNames()` the allow-list is built from. */
+  private readonly receiverNames: ReadonlySet<string>;
 
   constructor(options: ClaudeCodeAdapterOptions = {}) {
     this.spawnSeam = options.spawn ?? nodeJobSpawn();
@@ -552,6 +709,7 @@ export class ClaudeCodeAdapter implements EngineModule {
     this.settingSources = options.settingSources === undefined ? DEFAULT_SETTING_SOURCES : options.settingSources;
     this.serverName = options.serverName ?? DEPARTMENT_MCP_SERVER_NAME;
     this.headersHelper = options.headersHelper;
+    this.receiverNames = new Set(receiverToolNames(this.serverName));
   }
 
   /**
@@ -873,24 +1031,82 @@ export class ClaudeCodeAdapter implements EngineModule {
       case 'assistant': {
         const apiError = apiErrorCode(parsed);
         if (apiError !== null) handle.lastApiError = apiError;
+        this.trackReceiverCalls(handle, parsed);
         for (const note of assistantProgressNotes(parsed)) sink({ type: 'progress', note });
         return;
       }
-      case 'system':
       case 'user':
+        // Tool results. Nothing here is a supervisor event — a tool answering
+        // is not news — but x16 reads the RECEIVER tools' outcomes off these
+        // frames, because this is the only place the stream states whether a
+        // report actually landed. Still no event: emitting one would inflate
+        // `b4`'s signal count and change what the supervisor times out on.
+        this.noteToolResults(handle, parsed);
+        return;
+      case 'system':
       case 'stream_event':
       case 'rate_limit_event':
-        // Hook lifecycle, tool results, partial deltas, quota notices: real
-        // frames with nothing the supervisor acts on. Dropped quietly rather
-        // than logged per line — a busy session emits hundreds.
+        // Hook lifecycle, partial deltas, quota notices: real frames with
+        // nothing the supervisor acts on. Dropped quietly rather than logged
+        // per line — a busy session emits hundreds.
         return;
       default:
         this.logger.debug(`claude-code[${handle.taskId}]: unrecognized stream frame '${String(parsed.type)}'`);
     }
   }
 
+  /** x16: remember which `tool_use` ids belong to receiver tools, so the
+   *  `tool_result` that answers one can be told apart from every other tool's.
+   *  Bounded — see `MAX_TRACKED_RECEIVER_CALLS`. */
+  private trackReceiverCalls(handle: ClaudeCodeHandle, parsed: Record<string, unknown>): void {
+    for (const id of receiverToolUseIds(parsed, this.receiverNames)) {
+      if (handle.pendingReceiverCalls.size >= MAX_TRACKED_RECEIVER_CALLS) {
+        const oldest = handle.pendingReceiverCalls.values().next();
+        if (!oldest.done) handle.pendingReceiverCalls.delete(oldest.value);
+      }
+      handle.pendingReceiverCalls.add(id);
+    }
+  }
+
+  /**
+   * x16: the outcome of a receiver-tool call, which is the whole of the
+   * evidence that a session's report reached the gateway.
+   *
+   * A failure ARMS the judgement below; any subsequent receiver call that
+   * works DISARMS it, because the channel demonstrably recovered — a
+   * `headersHelper` re-authorization does exactly that, and a session that
+   * lost its tools for a minute and then completed properly has not failed.
+   * Only the state at the terminal frame matters.
+   */
+  private noteToolResults(handle: ClaudeCodeHandle, parsed: Record<string, unknown>): void {
+    for (const outcome of toolResultOutcomes(parsed)) {
+      if (!handle.pendingReceiverCalls.delete(outcome.toolUseId)) continue; // some other tool's result
+      handle.unlandedReport = outcome.isError ? (outcome.text ?? 'the call did not succeed') : null;
+    }
+  }
+
   private toTerminalEvent(handle: ClaudeCodeHandle, result: ClaudeResult): RuntimeEvent {
     if (!result.isError) {
+      // x16: `is_error:false` means the process exited CLAIMING success. If the
+      // last thing this session heard from the gateway was a refusal, that
+      // claim vouches for nothing — the summary below never reached a sender,
+      // and neither did whatever `task.complete` was supposed to carry.
+      if (handle.unlandedReport !== null) {
+        this.logger.warn(
+          `claude-code[${handle.taskId}]: the session ended claiming success, but its last department tool call did not ` +
+            `land (${truncate(redactSensitive(handle.unlandedReport), MAX_PROGRESS_NOTE)}) and nothing it reported ` +
+            `afterwards did either — reporting '${UNREPORTED_FAILURE_REASON}' rather than a completion nothing vouches for`
+        );
+        return {
+          type: 'failed',
+          reason: UNREPORTED_FAILURE_REASON,
+          // A fresh spawn is minted a fresh execution token (`./manager.ts`'s
+          // `resolveMcpEnv`), so this is precisely the kind of failure a later
+          // attempt gets past — unlike `b4`'s `stuck`, where nothing suggests
+          // the next run would say any more than this one did.
+          retrySafe: true,
+        };
+      }
       return { type: 'completed', ...(result.text === null ? {} : { summary: truncate(result.text, MAX_SUMMARY) }) };
     }
     const cause = result.terminalReason === null ? '' : ` (${result.terminalReason})`;
