@@ -57,9 +57,9 @@
  * `.mcp.json` honoured in full: a `permissions.deny` rule was enforced, a
  * department-local subagent ran, and a project-scoped MCP server reported
  * `"status":"connected"`. Workspace trust is an INTERACTIVE-mode gate, exactly
- * as `--print`'s own help text says and as lines 19-26 above already document;
- * nothing has to record anything for these servers to load here. [D28] is
- * annotated accordingly.
+ * as `--print`'s own help text says and as the `--print` entry in the flag
+ * surface above already documents; nothing has to record anything for these
+ * servers to load here. [D28] is annotated accordingly.
  *
  * ── Wiring the department MCP server (D23) ─────────────────────────────────
  * `--mcp-config` accepts an inline JSON STRING (`claude --help`: "Load MCP
