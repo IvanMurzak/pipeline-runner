@@ -1,0 +1,33 @@
+src/cli.ts
+  s_247a336e307f18::t_d3b8add9cacb7e 618-625
+src/department/container.ts
+  s_247a336e307f18::t_c8aef916021d91 110-112,418,420-430
+src/department/engine.test.ts
+  s_247a336e307f18::t_2cc929248dd75c 1-273
+src/department/engine.ts
+  s_247a336e307f18::t_a5d4f930cedf0f 1-374
+src/department/jsonl-process.ts
+  s_247a336e307f18::t_2d174b144765bb 66-69,345,347-357
+src/department/manager.ts
+  s_247a336e307f18::t_6d7f4368f57f3d 173,187-194
+src/department/pipeline-drive.ts
+  s_247a336e307f18::t_b159a2f2b6c5f5 182-184,309,311-323
+src/index.ts
+  s_247a336e307f18::t_6f0d73da8217ca 21-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "5845ad7276ba856bc3d0dba2334b8fa8e90db868",
+  "prompts": {},
+  "sessions": {
+    "s_247a336e307f18": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_247a336e307f18",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
