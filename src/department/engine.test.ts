@@ -26,6 +26,7 @@ import {
   ENGINE_REGISTRY,
   EngineMcpUnavailableError,
   engineToAdapterId,
+  isolationForAdapterId,
   isSupportedEngine,
   lookupEngine,
   PIPELINE_ENGINE_CAPABILITIES,
@@ -119,7 +120,32 @@ describe('module ⇄ registry coherence', () => {
       expect(row?.adapterId).toBe(module.id);
       expect(module.engineCapabilities).toEqual(row?.capabilities as EngineCapabilities);
       expect(module.requiresMcpConnection).toBe(row?.requiresMcpConnection as boolean);
+      // x20: the row is what `./manager.ts` judges an isolation request
+      // against (it holds an adapterId, not an instance), so a row that
+      // disagreed with its module would let the supervisor believe a sandbox
+      // exists that the module does not build.
+      expect(module.isolation).toBe(row?.isolation as never);
     }
+  });
+
+  test('x20: exactly ONE shipped module provides `container` isolation — every other spawns onto the host', () => {
+    // This asymmetry is the whole reason the refusal exists. If a second
+    // module ever genuinely sandboxes, this list grows and the refusal in
+    // `./manager.ts` narrows automatically — it reads the same rows.
+    const isolating = SHIPPED_MODULES.filter((module) => module.isolation === 'container').map((module) => module.id);
+    expect(isolating).toEqual(['container']);
+    expect(isolationForAdapterId('container')).toBe('container');
+    for (const id of ['claude-code', 'jsonl-process', 'pipeline-drive']) {
+      expect(isolationForAdapterId(id)).toBe('process');
+    }
+  });
+
+  test('x20: an adapterId outside the registry yields null — "not this table\'s to judge", not "no isolation"', () => {
+    // `./manager.ts` must NOT refuse a third-party/test adapter it knows
+    // nothing about; null is what keeps that distinct from a declared
+    // `'process'`, which IS refused when a sandbox was requested.
+    expect(isolationForAdapterId('fake')).toBeNull();
+    expect(isolationForAdapterId('codex')).toBeNull();
   });
 
   test('the registry covers exactly the four registered adapters, in both directions', () => {
@@ -194,6 +220,9 @@ describe('adding an engine is the registry plus the enum (06 §6)', () => {
     adapterId: 'stub-engine',
     capabilities: { acceptsMidTaskInput: 'yes', supportsCancellation: 'yes', supportsStreaming: 'yes', supportsCheckpoint: 'no' },
     requiresMcpConnection: true,
+    // x20: a new engine states the isolation tier it provides, like every
+    // other declaration on the row — one more line, still mechanical.
+    isolation: 'process',
   };
 
   test('one added row is enough for the whole engine surface to know about it', () => {

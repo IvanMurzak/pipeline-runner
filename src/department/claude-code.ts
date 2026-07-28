@@ -115,6 +115,7 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+import type { IsolationTier } from '../core/capabilities';
 // simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
 import type { EngineCapabilities, EngineModule, EngineName } from './engine';
 import { CLAUDE_CODE_ENGINE_CAPABILITIES, EngineMcpUnavailableError, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, requireEngineMcpEnv } from './engine';
@@ -687,6 +688,11 @@ export class ClaudeCodeAdapter implements EngineModule {
   readonly engineCapabilities: EngineCapabilities = CLAUDE_CODE_ENGINE_CAPABILITIES;
   /** Responsibilities 3 + 4 (D24). See this module's doc. */
   readonly requiresMcpConnection = true;
+  /** x20: `claude` is spawned directly on the host. A department asking
+   *  for `container` isolation AND this engine cannot be served by this
+   *  module — `./manager.ts` states that and fails, rather than quietly
+   *  running the session unsandboxed. */
+  readonly isolation: IsolationTier = 'process';
 
   private readonly spawnSeam: JobSpawn;
   private readonly exec: JobExec;

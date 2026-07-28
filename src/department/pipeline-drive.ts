@@ -179,6 +179,7 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+import type { IsolationTier } from '../core/capabilities';
 // simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
 import type { EngineCapabilities, EngineModule, EngineName } from './engine';
 import { PIPELINE_ENGINE_CAPABILITIES } from './engine';
@@ -321,6 +322,8 @@ export class PipelineDriveAdapter implements EngineModule {
    *  shipper, not through the department MCP server; it has never needed the
    *  injected variables and does not refuse without them. */
   readonly requiresMcpConnection = false;
+  /** x20: `pipeline drive` runs as an ordinary host child process. */
+  readonly isolation: IsolationTier = 'process';
 
   private readonly exec: JobExec;
   private readonly logger: Logger;

@@ -53,6 +53,11 @@
  *     — everything UP TO building the correct, validated `docker run` argv
  *     (including refusing to run with a declared-but-unenforced allowlist)
  *     is implemented and unit-tested here.
+ *   - Environment values NEVER touch the command line (x20). `-e KEY` names
+ *     the variable and docker takes the value from the CLI process's own
+ *     environment, because a command line is world-readable to every local
+ *     user (`ps`, `/proc/<pid>/cmdline`) and the department execution token
+ *     travels this way — see `BuiltContainerInvocation.clientEnv`.
  *
  * ── Per-execution workspace (T15/T30) ───────────────────────────────────────
  * `start()` mkdirs (never wipes) `<workspaceRoot>/<sanitized taskId>` and
@@ -107,6 +112,7 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+import type { IsolationTier } from '../core/capabilities';
 // simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
 import type { EngineCapabilities, EngineModule, EngineName } from './engine';
 import { CONTAINER_ENGINE_CAPABILITIES } from './engine';
@@ -168,7 +174,8 @@ export interface BuildContainerArgsParams {
   command: string;
   args: string[];
   /** Explicit env for the CONTAINER (never the host's `process.env` — see
-   *  `ContainerAdapter.tryBuild`'s doc for why that is safe by construction). */
+   *  `ContainerAdapter.tryBuild`'s doc for why that is safe by construction).
+   *  Values NEVER reach the argv — see `BuiltContainerInvocation.clientEnv`. */
   env?: Record<string, string | undefined>;
   containerName: string;
   workspaceHostPath: string;
@@ -177,6 +184,35 @@ export interface BuildContainerArgsParams {
 export interface BuiltContainerInvocation {
   runtimeBinary: ContainerRuntimeBinary;
   args: string[];
+  /**
+   * x20: the environment the `docker`/`podman` CLI PROCESS must be spawned
+   * with for the name-only `-e KEY` flags in `args` to resolve to anything.
+   *
+   * This pair — `-e KEY` on the argv, `KEY=value` in the client process's
+   * environment — is the whole point. `docker run -e KEY` (no `=`) is
+   * documented to take the value from the client's own environment, so the
+   * VALUE never becomes a command-line argument of any process.
+   *
+   * That matters because a command line is a world-readable surface on a
+   * shared machine (`ps -ef`, `/proc/<pid>/cmdline` is mode 0444, Task
+   * Manager's "Command line" column), whereas a process's environment block
+   * is not: `/proc/<pid>/environ` is 0400 owner-only, and reading another
+   * process's environment on Windows needs `PROCESS_VM_READ`. The department
+   * execution token (`PIPELINE_MESH_EXECUTION_TOKEN`) flows through `env`, so
+   * putting it on the argv leaked it to every local user — see
+   * `./execution-token-manager.ts`'s never-on-disk invariant, which this is
+   * the process-table half of.
+   *
+   * A temp `--env-file` was the other option and is REJECTED on purpose: it
+   * moves the secret from one world-readable surface to another (a file with
+   * default umask perms), and adds a lifetime to get wrong on a crash.
+   *
+   * The container/host boundary is unchanged: docker forwards ONLY the keys
+   * explicitly named by a `-e` flag, so the client process carrying the
+   * daemon's own `PATH`/`DOCKER_HOST` alongside them does not put those in
+   * the container.
+   */
+  clientEnv: Record<string, string | undefined>;
 }
 
 /**
@@ -222,10 +258,23 @@ export function buildContainerArgs(params: BuildContainerArgsParams): BuiltConta
   validateEgressAllowlist(allowlist);
   const networkArgs = buildNetworkArgs(spec);
 
+  // x20: NAME-ONLY `-e KEY` flags. The value is deliberately NOT interpolated
+  // here — it travels in `clientEnv` (see `BuiltContainerInvocation.clientEnv`
+  // for why the argv is the wrong place for an execution token).
   const envFlags: string[] = [];
+  const clientEnv: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(params.env ?? {})) {
     if (value === undefined) continue;
-    envFlags.push('-e', `${key}=${value}`);
+    // A key carrying `=` would make `-e KEY=x` parse as an inline assignment
+    // rather than a pass-through, which is exactly the leak this removed —
+    // refuse rather than silently fall back to putting the value on the argv.
+    if (key.length === 0 || key.includes('=')) {
+      throw new RuntimeAdapterError(
+        `container: refusing to pass environment variable '${key}' — a name must be non-empty and contain no '='`
+      );
+    }
+    envFlags.push('-e', key);
+    clientEnv[key] = value;
   }
 
   const workdir = spec.workdir ?? workspaceContainerPath;
@@ -252,7 +301,7 @@ export function buildContainerArgs(params: BuildContainerArgsParams): BuiltConta
     ...params.args,
   ];
 
-  return { runtimeBinary: spec.runtimeBinary ?? DEFAULT_CONTAINER_RUNTIME_BINARY, args };
+  return { runtimeBinary: spec.runtimeBinary ?? DEFAULT_CONTAINER_RUNTIME_BINARY, args, clientEnv };
 }
 
 /**
@@ -428,6 +477,9 @@ export class ContainerAdapter implements EngineModule {
   /** Same reasoning as the adapter it wraps: the JSONL contract runs fine
    *  with no MCP access at all. */
   readonly requiresMcpConnection = false;
+  /** x20: the whole reason this adapter exists — the ONE module that
+   *  actually builds a sandbox around the process it starts. */
+  readonly isolation: IsolationTier = 'container';
 
   private readonly inner: AgentRuntimeAdapter;
   private readonly control: ContainerRuntimeControl;
@@ -506,7 +558,7 @@ export class ContainerAdapter implements EngineModule {
     const workspaceHostPath = join(this.workspaceRoot, sanitizeName(taskIdForNaming));
     try {
       this.fs.mkdirp(workspaceHostPath);
-      const { runtimeBinary, args } = buildContainerArgs({
+      const { runtimeBinary, args, clientEnv } = buildContainerArgs({
         spec: config.container,
         command: config.command,
         args: config.args ?? [],
@@ -518,17 +570,24 @@ export class ContainerAdapter implements EngineModule {
         ok: true,
         containerName,
         runtimeBinary,
-        // `env`/`cwd` are cleared on the OUTER config: they belong to the
-        // CONTAINED process, and are already folded into `args` as `-e`/`-w`
-        // flags above. Passing `env: undefined` through to the inner adapter
-        // does NOT leak the daemon's host environment into the container —
-        // `nodeJobSpawn()` merging `process.env` there supplies the `docker`
-        // CLI PROCESS's own environment (PATH, DOCKER_HOST, …, needed just to
-        // run `docker` at all), which has no bearing on what the CONTAINER's
-        // environment is: docker does not forward the client's env into the
-        // container unless told to with `-e`, which is exactly the boundary
-        // this adapter uses to pass through ONLY `config.env`.
-        config: { ...config, command: runtimeBinary, args, env: undefined, cwd: undefined },
+        // `cwd` is cleared on the OUTER config: it belongs to the CONTAINED
+        // process and is already folded into `args` as the `-w` flag above.
+        //
+        // `env` is NOT cleared (x20 — it used to be). It now carries
+        // `clientEnv`: the same `config.env` entries, handed to the `docker`
+        // CLI PROCESS so that the name-only `-e KEY` flags built above have a
+        // value to forward. Before x20 the values were interpolated into the
+        // argv as `-e KEY=value`, which published the department execution
+        // token to every local user through the process table.
+        //
+        // This does NOT widen what reaches the container. `nodeJobSpawn()`
+        // merges this over `process.env`, so the docker CLI process's own
+        // environment (PATH, DOCKER_HOST, …, needed just to run `docker` at
+        // all) is present alongside — but docker forwards NOTHING from the
+        // client into the container except the keys a `-e` flag names, and the
+        // only names emitted are `config.env`'s own. The boundary is exactly
+        // where it was; only the transport of the values changed.
+        config: { ...config, command: runtimeBinary, args, env: clientEnv, cwd: undefined },
       };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);

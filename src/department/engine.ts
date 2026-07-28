@@ -83,6 +83,7 @@
  * department.
  */
 
+import type { IsolationTier } from '../core/capabilities';
 import type { AgentRuntimeAdapter, InvocationEnvelope } from './adapter';
 import { RuntimeAdapterError } from './adapter';
 
@@ -250,6 +251,26 @@ export interface EngineModule extends AgentRuntimeAdapter {
    * `task.fail`, so it can only end by deadline.
    */
   readonly requiresMcpConnection: boolean;
+  /**
+   * x20 — the isolation tier this module ACTUALLY provides
+   * (`../core/capabilities.ts`'s `IsolationTier`, the same vocabulary
+   * `register --container` advertises and the mesh scheduler matches a
+   * department's `requiredIsolation` against).
+   *
+   * Exactly one shipped module answers `'container'`, and that asymmetry is
+   * the point. Isolation is not a flag on a `RuntimeConfig` that any adapter
+   * honours — it is a property of the adapter that runs the process, because
+   * only `./container.ts` builds a `docker run` around it. Every other module
+   * spawns straight onto the host and IGNORES `RuntimeConfig.container`
+   * entirely (`./adapter.ts`'s own field doc says so).
+   *
+   * Declaring it makes that ignoring CHECKABLE instead of silent: see
+   * `./manager.ts`'s `resolveIsolationRefusal`, which refuses to run a
+   * department whose config asks for a sandbox the selected adapter cannot
+   * build. Before x20 that request was simply dropped and the session ran
+   * unsandboxed on the host.
+   */
+  readonly isolation: IsolationTier;
 }
 
 // ── Responsibility 4: refusing, rather than running blind (D24) ─────────────
@@ -333,6 +354,11 @@ export interface EngineDeclaration {
   readonly capabilities: EngineCapabilities;
   /** Mirrors `EngineModule.requiresMcpConnection` for the same row. */
   readonly requiresMcpConnection: boolean;
+  /** Mirrors `EngineModule.isolation` for the same row (x20) — carried as
+   *  DATA so the supervisor can judge an isolation request from an
+   *  `adapterId` alone, holding no adapter instance, exactly the way
+   *  `resolveStuckAfterMs` already reads `capabilities.supportsStreaming`. */
+  readonly isolation: IsolationTier;
 }
 
 /** Any engine table, including one a test or a future build composes. The
@@ -355,24 +381,32 @@ export const ENGINE_REGISTRY: Readonly<Record<EngineName, EngineDeclaration>> = 
     adapterId: 'claude-code',
     capabilities: CLAUDE_CODE_ENGINE_CAPABILITIES,
     requiresMcpConnection: true,
+    // Spawns `claude` straight onto the host. Nothing about this module
+    // sandboxes anything — see `isolation`'s doc on `EngineModule`.
+    isolation: 'process',
   },
   process: {
     engine: 'process',
     adapterId: 'jsonl-process',
     capabilities: PROCESS_ENGINE_CAPABILITIES,
     requiresMcpConnection: false,
+    isolation: 'process',
   },
   container: {
     engine: 'container',
     adapterId: 'container',
     capabilities: CONTAINER_ENGINE_CAPABILITIES,
     requiresMcpConnection: false,
+    // The one row that says `container`, and the only adapter that builds a
+    // `docker run` (`./container.ts`).
+    isolation: 'container',
   },
   pipeline: {
     engine: 'pipeline',
     adapterId: 'pipeline-drive',
     capabilities: PIPELINE_ENGINE_CAPABILITIES,
     requiresMcpConnection: false,
+    isolation: 'process',
   },
 };
 
@@ -402,6 +436,25 @@ export function lookupEngine(name: string, registry: EngineRegistry = ENGINE_REG
  *  it writes a binding; this is the table it reads. */
 export function engineToAdapterId(name: string, registry: EngineRegistry = ENGINE_REGISTRY): string | null {
   return lookupEngine(name, registry)?.adapterId ?? null;
+}
+
+/**
+ * x20 — the isolation tier the adapter behind `adapterId` actually provides,
+ * or `null` when this build has no engine row for it.
+ *
+ * `null` means "not this table's to judge", NOT "no isolation": a caller-
+ * supplied or test adapter id is outside the shipped set entirely, and
+ * `./manager.ts` deliberately does not refuse those (it cannot know what they
+ * do — the same posture `adapterIdToEngine` already takes by returning null,
+ * and `resolveStuckAfterMs` by declining to watch). Every adapterId a real
+ * department can be bound to IS in the table, so the refusal covers every
+ * reachable configuration.
+ */
+export function isolationForAdapterId(adapterId: string, registry: EngineRegistry = ENGINE_REGISTRY): IsolationTier | null {
+  for (const row of Object.values(registry)) {
+    if (row.adapterId === adapterId) return row.isolation;
+  }
+  return null;
 }
 
 /** `adapterId` → `engine:`, for going the other way: naming the engine that

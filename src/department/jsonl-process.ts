@@ -63,6 +63,7 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+import type { IsolationTier } from '../core/capabilities';
 // simplified-onboarding b2: the engine-module declarations (`./engine.ts`) —
 // types + two consts, no behaviour.
 import type { EngineCapabilities, EngineModule, EngineName } from './engine';
@@ -355,6 +356,9 @@ export class JsonlProcessAdapter implements EngineModule {
    *  `./manager.ts`'s d6 note) — so refusing without them would break every
    *  shipped JSONL runtime. Only a model-driven engine needs D24's refusal. */
   readonly requiresMcpConnection = false;
+  /** x20: spawns onto the host — `RuntimeConfig.container` means nothing
+   *  here, and `./manager.ts` now refuses rather than ignoring one. */
+  readonly isolation: IsolationTier = 'process';
 
   private readonly spawnSeam: JobSpawn;
   private readonly clock: Clock;

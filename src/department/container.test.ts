@@ -27,6 +27,12 @@ import type { InvocationEnvelope, RuntimeConfig } from './adapter';
 import { RuntimeAdapterError, type ContainerSpec } from './adapter';
 import { runAdapterConformanceSuite, type ConformanceInvocationOverrides } from './_adapter-conformance';
 import { FakeJobSpawn, makeTaskSpec } from './_test-helpers';
+// x20: the two variables the supervisor injects for a spawn — the token one is
+// the credential this file's argv assertions exist to keep off the process
+// table. Same strings as `./manager.ts`'s `MESH_*_ENV` (asserted in
+// `./engine.test.ts`); imported from `./engine.ts` to keep this file's import
+// graph on the adapter side.
+import { ENGINE_MCP_TOKEN_ENV as MESH_EXECUTION_TOKEN_ENV, ENGINE_MCP_URL_ENV as MESH_MCP_URL_ENV } from './engine';
 import {
   buildContainerArgs,
   ContainerAdapter,
@@ -177,7 +183,7 @@ describe('ContainerAdapter — delegates to a real docker run invocation', () =>
     await startPromise;
   });
 
-  test('config.env becomes -e flags; the daemon host env is never forwarded into the container', async () => {
+  test('config.env becomes NAME-ONLY -e flags — the value never reaches the argv (x20); the daemon host env is never forwarded into the container', async () => {
     const { adapter, spawner } = makeHarness();
     const originalHostVar = process.env.PIPELINE_RUNNER_CONTAINER_TEST_LEAK;
     process.env.PIPELINE_RUNNER_CONTAINER_TEST_LEAK = 'should-not-appear';
@@ -185,8 +191,15 @@ describe('ContainerAdapter — delegates to a real docker run invocation', () =>
       const invocation = makeContainerInvocation({ runtime: { env: { UNITY_LICENSE: 'abc123' } } });
       const startPromise = adapter.start(invocation, () => {});
       const call = spawner.calls[0];
+      // The flag names the variable and stops there: `-e UNITY_LICENSE` tells
+      // docker to take the value from ITS OWN environment, so the value is
+      // never a command-line argument of any process (x20).
       expect(call.args).toContain('-e');
-      expect(call.args[call.args.indexOf('-e') + 1]).toBe('UNITY_LICENSE=abc123');
+      expect(call.args[call.args.indexOf('-e') + 1]).toBe('UNITY_LICENSE');
+      expect(call.args.join(' ')).not.toContain('abc123');
+      // …and it is genuinely passed, not dropped: it rides the docker CLI
+      // process's environment block instead.
+      expect(call.opts?.env?.UNITY_LICENSE).toBe('abc123');
       expect(call.args.join(' ')).not.toContain('PIPELINE_RUNNER_CONTAINER_TEST_LEAK');
       expect(call.args.join(' ')).not.toContain('should-not-appear');
       spawner.last.emitJson({ type: 'ready', capabilities: { midTaskInput: true } });
@@ -195,6 +208,57 @@ describe('ContainerAdapter — delegates to a real docker run invocation', () =>
       if (originalHostVar === undefined) delete process.env.PIPELINE_RUNNER_CONTAINER_TEST_LEAK;
       else process.env.PIPELINE_RUNNER_CONTAINER_TEST_LEAK = originalHostVar;
     }
+  });
+
+  test('x20: the department EXECUTION TOKEN is never on the container process command line', async () => {
+    // The regression this is here to catch, stated in the terms that matter:
+    // a process command line is world-readable on a shared machine (`ps`,
+    // `/proc/<pid>/cmdline`, Task Manager), and `PIPELINE_MESH_EXECUTION_TOKEN`
+    // is exactly what `./manager.ts`'s `resolveMcpEnv` injects through
+    // `runtime.env`. Asserted on the BUILT ARGV, not by reading the source.
+    const { adapter, spawner } = makeHarness();
+    const secret = 'dept-exec-token-SUPER-SECRET-VALUE';
+    const invocation = makeContainerInvocation({
+      runtime: {
+        env: {
+          [MESH_MCP_URL_ENV]: 'https://ai-pipeline.dev/mcp',
+          [MESH_EXECUTION_TOKEN_ENV]: secret,
+        },
+      },
+    });
+    const startPromise = adapter.start(invocation, () => {});
+    const call = spawner.calls[0];
+
+    // Nothing on the command line — not the token, not any substring of it.
+    expect(call.args.join(' ')).not.toContain(secret);
+    expect(call.args.some((a) => a.includes(secret))).toBe(false);
+    // Not smuggled onto the argv under an `=` form either.
+    expect(call.args.some((a) => a.startsWith(`${MESH_EXECUTION_TOKEN_ENV}=`))).toBe(false);
+    // The variable IS requested, by name only, so the container still gets it.
+    const eValues = call.args.filter((_, i) => call.args[i - 1] === '-e');
+    expect(eValues).toContain(MESH_EXECUTION_TOKEN_ENV);
+    expect(eValues).toContain(MESH_MCP_URL_ENV);
+    // …carried in the docker client process's environment block, which (unlike
+    // the command line) is not world-readable.
+    expect(call.opts?.env?.[MESH_EXECUTION_TOKEN_ENV]).toBe(secret);
+
+    spawner.last.emitJson({ type: 'ready', capabilities: { midTaskInput: true } });
+    await startPromise;
+  });
+
+  test('x20: buildContainerArgs refuses an env NAME containing `=` rather than falling back to an inline value', () => {
+    // `-e A=B=C` would parse as an inline assignment — i.e. silently back to
+    // putting a value on the argv. Refuse instead.
+    expect(() =>
+      buildContainerArgs({
+        spec: makeContainerSpec(),
+        command: 'dept',
+        args: [],
+        env: { 'BAD=NAME': 'x' },
+        containerName: 'c1',
+        workspaceHostPath: '/ws/t1',
+      })
+    ).toThrow(RuntimeAdapterError);
   });
 
   test('two starts for the same taskId reuse the workspace directory but mint distinct container names', async () => {

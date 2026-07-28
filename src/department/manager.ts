@@ -211,7 +211,7 @@ import type {
 } from './adapter';
 import type { ArtifactFileSystem } from './artifact-upload';
 import { uploadDepartmentArtifact } from './artifact-upload';
-import { adapterIdToEngine, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, lookupEngine } from './engine';
+import { adapterIdToEngine, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, isolationForAdapterId, lookupEngine } from './engine';
 import {
   buildDepartmentIndexEntry,
   buildDepartmentJournalEnvelope,
@@ -366,6 +366,42 @@ const MAX_TRACKED_TASK_ARTIFACT_BUDGETS = 2000;
  * identical either way.
  */
 export const STUCK_FAILURE_REASON = 'stuck';
+
+// ── x20: an isolation request this build cannot honour ──────────────────────
+
+/**
+ * The CODED terminal reason for a department whose resolved `RuntimeConfig`
+ * asks for container isolation while the adapter selected to run it provides
+ * none.
+ *
+ * ## Why this is a terminal failure and not a shrug
+ *
+ * `RuntimeConfig.container` is the only way a binding says "sandbox this", and
+ * exactly one adapter reads it (`./container.ts`). Every other adapter — by
+ * its own field doc — IGNORES it. So before x20, a binding of
+ * `{ adapterId: 'claude-code', container: {…} }` was accepted, stored, and
+ * run: the session started on the host, unsandboxed, with no mount limits, no
+ * read-only root and full network, and NOTHING anywhere said the sandbox had
+ * been dropped. A silently-downgraded isolation request is the worst possible
+ * silent no-op, because the operator's evidence of safety (they wrote the
+ * spec) and reality (there is no container) diverge without a signal.
+ *
+ * The refusal is modelled on D24's blind-start rule in `./engine.ts`
+ * (`requireEngineMcpEnv`): when the thing that was asked for cannot be
+ * provided, refuse BEFORE spawning and say why. A department that runs
+ * unsandboxed when it asked for a sandbox is worse than one that never began.
+ *
+ * ## Why the string is hardcoded
+ *
+ * Same reason `STUCK_FAILURE_REASON` above and `UNREPORTED_FAILURE_REASON`
+ * (x16, `./claude-code.ts`) are: `@baizor/pipeline-protocol` is exact-pinned
+ * at 0.4.0 and its `DEPT_FAILURE_REASONS` constant is merged but unpublished.
+ * The STRING is the contract and is byte-identical either way; it rides the
+ * existing `failed` event's `reason` (already `z.string().min(1)`), so no
+ * schema change is needed and an older consumer just reads a `failed` whose
+ * reason it does not specially recognize.
+ */
+export const ISOLATION_UNSUPPORTED_FAILURE_REASON = 'isolation_unsupported';
 
 /** No signal from the runtime for this long ⇒ stuck, when the department
  *  states no `limits.taskTimeout` and no explicit `stuckAfterSeconds`.
@@ -608,8 +644,103 @@ export class DepartmentManager {
     this.executions.set(offer.executionId, state);
     this.armDeadlineTimer(state);
 
+    // x20: the isolation request and the adapter that would serve it must
+    // agree, and this is the last moment anything can check — after that,
+    // `spawnAndStart` runs whatever the adapter runs. Ordered BEFORE the spawn
+    // deliberately: the DoD is a stated failure with ZERO spawns, not a
+    // sandbox-less session that is cleaned up afterwards.
+    const isolationRefusal = this.resolveIsolationRefusal(runtime);
+    if (isolationRefusal !== null) {
+      this.logger.warn(`department execution ${offer.executionId}: ${isolationRefusal}`);
+      await this.reportTerminal(state, {
+        type: 'failed',
+        reason: ISOLATION_UNSUPPORTED_FAILURE_REASON,
+        retrySafe: false,
+      });
+      // Same two-signal shape the `broken_runtime` line below already uses: the
+      // terminal `failed` carries the coded WHY to the cloud, and the offer is
+      // rejected so no capacity is held. `capability` rather than
+      // `broken_runtime` because nothing here is broken — this runner cannot
+      // provide the tier that was asked for.
+      return { accepted: false, reason: 'capability' };
+    }
+
     const started = await this.spawnAndStart(state);
     return started ? { accepted: true } : { accepted: false, reason: 'broken_runtime' };
+  }
+
+  /**
+   * x20 — "this config asks for a sandbox the chosen adapter cannot build",
+   * as a human sentence, or `null` when there is nothing to refuse.
+   *
+   * Reads the engine registry by `adapterId` rather than inspecting the
+   * adapter instance, exactly as `resolveStuckAfterMs` does, so it works for
+   * the data the supervisor actually holds. An adapterId with NO registry row
+   * (a test double, a future third-party adapter) returns `null`: this table
+   * cannot know what such an adapter does, and inventing a refusal for it
+   * would break callers that legitimately register their own. Every adapterId
+   * a real department can be bound to is in the table, so every reachable
+   * configuration is covered — see `isolationForAdapterId`'s doc.
+   *
+   * ## Why this refuses instead of composing (x20 scope note)
+   *
+   * The honest alternative was to make `engine × isolation` a real product —
+   * wrap the `claude-code` module in `ContainerAdapter` (which already takes
+   * an `inner` adapter) and run the session inside the sandbox. That is NOT a
+   * wiring fix, and the four blockers are worth writing down so the composition
+   * can be scoped as its own task rather than rediscovered:
+   *
+   *   1. **The argv wrap order is inverted.** `ContainerAdapter.tryBuild`
+   *      rewrites `RuntimeConfig.command`/`args` into `docker run … <image>
+   *      <command> <args>` and hands THAT to its inner adapter. But
+   *      `ClaudeCodeAdapter.start` does not treat `runtime.args` as a whole
+   *      argv — it calls `buildClaudeArgs()` and appends `runtime.args` as
+   *      `extraArgs` AFTER its own flags. Composed as-is you get
+   *      `docker --output-format stream-json --mcp-config … run --name … `,
+   *      i.e. claude's flags in front of docker's subcommand. Composition
+   *      needs the ENGINE to build its argv first and the container to wrap
+   *      the RESULT — a new `EngineModule` seam (something like
+   *      `buildSpawnPlan(invocation) => {command, args, env}`) that
+   *      `ContainerAdapter` consumes, replacing today's blind rewrite of a
+   *      `RuntimeConfig` it does not understand.
+   *   2. **The MCP env must survive the wrap.** `requireEngineMcpEnv` reads
+   *      `invocation.runtime.env` and refuses before spawning (D24). Whatever
+   *      seam 1 introduces has to hand the inner engine an invocation that
+   *      still carries the URL + token, while keeping the values off the argv
+   *      the way `BuiltContainerInvocation.clientEnv` now does.
+   *   3. **A `claude-code` container department cannot use the default
+   *      network.** This module's whole contract is the mesh MCP connection,
+   *      but no `egressAllowlist` means `--network none` (airtight), and a
+   *      non-empty one requires operator-provisioned egress enforcement that
+   *      `container.ts` documents as NOT implemented. So the combination also
+   *      needs the allowlist to name the mesh host AND that enforcement to be
+   *      real — otherwise it is a session that cannot report, which is the
+   *      exact failure D24 exists to prevent.
+   *   4. **The image and the mounts become part of the contract.** `claude`
+   *      must be installed inside the image, and the department folder
+   *      (`runtime.cwd`, cleared by the wrap in favour of `-w`) must be an
+   *      explicit mount — "explicit mounts only" has no fallback.
+   *
+   * Until that exists, a request for it gets a stated failure. What is not
+   * acceptable — and what shipped before x20 — is running the session on the
+   * host and saying nothing.
+   */
+  private resolveIsolationRefusal(runtime: RuntimeConfig): string | null {
+    // No `container` spec ⇒ no isolation was requested ⇒ nothing to honour.
+    // (This is the same signal `resolveArtifactPath` already treats as
+    // "container-tier", so the two agree on what a sandbox request looks like.)
+    if (runtime.container === undefined) return null;
+    const provided = isolationForAdapterId(runtime.adapterId);
+    if (provided === null || provided === 'container') return null;
+    const engineName = adapterIdToEngine(runtime.adapterId) ?? runtime.adapterId;
+    return (
+      `refusing to start — this department's runtime config carries a 'container' isolation spec (image ` +
+      `'${runtime.container.image}'), but engine '${engineName}' runs its session directly on the host and cannot ` +
+      `build a sandbox: it would silently ignore the spec and run unsandboxed, with no read-only root, no mount ` +
+      `restrictions and full network access. Bind this department with engine 'container' (adapterId 'container') ` +
+      `to get the sandbox, or remove the 'container' spec to state that host execution is intended. ` +
+      `Running unsandboxed when a sandbox was requested is worse than not running at all.`
+    );
   }
 
   // ── d2: lease renewal (called from the connection's heartbeat `onBeat`
