@@ -147,6 +147,83 @@
  * the asymmetry between the two dispatch paths this task exists to remove.
  * Left as-is; a real fix belongs to a task scoped to touch `nodeJobExec()`
  * deliberately, with pipeline-dispatch regression coverage as its own gate.
+ *
+ * ── Saying that the run STARTED (x40) ───────────────────────────────────────
+ * `x36` fixed this defect in `./claude-code.ts`; its own worker found the same
+ * hole here and correctly left it outside that fence, because the two engines
+ * have nothing in common about WHEN a run has provably begun. Before x40 this
+ * module emitted no `{type:'status'}` event at all, ever — `grep -c` returned
+ * zero — and that event is the ONLY thing in the system that moves a task out
+ * of `SUBMITTED`. The cloud's transition table admits `SUBMITTED -> WORKING |
+ * REJECTED | CANCELED`, and its scheduler says so in as many words:
+ * "`department.accept` does NOT move a task to WORKING (only the runner's own
+ * `status` event does)". So a `pipeline`-engine task was admitted `SUBMITTED`
+ * and stayed there for the whole run — rendered to its own sender as `queued`
+ * while `pipeline drive` worked for minutes or hours, which is exactly the
+ * "goes quiet" failure 02 §5 forbids, on the flagship path.
+ *
+ * Two consequences beyond the wrong live state, both of which this fixes:
+ *
+ *  1. A drive that FAILS lands as `REJECTED`, not `FAILED`. The cloud's `x18`
+ *     picks whichever terminal the state machine permits, and from `SUBMITTED`
+ *     that is `REJECTED` — "the department refused the task" — for a pipeline
+ *     that genuinely ran and genuinely failed. From `WORKING` it lands as the
+ *     `FAILED` it actually is.
+ *  2. Every completion goes through the cloud's `x36` repair
+ *     (`ensureWorkingForLiveExecution`), which promotes on the engine's behalf
+ *     and logs at WARN that "the engine never emitted a status event". That is
+ *     deliberate defence in depth whose own doc says "the primary fix is still
+ *     the engine's". This is that fix.
+ *
+ * ── Which instant, and why it is not `claude-code`'s ────────────────────────
+ * x36 announces at the `init` frame, because that is the earliest instant a
+ * Claude Code session has provably begun, and announcing at first-assistant-
+ * activity would be too late by construction. This adapter has no frames at
+ * all: `JobExec` is BUFFERED (`../jobs/types.ts`), a single promise that
+ * settles only when `pipeline drive` EXITS. There is no `init`, no `ready`, no
+ * stdout line — nothing between the spawn and the exit.
+ *
+ * So the instants actually available here are:
+ *
+ *  - **Immediately before `exec.run()`** — this one. It is the last
+ *    synchronous point at which anything is knowable, and it is knowable
+ *    truthfully: every pre-flight decision that can end this execution WITHOUT
+ *    a child process ever existing has already been made — `start()`'s spec
+ *    and lifecycle validation (which throws, so no handle and no sink exist
+ *    yet), `prune()`, and `runOnce`'s own parked-without-an-answer refusal.
+ *    Past that point the ONLY remaining act is the spawn. The announcement
+ *    therefore means "a `pipeline drive` child is being launched for this task
+ *    now", never the weaker "an execution was admitted".
+ *  - After `exec.run()` resolves — too late by construction, and worse than
+ *    x36's rejected alternative rather than merely equal to it. The buffered
+ *    seam produces NOTHING until the process exits, so this instant IS the
+ *    instant of the terminal event: `status` and `completed` would be sunk in
+ *    the same turn, one `seq` apart, and the announcement meant to unblock the
+ *    terminal would be racing it with no gap at all. x36 called that shape
+ *    "usually wins is not a fix"; here it would not even usually win.
+ *  - Inside `start()`, before `runOnce` — earlier, but it announces the wrong
+ *    thing. It would fire for a resume that is about to refuse itself for want
+ *    of an answer, i.e. for an execution that never launches a process.
+ *
+ * Emitted once per `runOnce()`, which is once per `start()` — this adapter is
+ * `per-task` and performs exactly one exec per start, so there is no second
+ * announcement inside a run. A park/answer RESPAWN does announce again, and
+ * that is correct rather than the re-announcement x36 warns against: the cloud
+ * has already taken `INPUT_REQUIRED -> WORKING` itself when the sender's answer
+ * landed (`scheduler.ts#answerTask`), so the second announcement restates the
+ * state the task is already in — and the cloud ignores a `status` it cannot
+ * legally transition to ("same state or illegal … ignore; never mutate"). It
+ * can never yank a still-parked task out of `INPUT_REQUIRED`, because this
+ * adapter only ever reaches this line when an answer is already in hand.
+ *
+ * What this does NOT re-arm: `./manager.ts`'s `b4` stuck detection. `pipeline`
+ * declares `supportsStreaming: 'partial'` (`./engine.ts`), so
+ * `resolveStuckAfterMs` returns `null` and BOTH shapes — the silence watchdog
+ * and `judgeTerminalEvent`'s "ended having reported nothing" — are inapplicable
+ * to this engine and always were. Independently of that, `handleRuntimeEvent`
+ * already excludes `status` from the runtime-signal count (x36), engine-
+ * agnostically, so this event could not have disabled shape 2 even for a
+ * watched engine.
  */
 
 import type { Clock } from '../core/clock';
@@ -187,6 +264,19 @@ import { PIPELINE_ENGINE_CAPABILITIES } from './engine';
 /** 07 §2.1: fixed and declared, never negotiated (there is no handshake that
  *  could raise it — unlike `jsonl-process`'s `ready` frame). */
 export const PIPELINE_DRIVE_CAPABILITIES: RuntimeCapabilities = { midTaskInput: false, artifacts: false };
+
+/**
+ * x40: the human half of the ONE `{type:'status', state:'WORKING'}` event this
+ * module emits per `runOnce()` — see the module doc's "Saying that the run
+ * STARTED" section for the instant it is emitted at and why that instant, and
+ * not the two alternatives, is the only honest one for a buffered exec.
+ *
+ * Names the INVOCATION rather than the session, because that is what this
+ * adapter can actually vouch for: one `pipeline drive` child is being spawned.
+ * A resume announces the same thing again for its own child, which is the
+ * truth about that child.
+ */
+export const DRIVE_STARTED_STATUS_MESSAGE = 'pipeline drive invocation started';
 
 export interface PipelineDriveAdapterOptions {
   exec?: JobExec;
@@ -554,6 +644,20 @@ export class PipelineDriveAdapter implements EngineModule {
     // `buildDriveArgs` already supports — this IS the "one abstraction
     // serves both dispatch paths" proof (P5 DoD).
     const args = buildDriveArgs(target, mode);
+
+    // x40: and the task says it is working — the one event that moves it off
+    // `SUBMITTED`, without which it is rendered to its own sender as `queued`
+    // for the entire run and its eventual failure lands as `REJECTED` rather
+    // than `FAILED`. See {@link DRIVE_STARTED_STATUS_MESSAGE} and the module
+    // doc for why HERE: every branch that can end this execution without ever
+    // launching a child is above this line, and the buffered `JobExec` seam
+    // offers nothing between the spawn below and its exit.
+    //
+    // No `handle.disposed` guard, and none is reachable: everything from
+    // `start()`'s `void this.runOnce(…)` down to the `await` on the next line
+    // runs in ONE synchronous turn, before `start()` has returned the handle to
+    // anybody who could cancel or dispose it.
+    sink({ type: 'status', state: 'WORKING', message: DRIVE_STARTED_STATUS_MESSAGE });
 
     let result: JobExecResult;
     try {
