@@ -300,8 +300,27 @@ export class ExecutionTokenEndpoint implements ExecutionHeaderChannelSource {
 
   /**
    * One helper request. Every refusal is a bare code with no detail: this
-   * endpoint answers an unauthenticated local caller, so its error messages
-   * are the one place it could leak which executions exist.
+   * endpoint answers an unauthenticated local caller, so its RESPONSE is the
+   * one place it could leak which executions exist.
+   *
+   * x38: the LOG is a different surface and now says something. A refused
+   * helper request used to leave no trace anywhere in the runner — the
+   * response is a bare 401, and the helper's own careful diagnosis goes to its
+   * STDERR, which Claude Code swallows (its `headersHelper` runner discards
+   * the child's stderr and reports only its own "did not return a valid
+   * value"). So the one failure that silently costs a long session every
+   * receiver tool it has was, until now, completely unobservable — which is a
+   * large part of why four P4 gate runs could not settle x38. The line names
+   * the execution and WHY, and nothing else: never the presented value, never
+   * the grant's secret, and never a hint that would let an unauthenticated
+   * local caller enumerate executions from the response (the response is
+   * unchanged).
+   *
+   * Deliberately NOT a fix for x38 itself. The live 401-recovery failure was
+   * root-caused to the GATEWAY answering its own RFC 9728 / RFC 8414
+   * discovery endpoints with 401, which stops Claude Code before it ever
+   * re-runs the helper; this endpoint was never reached at all. This is the
+   * instrument that would have said so on the first run.
    */
   private async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -310,12 +329,20 @@ export class ExecutionTokenEndpoint implements ExecutionHeaderChannelSource {
     const executionId = url.searchParams.get(HELPER_EXECUTION_PARAM);
     const presented = readBearer(request.headers.get('authorization'));
     if (executionId === null || executionId.length === 0 || presented === null) {
+      this.logger.warn(
+        'department: a headers-helper request arrived without an execution id or a bearer and was refused — ' +
+          'a session that outlives its execution token cannot re-authorize'
+      );
       return jsonResponse(401, { error: 'unauthorized' });
     }
     const grant = this.grants.get(executionId);
     // Compare against a same-length decoy when there is no grant, so "unknown
     // execution" and "wrong secret" cost the same.
     if (grant === undefined || !secretsMatch(grant.secret, presented)) {
+      this.logger.warn(
+        `department execution ${executionId}: a headers-helper request was refused (${grant === undefined ? 'no live grant for this execution' : 'the presented secret does not match this execution’s grant'}) — ` +
+          'that session can no longer re-authorize and will lose its receiver tools when its execution token expires'
+      );
       return jsonResponse(401, { error: 'unauthorized' });
     }
 
