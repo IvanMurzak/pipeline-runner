@@ -40,11 +40,17 @@ bun src/cli.ts status
 # install/uninstall/status as a native OS service
 bun src/cli.ts service <install|uninstall|status> [--dry-run]
 
+# start / stop / restart an ALREADY-INSTALLED service, without re-registering it
+bun src/cli.ts service <start|stop|restart> [--name <n>] [--home <path>]
+
 # department runtime bindings — what this machine will actually execute
 bun src/cli.ts bind --department <id> --command <cmd> [--arg=<a>]... \
     [--adapter <id>] [--cwd <path>] [--lifecycle <l>] [--spec <json>]
 bun src/cli.ts unbind --department <id>
 bun src/cli.ts bindings [--json]
+
+# what this machine has recorded for one department (local read, never ships)
+bun src/cli.ts journal --department <id> [--json] [--limit <n>]
 ```
 
 `register` flags:
@@ -103,6 +109,31 @@ them cannot attach credentials to an unrelated `register --token`.
 `service install` supports `--dry-run` to print the generated systemd
 unit / launchd plist / `sc.exe create` + `sc.exe failure` commands without
 touching the system.
+
+### `service start` / `stop` / `restart`
+
+`install` **registers** the service (and on a re-run stop+deletes+recreates it,
+which needs an elevated shell on Windows). Use these when the service is
+already installed and you just want it up, down, or bounced:
+
+| Verb | Not installed | Already in that state | Otherwise |
+|---|---|---|---|
+| `start` | **fails**, naming `service install` | success, "already running" | starts it, then **re-queries** and refuses to report success it did not observe |
+| `stop` | success, "nothing to stop" | success, "already stopped" | stops it, keeping it installed |
+| `restart` | **fails**, naming `service install` | — | stop then start, verified the same way |
+
+Notes worth knowing before you rely on the exit code:
+
+- A failure that is genuinely a **privilege** problem says so (Windows exit 5,
+  launchd's "Operation not permitted"); one that is not, does not.
+- Windows `START_PENDING` / `STOP_PENDING` and a launchd agent that is loaded
+  but has not been given a pid yet are reported as **inconclusive**, not as
+  success. Re-check with `service status`.
+- On macOS, `stop` **unloads** the agent (`launchctl unload -w`): `install`
+  writes `KeepAlive`, so a plain `launchctl stop` would be relaunched
+  instantly. The plist is kept, and the agent stays down until `service start`.
+- `stop` does not disable a systemd unit or a Windows service — both come back
+  at the next boot. `service uninstall` is what removes them.
 
 ### Reboot/logout recovery of the installed service
 
@@ -219,6 +250,14 @@ is the control there — the same posture `config.json` has always had.)
 
 `bindings` exits non-zero when the store is refused, so a script can tell.
 
+`--adapter` is checked against this build's own engine registry
+(`src/department/engine.ts`), and an adapter this runner has no module for is
+**refused**, naming the ones it has — `claude-code`, `container`,
+`jsonl-process` (`engine: process`), `pipeline-drive` (`engine: pipeline`).
+Before this, `bind` stored whatever string it was given, so a wrong id produced
+a stored binding, a success line, and a `capability` reject on the first task
+that ever arrived. Callers can therefore stop mirroring this table and just ask.
+
 ### `PIPELINE_RUNNER_DEPARTMENTS` is deprecated
 
 The old environment variable still works, unchanged, **when no binding file
@@ -229,6 +268,55 @@ department without a restart, which is the whole reason the file exists.
 If a binding file exists, the file is the **sole authority** and the variable
 is ignored with a warning naming both. There is no merge: a security-critical
 answer gets one author.
+
+## `journal` — what this machine ran for a department
+
+```sh
+bun src/cli.ts journal --department 018f…-uuid --json
+```
+
+Reads the per-department **admission index** the runner writes under its data
+dir and prints, per execution, who addressed the task (`sender`), which engine
+ran it, when, and where that execution's own journal is. `--json` is a stable
+contract: every documented key is always present, `null` where a value is
+genuinely absent.
+
+It exists because a reader in another package has to resolve the runner's data
+dir **as the invoking user**, which finds nothing when the runner runs as a
+service under a different OS account — the shape `service install` produces on
+Windows, where the SCM defaults to `LocalSystem`. This command additionally
+reads the *installed service definition*: it follows a `--home` the definition
+pins, and when it still finds nothing it names the account that owns the
+journal instead of reporting an unexplained blank.
+
+`--json` keys (all always present):
+
+| Key | Meaning |
+|---|---|
+| `schema` | Version of this output shape. Adding a key is additive and does not move it. |
+| `department_id` | The id that was asked about. |
+| `status` | `ok` \| `absent` \| `unreadable` \| `unlocatable`. |
+| `message` | Why, for a non-`ok` status; `null` when there is nothing to explain. |
+| `path` | The index file read (or that would have been); `null` only when nothing could be located. |
+| `home_source` | Which home answered: `flag` \| `env` \| `service` \| `default` \| `none`. |
+| `executions[]` | `run_id`, `task_id`, `context_id`, `sender`, `engine`, `ts`, `journal_path` — append-ordered, oldest first. |
+| `tasks{}` | `task_id` → `{ sender, engine, run_id, ts }` for its **most recent** execution. |
+| `counts` | `{ executions, skipped, limit, truncated }`. `skipped` counts unparseable lines (a truncated last line after a hard kill). |
+| `supervisor` | The installed definition's `{ backend, installed, home, account, systemAccount, note }`, or `null` when no probe was needed. |
+
+Exit codes: **0** for a journal that was read *and* for one that is simply not
+there (never having served a department here is a normal state); **1** when the
+file exists but cannot be read, or the data dir cannot be resolved at all. The
+JSON is printed in every case, so the reason is always machine-readable.
+
+**Privacy.** This is a local read of a file already on this machine, printed to
+the stdout of a process you started. It reads only the admission index — not
+the per-execution journals — so no message body, question, artifact, or failure
+reason is reachable through it. `sender` appears in the clear here because that
+is what is on disk; the *shipping* path fingerprints it (`src/shipper/privacy.ts`
+maps `sender: 'fingerprint'`), so what leaves the machine at the metadata tier
+is `fp:<sha256-16>` and never the identity. This command writes nothing, ships
+nothing, and stores no field that was not already being stored.
 
 ## Run-stats sync and the `sync_local_stats` flag
 
@@ -280,9 +368,13 @@ src/dispatch/            # task-dispatch pipeline resolution (`pipeline match`)
 src/jobs/                # lease -> accept -> workspace -> `pipeline drive`
 src/shipper/             # event shipper: tails run artifacts, batches, uploads
 src/relay/               # needs-input relay over the WSS channel
-src/service/             # OS service install/uninstall/status (systemd/launchd/Windows)
+src/service/             # OS service install/uninstall/status/start/stop/restart
+                         #   (systemd/launchd/Windows) + inspect.ts: read the INSTALLED
+                         #   definition (pinned home, service account)
 src/department/bindings.ts # file-backed, reloadable department runtime bindings
-src/cli.ts               # thin CLI: register / start / status / service / bind
+src/department/engine.ts   # the engine registry — what `bind --adapter` is checked against
+src/department/journal-read.ts # `journal`: the local department journal, read back
+src/cli.ts               # thin CLI: register / start / status / service / bind / journal
 ```
 
 ## Wire protocol

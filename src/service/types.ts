@@ -57,10 +57,21 @@ export interface RanCommand {
   args: string[];
 }
 
-/** Coarse service state parsed from a backend's status query. */
+/**
+ * Coarse service state parsed from a backend's status query.
+ *
+ * DELIBERATELY UNCHANGED by x24, which added the `start`/`stop`/`restart`
+ * verbs: a `status` message's shape is a cross-package contract the `pipeline`
+ * CLI parses (`department-serve.ts`'s `parseRunnerServiceState`, matching
+ * `/:\s*(running|stopped|unknown)\s*\(/`), so a fifth word here would break a
+ * shipped consumer to describe a transient. The SCM's `START_PENDING` /
+ * `STOP_PENDING` therefore stay `'unknown'` — which is what they already
+ * were — and the new verbs say what they saw in their own message lines
+ * instead of inventing a state for it.
+ */
 export type ServiceState = 'running' | 'stopped' | 'not-installed' | 'unknown';
 
-export type ServiceAction = 'install' | 'uninstall' | 'status';
+export type ServiceAction = 'install' | 'uninstall' | 'status' | 'start' | 'stop' | 'restart';
 
 /** Structured outcome of a service action. */
 export interface ServiceResult {
@@ -105,6 +116,37 @@ export interface ServiceBackend {
   install(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
   uninstall(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
   status(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
+  /**
+   * x24 — the three verbs that were missing, and the rules all three backends
+   * keep. Before this, the ONLY path from `stopped` back to `running` was
+   * `service install`, which stop+deletes+recreates the service and needs
+   * elevation on Windows; `x13` had meanwhile taught `pipeline department
+   * serve` to correctly REPORT a stopped supervisor, so the product could name
+   * the problem and had no clean command to name as the fix.
+   *
+   * The awkward states, and what each verb owes them:
+   *
+   *  - **Not installed.** `start`/`restart` THROW `ServiceError` — the desired
+   *    end state (running) was not reached, so exiting 0 would be a success
+   *    line with nothing behind it — and the message names `service install`.
+   *    `stop` returns SUCCESS with `state: 'not-installed'`: its desired end
+   *    state (not running) is already true, and `cli.ts`'s `unbind` sets the
+   *    precedent ("was not bound — nothing to do").
+   *  - **Already in the target state.** Success, `state` set, and the message
+   *    says "already", never "started"/"stopped". Idempotent, and honest about
+   *    having done nothing.
+   *  - **Insufficient privilege.** Detected from the backend's own exit
+   *    code/stderr and re-thrown with the remedy named (an elevated shell on
+   *    Windows; the logind/lingering hint on systemd).
+   *  - **Command succeeded, service did not.** Every verb RE-QUERIES the state
+   *    afterwards and throws when the observation contradicts the exit code.
+   *    Where the observation is legitimately inconclusive — the SCM's
+   *    `START_PENDING`, launchd not having reported a pid yet — it says that
+   *    in words and claims nothing more.
+   */
+  start(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
+  stop(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
+  restart(plan: ServicePlan, ctx: ServiceContext): ServiceResult;
 }
 
 // ── Real seam implementations (node/bun stdlib only) ─────────────────────────
