@@ -183,7 +183,6 @@ export interface FakeAdapterCall {
  *  format (the same separation the interface itself draws: an adapter's wire
  *  format is its own business, not the supervisor's). */
 export class FakeAdapter implements AgentRuntimeAdapter {
-  readonly id = 'fake';
   calls: FakeAdapterCall[] = [];
   /** Every handle `start()` has minted, in order — index-addressable, since
    *  `emit()` needs the EXACT object `start()` returned (the sink map below
@@ -191,6 +190,13 @@ export class FakeAdapter implements AgentRuntimeAdapter {
    *  the handle an adapter gave it, never reconstructs one). */
   handles: RuntimeHandle[] = [];
   private sinks = new Map<RuntimeHandle, (event: RuntimeEvent) => void>();
+
+  /** Defaults to `'fake'` — an id deliberately absent from `./engine.ts`'s
+   *  registry, so a plain `new FakeAdapter()` declares no engine capabilities
+   *  and the supervisor holds it to none. Pass a REAL adapter id
+   *  (`'claude-code'`, `'pipeline-drive'`) to exercise behaviour that keys off
+   *  a registered engine's declarations — b4's stuck detection is the first. */
+  constructor(readonly id: string = 'fake') {}
 
   async probe(): Promise<{ ok: true; capabilities: { midTaskInput: boolean; artifacts: boolean } }> {
     this.calls.push({ kind: 'probe' });

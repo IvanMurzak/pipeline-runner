@@ -90,6 +90,16 @@ export interface RuntimeConfig {
    *  env-driven placeholder, `./config.ts`) returns as the base. Default:
    *  `./manager.ts`'s `DEFAULT_PARK_EXPIRY_S` (7 days). */
   parkExpirySeconds?: number;
+  /** How long an execution of this department may go without ANY signal from
+   *  its runtime before the supervisor reports it `stuck` (simplified-
+   *  onboarding b4, D25; `./manager.ts`'s stuck detection). `0` disables the
+   *  watchdog for this department; absent means the default
+   *  (`./manager.ts`'s `DEFAULT_STUCK_AFTER_S`, 30 minutes), itself overridden
+   *  by a `department.config_update`'s `limits.taskTimeout`. Only ever applied
+   *  to an engine that DECLARES it reports while it works
+   *  (`./engine.ts`'s `supportsStreaming: 'yes'`) — see
+   *  `DepartmentManager.resolveStuckAfterMs`. */
+  stuckAfterSeconds?: number;
   lifecycle?: RuntimeLifecycle;
   /** `container` adapter only (task d8, see the section above) — read-only-
    *  root/explicit-mounts/egress-allowlist spec. Every other adapter ignores

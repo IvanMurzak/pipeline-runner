@@ -113,6 +113,37 @@
  * arriving, but no runner will actually receive one until the cloud side is
  * closed (tracked as a `c9`/mesh follow-up, not a defect in this file).
  *
+ * ── Stuck detection (b4, D25 / 06 §5) ───────────────────────────────────────
+ * "A task never goes quiet" ([05](05-department-project.md) §7.5) shipped with
+ * a hole: crash (`reportTerminal`), wall-clock deadline, park expiry and the
+ * cloud's lease sweeper all report, but a session that simply STOPS reporting
+ * did nothing at all until its deadline — possibly hours. `armIdleTimer` is
+ * NOT that mechanism and is left alone: it fires only for `per-context` and
+ * merely evicts the handle to reclaim resources; it reports nothing and fails
+ * nothing, which is a different, real job.
+ *
+ * Two failure shapes are covered, because the engine module (b3) observed the
+ * second one for real and it is not a hang:
+ *
+ *   1. **The session goes quiet.** `armStuckTimer` watches the time since the
+ *      last signal from the runtime (any `RuntimeEvent` — 06 §5's "tool
+ *      activity, stream liveness, or `task.update_progress`", which for
+ *      `claude-code` is one `progress` per assistant turn and per tool call).
+ *      Past the threshold the execution terminates through the SAME
+ *      finalize-now path cancellation and the deadline use, with the coded
+ *      terminal reason `stuck` ({@link STUCK_FAILURE_REASON}).
+ *   2. **The session ends having reported nothing.** 06 §4 predicted a missing
+ *      tool allow-list would make the first `task.update_progress` "block
+ *      forever"; b3 found the real behaviour is the opposite — the call is
+ *      DENIED and the session runs to its own end, silently. A watchdog alone
+ *      never fires on that, so a terminal `completed` from an execution that
+ *      emitted NOT ONE signal in its whole life is reported `stuck` instead of
+ *      a hollow success (`judgeTerminalEvent`).
+ *
+ * Both are gated on the engine DECLARING that it reports while it works
+ * (`./engine.ts`'s `supportsStreaming: 'yes'`) — see `resolveStuckAfterMs`.
+ * Silence only breaks a promise an engine actually made.
+ *
  * ── Lifecycle policy, concretely ────────────────────────────────────────────
  *   - `per-task`: one `adapter.start()` per execution; disposed at terminal.
  *   - `per-context`: same as `per-task` at the wire-contract level (07 §3:
@@ -170,8 +201,14 @@ import type {
 } from './adapter';
 import type { ArtifactFileSystem } from './artifact-upload';
 import { uploadDepartmentArtifact } from './artifact-upload';
-import { ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV } from './engine';
-import { buildDepartmentJournalEnvelope } from './events';
+import { adapterIdToEngine, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, lookupEngine } from './engine';
+import {
+  buildDepartmentIndexEntry,
+  buildDepartmentJournalEnvelope,
+  departmentIndexPath,
+  departmentJournalPath,
+  senderFromMessages,
+} from './events';
 import type { ExecutionTokenSource } from './execution-token-manager';
 
 // ── d6: pointing model-driven runtimes at the cloud MCP server ──────────────
@@ -295,6 +332,59 @@ const DEFAULT_PARK_EXPIRY_S = 7 * 24 * 60 * 60;
  *  when every caller remembers to clean up. */
 const MAX_TRACKED_TASK_ARTIFACT_BUDGETS = 2000;
 
+// ── b4: stuck detection (D25, 06 §5) ────────────────────────────────────────
+
+/**
+ * The CODED terminal reason a stuck task carries, distinct from every other
+ * `failed` (which mean the agent broke, declined, or ran past its deadline).
+ *
+ * It rides the EXISTING `failed` event rather than being a new event type, and
+ * that is p1's deliberate protocol decision, not a shortcut:
+ * `DeptRuntimeEventSchema` is a `z.discriminatedUnion("type", …)`, so an
+ * unknown discriminant HARD-FAILS the parse and would crash every consumer
+ * older than this change. `reason` was already `z.string().min(1)`, so the
+ * value is additive by convention and needs no schema change at all — an old
+ * consumer reads an ordinary `failed` with a reason it does not specially
+ * recognize.
+ *
+ * Deliberately the BARE word: p1 publishes it as the one coded value in
+ * `DEPT_FAILURE_REASONS`, which a consumer checks by equality. The human
+ * detail (how long the silence was, which shape was detected) goes to the log
+ * and the journal, never into the wire value. NOT imported from
+ * `@baizor/pipeline-protocol` because that dependency is exact-pinned at
+ * 0.4.0, which predates p1's constant — the STRING is the contract, and it is
+ * identical either way.
+ */
+export const STUCK_FAILURE_REASON = 'stuck';
+
+/** No signal from the runtime for this long ⇒ stuck, when the department
+ *  states no `limits.taskTimeout` and no explicit `stuckAfterSeconds`.
+ *  Matches 05 §6's own rendering of the case ("no progress for 30m — flagged
+ *  stuck, sender notified"). */
+export const DEFAULT_STUCK_AFTER_S = 30 * 60;
+/** Clamp on a threshold DERIVED from `limits.taskTimeout` (never on an
+ *  explicit `stuckAfterSeconds`, which an operator meant literally). The floor
+ *  exists because a single model turn legitimately runs for minutes with no
+ *  frame in between; the ceiling because a department with an all-day
+ *  `taskTimeout` still deserves to hear about silence the same day. */
+export const MIN_DERIVED_STUCK_AFTER_S = 5 * 60;
+export const MAX_DERIVED_STUCK_AFTER_S = 60 * 60;
+
+/**
+ * `limits.taskTimeout` → a progress threshold: a quarter of the time the whole
+ * task is allowed, clamped. A department that must finish in 2h (05 §2's own
+ * reference manifest) gets 30m, which is exactly the number 05 §6 renders —
+ * the design's example and this default are the same story told twice.
+ *
+ * Note what this does NOT do: `taskTimeout` still is not a deadline here. The
+ * wall-clock deadline arrives pre-computed on the offer (`deadline_at`,
+ * `armDeadlineTimer`) and is untouched; this reads the same limit for the one
+ * thing the runner CAN act on locally.
+ */
+export function deriveStuckAfterSeconds(taskTimeoutSeconds: number): number {
+  return Math.min(MAX_DERIVED_STUCK_AFTER_S, Math.max(MIN_DERIVED_STUCK_AFTER_S, Math.round(taskTimeoutSeconds / 4)));
+}
+
 interface ExecutionState {
   executionId: string;
   taskId: string;
@@ -317,6 +407,23 @@ interface ExecutionState {
   respawnAttempted: boolean;
   lastActivityAt: number;
   journalPath: string;
+  // ── b4: journal identity (05 §6) ────────────────────────────────────────
+  /** Who addressed the task (`senderFromMessages`), or null — carried on every
+   *  journal envelope and on the per-department index line. */
+  sender: string | null;
+  /** The USER-FACING engine name for `runtime.adapterId` (06 §7), or null for
+   *  an adapter outside `./engine.ts`'s registry. */
+  engine: string | null;
+  // ── b4: stuck detection (D25) ───────────────────────────────────────────
+  /** Silence tolerated before this execution is reported `stuck`, or null when
+   *  it is not watched at all — see `resolveStuckAfterMs`. Resolved once, at
+   *  admission, from the runtime config in force then. */
+  stuckAfterMs: number | null;
+  stuckTimer: unknown;
+  /** How many signals the RUNTIME has emitted for this execution (every
+   *  non-terminal `RuntimeEvent`, across a `per-context` respawn). Zero at a
+   *  terminal is stuck-shape 2: the session ended having reported nothing. */
+  runtimeSignals: number;
   /** Next `department.event.seq` to send — seeded from the offer's
    *  `event_seq_base` (08 §4 attempt-fencing), incremented per shipped event. */
   nextSeq: number;
@@ -453,8 +560,11 @@ export class DepartmentManager {
     const adapter = this.adapters.get(runtime.adapterId);
     if (adapter === undefined) return { accepted: false, reason: 'capability' };
 
-    const journalPath = join(this.journalRoot, sanitizeForPath(offer.executionId), 'events.jsonl');
+    const journalPath = departmentJournalPath(this.journalRoot, offer.executionId);
     this.journal.ensureDir(dirname(journalPath));
+    const sender = senderFromMessages(offer.messages);
+    const engine = adapterIdToEngine(runtime.adapterId);
+    this.appendDepartmentIndexEntry(offer, journalPath, sender, engine);
 
     const state: ExecutionState = {
       executionId: offer.executionId,
@@ -471,6 +581,11 @@ export class DepartmentManager {
       respawnAttempted: false,
       lastActivityAt: this.clock.now(),
       journalPath,
+      sender,
+      engine,
+      stuckAfterMs: this.resolveStuckAfterMs(runtime),
+      stuckTimer: null,
+      runtimeSignals: 0,
       nextSeq: offer.eventSeqBase ?? 0,
       idleTimer: null,
       leaseToken: offer.leaseToken ?? null,
@@ -549,6 +664,7 @@ export class DepartmentManager {
     this.clearIdleTimer(state);
     this.clearDeadlineTimer(state);
     this.clearParkTimer(state);
+    this.clearStuckTimer(state);
     // d6 (13 §12): "revoking the lease revokes the token" — drop it from the
     // in-memory cache too, so nothing (a stray relay drain, a respawn race)
     // could ever hand it out again for a lease that is already gone.
@@ -572,18 +688,21 @@ export class DepartmentManager {
 
   // ── e2: department.config_update (cloud → runner) ───────────────────────
   // Cloud sends this on install approval and on reconnect
-  // (`08-protocol-delta.md` §4/§5, `06-department-registry.md`). Only
-  // `limits.parkExpiry` is wired to a runner concept today —
-  // `RuntimeConfig.parkExpirySeconds` (see `./adapter.ts`'s doc for that
-  // field). `limits.taskTimeout` is NOT wired here: wall-clock deadlines
-  // already flow through a different mechanism, the offer's pre-computed
-  // `deadline_at` (`armDeadlineTimer`, above) — a manifest-level
-  // `taskTimeout` would need cloud-side plumbing into that computation, not
-  // a runner-side consumer. `limits.maxArtifactBytes`/`retrySafe` have no
-  // runner-side consumer at all yet (artifact upload is P4 scope, `retrySafe`
-  // is emitted BY the runtime today, `./adapter.ts`'s `RuntimeEvent`, not
-  // configured) — left unwired, same "honest placeholder" discipline as
-  // `cli.ts:69`.
+  // (`08-protocol-delta.md` §4/§5, `06-department-registry.md`). Two limits
+  // are wired to a runner concept:
+  //   - `limits.parkExpiry`  → `RuntimeConfig.parkExpirySeconds` (e2).
+  //   - `limits.taskTimeout` → `RuntimeConfig.stuckAfterSeconds` (b4), via
+  //     `deriveStuckAfterSeconds`. This is NOT a deadline: wall-clock
+  //     deadlines flow through the offer's pre-computed `deadline_at`
+  //     (`armDeadlineTimer`, above) and are untouched — a manifest-level
+  //     `taskTimeout` would need cloud-side plumbing into THAT computation.
+  //     What the runner can do locally with it is decide how long silence
+  //     from this department's sessions is tolerable, which is exactly D25's
+  //     "per-department threshold defaulting from `limits`".
+  // `limits.maxArtifactBytes`/`retrySafe` have no runner-side consumer at all
+  // yet (`retrySafe` is emitted BY the runtime today, `./adapter.ts`'s
+  // `RuntimeEvent`, not configured) — left unwired, same "honest placeholder"
+  // discipline as `cli.ts:69`.
 
   /** Merge any live `department.config_update` override on top of the
    *  static/base `resolveRuntimeConfig` result. Used at admission
@@ -616,18 +735,38 @@ export class DepartmentManager {
       return;
     }
 
-    if (limits.parkExpiry === undefined) return; // nothing this manager acts on in this frame
+    const override: Partial<RuntimeConfig> = {};
 
-    const parkExpirySeconds = parseDurationSeconds(limits.parkExpiry);
-    if (parkExpirySeconds === null) {
-      this.logger.warn(
-        `department.config_update for '${departmentId}': limits.parkExpiry '${limits.parkExpiry}' is not a valid duration — ignored (other fields, if any, still apply)`,
-      );
-      return;
+    if (limits.parkExpiry !== undefined) {
+      const parkExpirySeconds = parseDurationSeconds(limits.parkExpiry);
+      if (parkExpirySeconds === null) {
+        this.logger.warn(
+          `department.config_update for '${departmentId}': limits.parkExpiry '${limits.parkExpiry}' is not a valid duration — ignored (other fields, if any, still apply)`,
+        );
+      } else {
+        override.parkExpirySeconds = parkExpirySeconds;
+      }
     }
 
+    // b4: the department's own answer to "how long may a session of mine be
+    // silent?", derived from the one limit that already states how long its
+    // work may take. See `deriveStuckAfterSeconds` for why a quarter, and the
+    // section comment above for why this is not a deadline.
+    if (limits.taskTimeout !== undefined) {
+      const taskTimeoutSeconds = parseDurationSeconds(limits.taskTimeout);
+      if (taskTimeoutSeconds === null || taskTimeoutSeconds <= 0) {
+        this.logger.warn(
+          `department.config_update for '${departmentId}': limits.taskTimeout '${limits.taskTimeout}' is not a valid duration — ignored (other fields, if any, still apply)`,
+        );
+      } else {
+        override.stuckAfterSeconds = deriveStuckAfterSeconds(taskTimeoutSeconds);
+      }
+    }
+
+    if (Object.keys(override).length === 0) return; // nothing this manager acts on in this frame
+
     const existing = this.configOverrides.get(departmentId) ?? {};
-    this.configOverrides.set(departmentId, { ...existing, parkExpirySeconds });
+    this.configOverrides.set(departmentId, { ...existing, ...override });
 
     // Also apply to every live (non-terminal) execution of this department
     // NOW — both so a FUTURE park on an already-running execution uses the
@@ -636,10 +775,24 @@ export class DepartmentManager {
     // than expiring on the stale one.
     for (const state of this.executions.values()) {
       if (state.departmentId !== departmentId || state.terminal) continue;
-      state.runtime = { ...state.runtime, parkExpirySeconds };
-      if (state.parkTimer !== null) {
+      state.runtime = { ...state.runtime, ...override };
+      if (override.parkExpirySeconds !== undefined && state.parkTimer !== null) {
         this.armParkTimer(state);
-        this.logger.info(`department execution ${state.executionId}: parked wait re-armed to ${parkExpirySeconds}s (config_update)`);
+        this.logger.info(
+          `department execution ${state.executionId}: parked wait re-armed to ${override.parkExpirySeconds}s (config_update)`,
+        );
+      }
+      if (override.stuckAfterSeconds !== undefined) {
+        const stuckAfterMs = this.resolveStuckAfterMs(state.runtime);
+        if (stuckAfterMs !== state.stuckAfterMs) {
+          state.stuckAfterMs = stuckAfterMs;
+          // Re-arm only when the execution is not parked — a parked wait has
+          // the watchdog suspended, and `deliverMessage` restores it.
+          if (state.parkTimer === null) this.armStuckTimer(state);
+          this.logger.info(
+            `department execution ${state.executionId}: stuck threshold re-armed to ${override.stuckAfterSeconds}s (config_update)`,
+          );
+        }
       }
     }
   }
@@ -687,6 +840,9 @@ export class DepartmentManager {
     // An answer (or anything else fed in) ends the current parked wait — the
     // park-expiry timer, if one is armed, no longer applies (d2).
     this.clearParkTimer(state);
+    // b4: work is expected to resume from here, so the silence window restarts
+    // (and, if the execution was parked, the suspended watchdog comes back).
+    this.armStuckTimer(state);
 
     if (state.handle !== null && state.handle.capabilities.midTaskInput) {
       await state.adapter.send(state.handle, { kind: 'message', message });
@@ -773,6 +929,9 @@ export class DepartmentManager {
       state.handle = handle;
       state.lastActivityAt = this.clock.now();
       this.armIdleTimer(state);
+      // b4: the silence window starts at the spawn, not at the first signal —
+      // a session that never says anything at all is the commonest hang.
+      this.armStuckTimer(state);
       return true;
     } catch (err) {
       this.logger.warn(`department execution ${state.executionId}: start() failed: ${describeError(err)}`);
@@ -808,6 +967,13 @@ export class DepartmentManager {
   private handleRuntimeEvent(state: ExecutionState, event: RuntimeEvent): void {
     if (state.terminal) return; // a stale handle's straggling line after finalize
     state.lastActivityAt = this.clock.now();
+    // b4: the stuck watchdog's input (06 §5's progress signal — "tool
+    // activity, stream liveness, or `task.update_progress`"). Counted rather
+    // than re-armed per event: a busy `claude-code` session emits hundreds of
+    // these, and `checkStuck` re-reads `lastActivityAt` when it wakes, so one
+    // timer per window is enough. Terminals are excluded — ending is not a
+    // sign of life, and shape 2 asks whether anything came BEFORE the end.
+    if (event.type !== 'completed' && event.type !== 'failed') state.runtimeSignals += 1;
 
     // Crash recovery (per-context only, bounded to one silent respawn): the
     // process is gone but the task is not actually done — continue instead
@@ -855,11 +1021,49 @@ export class DepartmentManager {
     }
 
     if (event.type === 'completed' || event.type === 'failed') {
-      void this.reportTerminal(state, event);
+      void this.reportTerminal(state, this.judgeTerminalEvent(state, event));
       return;
     }
     this.journalRuntimeEvent(state, event);
     this.shipDepartmentEvent(state, event);
+  }
+
+  /**
+   * b4, stuck shape 2 — "the session ended having reported nothing" (D25).
+   *
+   * 06 §4 predicted that a headless session missing its tool allow-list would
+   * hang on the first `task.update_progress` ("would block forever"). b3
+   * observed the opposite and it is worse: the call is DENIED, and the session
+   * runs to its own natural end having reported precisely nothing. Silent, not
+   * hung — so the watchdog below never fires on it, and the sender receives a
+   * `completed` that means nothing happened.
+   *
+   * A `completed` from a watched engine (one that DECLARED it reports while it
+   * works) that emitted NOT ONE signal in its entire life is therefore reported
+   * `stuck` instead. The conditions are deliberately narrow:
+   *
+   * - Only `completed` is ever rewritten. A `failed` already carries the
+   *   runtime's own stated reason, and replacing it would destroy the more
+   *   specific information.
+   * - Only a WATCHED engine (`stuckAfterMs !== null`). `pipeline` declares
+   *   `supportsStreaming: 'partial'` — nothing at all is reported while a
+   *   buffered exec runs — so a silent `completed` from it is normal and is
+   *   left exactly as it is, as it is for any adapter outside the registry.
+   * - Only ZERO signals, not "few". One `progress`, one `message`, one
+   *   `input_required` — any evidence the session was reporting — and the
+   *   `completed` stands untouched.
+   */
+  private judgeTerminalEvent(
+    state: ExecutionState,
+    event: Extract<RuntimeEvent, { type: 'completed' } | { type: 'failed' }>,
+  ): Extract<RuntimeEvent, { type: 'completed' } | { type: 'failed' }> {
+    if (event.type !== 'completed' || state.stuckAfterMs === null || state.runtimeSignals > 0) return event;
+    this.logger.warn(
+      `department execution ${state.executionId}: the ${state.engine ?? state.runtime.adapterId} session ended without ` +
+        'reporting anything at all — no progress, no message, no question — so its completion vouches for no work; ' +
+        `reporting '${STUCK_FAILURE_REASON}' rather than a hollow success`,
+    );
+    return { type: 'failed', reason: STUCK_FAILURE_REASON, retrySafe: false };
   }
 
   private async reportTerminal(state: ExecutionState, event: Extract<RuntimeEvent, { type: 'completed' } | { type: 'failed' }>): Promise<void> {
@@ -868,6 +1072,7 @@ export class DepartmentManager {
     this.clearIdleTimer(state);
     this.clearDeadlineTimer(state);
     this.clearParkTimer(state);
+    this.clearStuckTimer(state);
     // d6: the execution is done — its token (if any was ever requested) is
     // useless from here on; drop the cache entry (see handleLeaseRevoked's
     // matching note).
@@ -895,10 +1100,50 @@ export class DepartmentManager {
       executionId: state.executionId,
       taskId: state.taskId,
       contextId: state.contextId,
+      departmentId: state.departmentId,
+      sender: state.sender,
+      engine: state.engine,
       event,
       nowIso: new Date(this.clock.now()).toISOString(),
     });
     this.journal.appendLine(state.journalPath, JSON.stringify(envelope));
+  }
+
+  /**
+   * b4 (05 §6): one line per admitted execution in the department's OWN index
+   * file, so a reader resolves "what has this department run?" by computing a
+   * single path (`departmentIndexPath`) instead of listing the journal root
+   * and opening every execution's journal to find out whose it was.
+   *
+   * Written once, at admission, and never rewritten — the outcome is not
+   * duplicated here; the entry carries `journal_path`, which is where the
+   * outcome already is. Best-effort in the same sense the journal itself is: a
+   * failed index append must never take an admission down with it, since the
+   * execution's own journal is the source of truth either way.
+   */
+  private appendDepartmentIndexEntry(
+    offer: DepartmentOfferInput,
+    journalPath: string,
+    sender: string | null,
+    engine: string | null,
+  ): void {
+    const indexPath = departmentIndexPath(this.journalRoot, offer.departmentId);
+    const entry = buildDepartmentIndexEntry({
+      executionId: offer.executionId,
+      taskId: offer.taskId,
+      contextId: offer.contextId,
+      departmentId: offer.departmentId,
+      sender,
+      engine,
+      journalPath,
+      nowIso: new Date(this.clock.now()).toISOString(),
+    });
+    try {
+      this.journal.ensureDir(dirname(indexPath));
+      this.journal.appendLine(indexPath, JSON.stringify(entry));
+    } catch (err) {
+      this.logger.warn(`department execution ${offer.executionId}: per-department index append failed: ${describeError(err)}`);
+    }
   }
 
   /**
@@ -1092,6 +1337,81 @@ export class DepartmentManager {
       this.logger.warn(`department execution ${state.executionId}: dispose() on idle-evict failed: ${describeError(err)}`);
     });
     // No re-arm: a future deliverMessage()/respawn re-establishes activity.
+    // b4: the STUCK watchdog is deliberately left running here. Eviction
+    // reclaims a process; it does not decide the task is fine. An execution
+    // whose handle was evicted and that nobody ever nudges again is exactly
+    // the "goes quiet" case, and it is still reported — the two mechanisms
+    // observe the same silence and do different things about it.
+  }
+
+  // ── b4: stuck detection (D25, 06 §5 — see the module doc) ───────────────
+
+  /**
+   * How long this execution may be silent, or `null` for "not watched".
+   *
+   * The gate is the engine's OWN declaration (`./engine.ts`, b2): only an
+   * engine that says `supportsStreaming: 'yes'` — "I report as I work, not
+   * only at the end" — can be held to it. `pipeline` declares `'partial'`
+   * (nothing is reported WHILE a buffered exec runs; events appear only at
+   * invocation boundaries), so timing it out on silence would fail every
+   * pipeline department that thinks for longer than the threshold. An adapter
+   * with no registry row at all — a test double, a future third-party module —
+   * declared nothing and is likewise not watched: the supervisor never invents
+   * a promise on a module's behalf.
+   *
+   * Given a watched engine: an explicit `stuckAfterSeconds` wins (`0` disables
+   * it for that department), otherwise the default. `handleConfigUpdateFrame`
+   * is what turns a department's `limits.taskTimeout` into that field.
+   */
+  private resolveStuckAfterMs(runtime: RuntimeConfig): number | null {
+    const engineName = adapterIdToEngine(runtime.adapterId);
+    const declaration = engineName === null ? null : lookupEngine(engineName);
+    if (declaration?.capabilities.supportsStreaming !== 'yes') return null;
+    const seconds = runtime.stuckAfterSeconds ?? DEFAULT_STUCK_AFTER_S;
+    return seconds > 0 ? seconds * 1000 : null;
+  }
+
+  private armStuckTimer(state: ExecutionState): void {
+    this.clearStuckTimer(state);
+    if (state.terminal || state.stuckAfterMs === null) return;
+    state.stuckTimer = this.clock.setTimeout(() => this.checkStuck(state), state.stuckAfterMs);
+  }
+
+  private clearStuckTimer(state: ExecutionState): void {
+    if (state.stuckTimer !== null) {
+      this.clock.clearTimeout(state.stuckTimer);
+      state.stuckTimer = null;
+    }
+  }
+
+  /**
+   * One window elapsed — but the window is measured from the LAST signal, not
+   * from when the timer was armed, so a session that has been reporting all
+   * along simply re-arms for the remainder. That is what keeps a slow-but-live
+   * task off this path without re-arming a timer on every one of the hundreds
+   * of frames a busy session emits.
+   */
+  private checkStuck(state: ExecutionState): void {
+    state.stuckTimer = null;
+    if (state.terminal || state.stuckAfterMs === null) return;
+    // Parked: the sender has been asked a question and the wait is legitimate
+    // and bounded by park expiry (d2), which owns this window entirely.
+    // `deliverMessage` re-arms this timer when the answer lands.
+    if (state.parkTimer !== null) return;
+    const quietFor = this.clock.now() - state.lastActivityAt;
+    if (quietFor < state.stuckAfterMs) {
+      state.stuckTimer = this.clock.setTimeout(() => this.checkStuck(state), state.stuckAfterMs - quietFor);
+      return;
+    }
+    this.logger.warn(
+      `department execution ${state.executionId}: no progress for ${quietFor}ms (threshold ${state.stuckAfterMs}ms) — ` +
+        `reporting '${STUCK_FAILURE_REASON}' and notifying the sender`,
+    );
+    // `retrySafe: false`, like every other supervisor-initiated termination
+    // (cancel, deadline, park expiry): a session that stopped reporting may
+    // have got arbitrarily far through its side effects first, and the
+    // supervisor cannot know how far.
+    void this.terminateExecution(state, STUCK_FAILURE_REASON, false);
   }
 
   // ── d2: wall-clock deadline (07 §7) ─────────────────────────────────────
@@ -1127,6 +1447,10 @@ export class DepartmentManager {
 
   private armParkTimer(state: ExecutionState): void {
     this.clearParkTimer(state);
+    // b4: a parked question is not silence — the runtime asked, and the wait
+    // is the SENDER's now, bounded by park expiry below. Suspend the stuck
+    // watchdog for the duration; `deliverMessage` re-arms it on the answer.
+    this.clearStuckTimer(state);
     const seconds = state.runtime.parkExpirySeconds ?? DEFAULT_PARK_EXPIRY_S;
     state.parkTimer = this.clock.setTimeout(() => this.onParkExpired(state), seconds * 1000);
   }
@@ -1147,12 +1471,6 @@ export class DepartmentManager {
 
 function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/** Execution ids are caller-minted (offer frame) — sanitize before using one
- *  as a path segment, same discipline as `../jobs/workspace.ts`'s job ids. */
-function sanitizeForPath(id: string): string {
-  return id.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
 // ── Wire-frame parsing / building — real protocol 0.4.0 schemas (e1 repin) ──
@@ -1192,7 +1510,14 @@ function toWirePart(part: Part): WireDeptPart {
 /** Validate + translate an incoming wire `DeptMessage` (real
  *  `DeptMessageSchema`, snake_case) into the runner-local camelCase
  *  `DeptMessage` (`./adapter.ts`). Returns null on a schema-invalid frame —
- *  the caller logs and drops, same tolerance as before the repin. */
+ *  the caller logs and drops, same tolerance as before the repin.
+ *
+ *  b4: MESSAGE-level `metadata` is carried through. It was dropped here
+ *  before, silently, which made the sender identity unreachable for everything
+ *  downstream that reads it — `./events.ts`'s `senderFromMessages` (the
+ *  journal's `sender` column, 05 §6) and `./claude-code.ts`'s
+ *  `buildSessionContext` (which tells a session who addressed it) both read
+ *  `metadata.sender` and, for any wire-delivered offer, always found nothing. */
 function narrowWireMessage(raw: unknown): DeptMessage | null {
   const parsed = WireDeptMessageSchema.safeParse(raw);
   if (!parsed.success) return null;
@@ -1203,6 +1528,7 @@ function narrowWireMessage(raw: unknown): DeptMessage | null {
     parts: m.parts.map(fromWirePart),
     ...(m.context_id !== undefined ? { contextId: m.context_id } : {}),
     ...(m.task_id !== undefined ? { taskId: m.task_id } : {}),
+    ...(m.metadata !== undefined ? { metadata: m.metadata } : {}),
     createdAt: m.created_at,
   };
 }

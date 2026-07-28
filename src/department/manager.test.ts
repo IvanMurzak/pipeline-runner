@@ -14,6 +14,7 @@ import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import { Dispatcher } from '../core/dispatcher';
 import type { WireFrame } from '../core/wire';
 import { FakeAdapter, FakeNoMidTaskInputAdapter, makeMessage } from './_test-helpers';
+import { departmentIndexPath, parseDepartmentIndexLine } from './events';
 import type { DepartmentOfferInput, JournalWriter } from './manager';
 import { DepartmentManager } from './manager';
 import type { RuntimeConfig } from './adapter';
@@ -622,6 +623,109 @@ describe('DepartmentManager — department.config_update (e2, parkExpiry only)',
     clock.advance(58_000);
     await tick();
     expect(adapter.calls.filter((c) => c.kind === 'cancel')).toHaveLength(1);
+  });
+});
+
+describe('DepartmentManager — journal identity + per-department index (b4, 05 §6)', () => {
+  test('every envelope carries the department, the sender and the engine name', async () => {
+    const { manager, adapter, runtimes, journal } = makeManager({ adapters: [new FakeAdapter('claude-code')] });
+    runtimes.set('unity-department', { adapterId: 'claude-code', command: 'claude' });
+    await manager.admitTask(
+      makeOffer({ messages: [makeMessage({ metadata: { sender: 'ivan@acme' } })] }),
+    );
+    adapter.emitLatest({ type: 'progress', note: 'using Read' });
+
+    const lines = journal.parsedLines(journalPathFor('dexec-1'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      type: 'department.progress',
+      run_id: 'dexec-1',
+      department_id: 'unity-department',
+      sender: 'ivan@acme',
+      // The USER-FACING engine name, resolved from the adapter id (06 §7).
+      engine: 'claude-code',
+    });
+  });
+
+  test('an unknown adapter id yields a null engine rather than leaking the internal id', async () => {
+    const { manager, adapter, runtimes, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer());
+    adapter.emitLatest({ type: 'progress', note: 'working' });
+
+    const line = journal.parsedLines(journalPathFor('dexec-1'))[0]!;
+    expect(line.engine).toBeNull();
+    expect(line.sender).toBeNull();
+  });
+
+  test('admission appends ONE index line at the department\'s own resolvable path — no directory scan', async () => {
+    const { manager, runtimes, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer({ messages: [makeMessage({ metadata: { sender: 'ivan@acme' } })] }));
+    await manager.admitTask(makeOffer({ executionId: 'dexec-2' }));
+
+    const indexPath = departmentIndexPath('/data/department', 'unity-department');
+    const entries = journal.parsedLines(indexPath).map((line) => parseDepartmentIndexLine(JSON.stringify(line)));
+    expect(entries.map((e) => e?.run_id)).toEqual(['dexec-1', 'dexec-2']);
+    expect(entries[0]).toMatchObject({
+      department_id: 'unity-department',
+      task_id: 'dtask-1',
+      sender: 'ivan@acme',
+      journal_path: journalPathFor('dexec-1'),
+    });
+    // The index is a SIBLING of the execution directories, never inside one.
+    expect(journal.lines.has(journalPathFor('dexec-1'))).toBe(false); // nothing journalled yet for it
+  });
+
+  test('a wire offer\'s message metadata survives narrowing — the sender is reachable at all', async () => {
+    const dispatcher = new Dispatcher();
+    const clock = new FakeClock();
+    const journal = new MemJournal();
+    const sink = new FrameSink();
+    const adapter = new FakeAdapter();
+    const manager = new DepartmentManager({
+      adapters: [adapter],
+      resolveRuntimeConfig: () => ({ adapterId: 'fake', command: 'x' }),
+      send: sink.send,
+      dispatcher,
+      journal,
+      journalRoot: '/data/department',
+      clock,
+      logger: new CaptureLogger(),
+    });
+    manager.attach(dispatcher);
+
+    dispatcher.dispatch({
+      type: 'department.offer',
+      execution_id: 'dexec-w9',
+      task_id: 'dtask-w9',
+      context_id: 'dctx-w9',
+      department_id: 'unity-department',
+      attempt: 1,
+      lease_token: 'lease-w9',
+      lease_ttl_s: 900,
+      adapter: 'fake',
+      accepted_output_modes: ['text/markdown'],
+      deadline_at: '2026-07-26T18:00:00.000Z',
+      event_seq_base: 0,
+      messages: [
+        {
+          message_id: 'm1',
+          role: 'ROLE_USER',
+          parts: [{ text: 'review the save system' }],
+          created_at: '2026-07-26T12:00:00.000Z',
+          metadata: { sender: 'ivan@acme', skill: 'unity-architecture-review' },
+        },
+      ],
+    });
+    await tick();
+
+    // Both halves of the fix: the journal's sender column, and the metadata
+    // `./claude-code.ts`'s `buildSessionContext` reads off the same message.
+    const entry = journal.parsedLines(departmentIndexPath('/data/department', 'unity-department'))[0]!;
+    expect(entry.sender).toBe('ivan@acme');
+    const started = adapter.startCalls()[0]!;
+    expect(started.task.messages[0]!.metadata).toEqual({ sender: 'ivan@acme', skill: 'unity-architecture-review' });
   });
 });
 

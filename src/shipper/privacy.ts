@@ -119,6 +119,15 @@ const ENVELOPE_ALLOWLIST: Record<string, FieldRule> = {
   // its task/context identity, structural like `session_id`, not content.
   task_id: 'keep',
   context_id: 'keep',
+  // simplified-onboarding b4 (journal schema 2): the department a task ran in
+  // and the engine that ran it are structure and taxonomy — the same kind of
+  // thing as `pipeline_name` and `resolved_model`. `sender` is NOT: it is a
+  // person's identity (`ivan@acme`), so it is FINGERPRINTED rather than kept,
+  // which still correlates one sender's tasks across events without the
+  // identity itself leaving the machine at this tier.
+  department_id: 'keep',
+  engine: 'keep',
+  sender: 'fingerprint',
 };
 
 /**
