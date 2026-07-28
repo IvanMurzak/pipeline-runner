@@ -210,6 +210,24 @@ describe('stuck detection — shape 2: the session ends having reported nothing 
     expect(logger.joined()).toContain('without reporting anything at all');
   });
 
+  test('x36: the WORKING announcement is NOT one of those signals — shape 2 survives it', async () => {
+    // Every `claude-code` session now emits exactly one `status` event at its
+    // `init` frame, because that event is the only thing that moves its task
+    // off SUBMITTED. If it counted as a runtime signal, "emitted NOT ONE signal
+    // in its whole life" would be trivially false for every session of the very
+    // engine b3 observed this failure on, and the detector would retire
+    // silently. A lifecycle announcement is not a report of work.
+    const { manager, adapter, runtimes, sink, journal } = makeManager();
+    runtimes.set('unity-department', { adapterId: 'claude-code', command: 'claude' });
+    await manager.admitTask(makeOffer());
+
+    adapter.emitLatest({ type: 'status', state: 'WORKING', message: 'claude-code session started' });
+    adapter.emitLatest({ type: 'completed', summary: 'I could not report anything' });
+
+    expect(reportedFailure(sink)).toEqual({ reason: STUCK_FAILURE_REASON, retry_safe: false });
+    expect(journalledTypes(journal)).not.toContain('department.completed');
+  });
+
   test('ONE signal of any kind is enough for the completion to stand', async () => {
     const { manager, adapter, runtimes, sink, journal } = makeManager();
     runtimes.set('unity-department', { adapterId: 'claude-code', command: 'claude' });
