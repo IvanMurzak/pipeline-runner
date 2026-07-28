@@ -190,6 +190,37 @@ export const PIPELINE_ENGINE_CAPABILITIES: EngineCapabilities = {
   supportsCheckpoint: 'no',
 };
 
+/**
+ * `claude-code` — `./claude-code.ts` (task b3). Matches 06 §3's table row for
+ * row; it is the only engine that column describes, and the only one whose
+ * every answer is an unqualified one.
+ *
+ * - `acceptsMidTaskInput: 'yes'` — 06 §3's own words are "yes — via the
+ *   receiver tools", and this module additionally keeps the session's stdin
+ *   open (`--input-format stream-json`), so `send()` reaches a LIVE session
+ *   rather than being queued for a respawn. Both halves are real; the
+ *   per-handle `RuntimeCapabilities.midTaskInput` it mints is `true` to match.
+ * - `supportsCancellation: 'yes'` — stdin half-close as the polite ask, with a
+ *   process-GROUP SIGTERM→SIGKILL escalation behind it on dispose. A Claude
+ *   Code session shells out constantly, so the group is the only correct
+ *   target.
+ * - `supportsStreaming: 'yes'` — `--output-format stream-json` delivers one
+ *   JSON frame per line WHILE the session works; every assistant turn and
+ *   every tool call becomes a `progress` event. Unlike `pipeline`, nothing
+ *   waits for an invocation boundary.
+ * - `supportsCheckpoint: 'no'` — `checkpoint`/`resume` are not implemented.
+ *   Claude Code does have native session resume (`--resume <session_id>`), so
+ *   this is the one capability here that is 'no' by choice of scope rather
+ *   than by nature; declaring 'yes' would promise a `CheckpointRef` round trip
+ *   that no code in this package performs.
+ */
+export const CLAUDE_CODE_ENGINE_CAPABILITIES: EngineCapabilities = {
+  acceptsMidTaskInput: 'yes',
+  supportsCancellation: 'yes',
+  supportsStreaming: 'yes',
+  supportsCheckpoint: 'no',
+};
+
 // ── The module contract ─────────────────────────────────────────────────────
 
 /**
@@ -210,11 +241,12 @@ export interface EngineModule extends AgentRuntimeAdapter {
    * `EngineMcpUnavailableError`, before spawning anything — when it cannot.
    * A session that cannot report anything is worse than one that never began.
    *
-   * Every shipped module declares `false`, and that is ground truth rather
-   * than an oversight: `./manager.ts`'s `resolveMcpEnv` deliberately degrades
-   * to "no MCP env this spawn" instead of failing admission, because JSONL
-   * and drive runtimes work with no MCP access whatsoever. A model-driven
-   * engine cannot: without the connection it has no `task.complete` and no
+   * The three process/drive modules declare `false`, and that is ground truth
+   * rather than an oversight: `./manager.ts`'s `resolveMcpEnv` deliberately
+   * degrades to "no MCP env this spawn" instead of failing admission, because
+   * JSONL and drive runtimes work with no MCP access whatsoever.
+   * `claude-code` (b3) is the one that declares `true`, and shows why the flag
+   * exists: without the connection it has no `task.complete` and no
    * `task.fail`, so it can only end by deadline.
    */
   readonly requiresMcpConnection: boolean;
@@ -278,13 +310,14 @@ export function requireEngineMcpEnv(invocation: InvocationEnvelope, engine: stri
  * it, `ENGINE_REGISTRY` is keyed by that type, and `validate`'s
  * supported-engine list is its sorted keys — so an engine cannot be half-added.
  *
- * `claude-code` is deliberately absent. It is design 06's headline engine and
- * task b3's whole job; listing it before the module exists would make
- * `validate` tell a user that `engine: claude-code` is supported when nothing
- * in this repo can run it. `codex` / `copilot` are likewise not listed —
- * "planned" is documentation, not a value a validator should accept.
+ * `claude-code` joined the list in task b3, at the same moment
+ * `./claude-code.ts` and its registry row did — listing it any earlier would
+ * have made `validate` tell a user that `engine: claude-code` is supported
+ * when nothing in this repo could run it. `codex` / `copilot` are still not
+ * listed for exactly that reason: "planned" is documentation, not a value a
+ * validator should accept.
  */
-export const ENGINE_NAMES = ['process', 'container', 'pipeline'] as const;
+export const ENGINE_NAMES = ['claude-code', 'process', 'container', 'pipeline'] as const;
 
 export type EngineName = (typeof ENGINE_NAMES)[number];
 
@@ -315,6 +348,14 @@ export type EngineRegistry = Readonly<Record<string, EngineDeclaration>>;
  * rather than aspirational.
  */
 export const ENGINE_REGISTRY: Readonly<Record<EngineName, EngineDeclaration>> = {
+  'claude-code': {
+    engine: 'claude-code',
+    // The one engine whose user-facing name and adapter id coincide: here the
+    // mechanism and the thing genuinely have one name (06 §7).
+    adapterId: 'claude-code',
+    capabilities: CLAUDE_CODE_ENGINE_CAPABILITIES,
+    requiresMcpConnection: true,
+  },
   process: {
     engine: 'process',
     adapterId: 'jsonl-process',
@@ -337,7 +378,7 @@ export const ENGINE_REGISTRY: Readonly<Record<EngineName, EngineDeclaration>> = 
 
 /**
  * The supported-engine list, sorted, for `validate`'s output and its error
- * message ("supported: container, pipeline, process"). Sorted rather than
+ * message ("supported: claude-code, container, pipeline, process"). Sorted rather than
  * declaration-ordered so the list a user reads does not silently reorder when
  * an engine is added.
  */

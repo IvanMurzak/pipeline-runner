@@ -12,10 +12,12 @@
 import { describe, expect, test } from 'bun:test';
 import type { InvocationEnvelope } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+import { ClaudeCodeAdapter } from './claude-code';
 import { ContainerAdapter } from './container';
 import type { EngineCapabilities, EngineDeclaration, EngineModule, EngineName, EngineRegistry } from './engine';
 import {
   adapterIdToEngine,
+  CLAUDE_CODE_ENGINE_CAPABILITIES,
   CONTAINER_ENGINE_CAPABILITIES,
   ENGINE_CAPABILITY_LEVELS,
   ENGINE_MCP_TOKEN_ENV,
@@ -35,11 +37,16 @@ import { JsonlProcessAdapter } from './jsonl-process';
 import { MESH_EXECUTION_TOKEN_ENV, MESH_MCP_URL_ENV } from './manager';
 import { PIPELINE_DRIVE_CAPABILITIES, PipelineDriveAdapter } from './pipeline-drive';
 
-/** The three modules this runner actually registers (`../cli.ts`). If a
- *  fourth is ever constructed there without appearing here, the coherence
+/** The four modules this runner actually registers (`../cli.ts`). If a
+ *  fifth is ever constructed there without appearing here, the coherence
  *  tests below stop covering it — which is why `every registered adapter id
  *  has a registry row` asserts in BOTH directions. */
-const SHIPPED_MODULES: EngineModule[] = [new JsonlProcessAdapter(), new ContainerAdapter(), new PipelineDriveAdapter()];
+const SHIPPED_MODULES: EngineModule[] = [
+  new JsonlProcessAdapter(),
+  new ContainerAdapter(),
+  new PipelineDriveAdapter(),
+  new ClaudeCodeAdapter(),
+];
 
 describe('declared capabilities (06 §3)', () => {
   test("`pipeline` matches 06 §3's table row for row", () => {
@@ -49,6 +56,18 @@ describe('declared capabilities (06 §3)', () => {
       acceptsMidTaskInput: 'no',
       supportsCancellation: 'yes',
       supportsStreaming: 'partial',
+      supportsCheckpoint: 'no',
+    });
+  });
+
+  test("`claude-code` matches 06 §3's table row for row", () => {
+    // The design's table states, for the `claude-code` column: mid-task input
+    // yes ("via the receiver tools"), cancellation yes, streaming yes,
+    // checkpoint no. It is the only engine with no qualified answer.
+    expect(CLAUDE_CODE_ENGINE_CAPABILITIES).toEqual({
+      acceptsMidTaskInput: 'yes',
+      supportsCancellation: 'yes',
+      supportsStreaming: 'yes',
       supportsCheckpoint: 'no',
     });
   });
@@ -103,8 +122,9 @@ describe('module ⇄ registry coherence', () => {
     }
   });
 
-  test('the registry covers exactly the three registered adapters, in both directions', () => {
+  test('the registry covers exactly the four registered adapters, in both directions', () => {
     expect(Object.values(ENGINE_REGISTRY).map((row) => row.adapterId).sort()).toEqual([
+      'claude-code',
       'container',
       'jsonl-process',
       'pipeline-drive',
@@ -118,26 +138,29 @@ describe('module ⇄ registry coherence', () => {
     }
   });
 
-  test('no shipped module requires an MCP connection — the supervisor degrades rather than failing', () => {
+  test('only the model-driven module requires an MCP connection — the supervisor degrades for the rest', () => {
     // `manager.ts`'s `resolveMcpEnv` returns null and the spawn proceeds
-    // without the variables. D24's refusal is for model-driven engines only,
-    // so declaring `true` anywhere today would break existing dispatch.
-    for (const module of SHIPPED_MODULES) expect(module.requiresMcpConnection).toBe(false);
+    // without the variables. D24's refusal is for model-driven engines only:
+    // declaring `true` on a process/drive module would break existing
+    // dispatch, which works with no MCP access whatsoever.
+    const requiring = SHIPPED_MODULES.filter((module) => module.requiresMcpConnection).map((module) => module.id);
+    expect(requiring).toEqual(['claude-code']);
   });
 });
 
 describe('the supported-engine list (what `validate` reads)', () => {
   test('is the registry keys, sorted', () => {
-    expect(supportedEngines()).toEqual(['container', 'pipeline', 'process']);
+    expect(supportedEngines()).toEqual(['claude-code', 'container', 'pipeline', 'process']);
     expect(supportedEngines()).toEqual([...ENGINE_NAMES].sort());
   });
 
-  test('does NOT yet include `claude-code` — that module does not exist in this repo', () => {
+  test('includes `claude-code` — b3 added the module, the name and the row together', () => {
     // Listing an engine before it can run is exactly the lie `validate` is
-    // for. Task b3 adds the module, the name, and the row together.
-    expect(supportedEngines()).not.toContain('claude-code');
-    expect(isSupportedEngine('claude-code')).toBe(false);
-    expect(engineToAdapterId('claude-code')).toBeNull();
+    // for, so this assertion is only true because `./claude-code.ts` exists
+    // and `../cli.ts` constructs it (asserted by SHIPPED_MODULES above).
+    expect(supportedEngines()).toContain('claude-code');
+    expect(isSupportedEngine('claude-code')).toBe(true);
+    expect(engineToAdapterId('claude-code')).toBe('claude-code');
   });
 
   test('an unknown engine resolves to null rather than throwing', () => {
@@ -148,6 +171,8 @@ describe('the supported-engine list (what `validate` reads)', () => {
   });
 
   test('translates both ways for every shipped engine', () => {
+    expect(engineToAdapterId('claude-code')).toBe('claude-code');
+    expect(adapterIdToEngine('claude-code')).toBe('claude-code');
     expect(engineToAdapterId('process')).toBe('jsonl-process');
     expect(engineToAdapterId('container')).toBe('container');
     expect(engineToAdapterId('pipeline')).toBe('pipeline-drive');
@@ -174,7 +199,7 @@ describe('adding an engine is the registry plus the enum (06 §6)', () => {
   test('one added row is enough for the whole engine surface to know about it', () => {
     const withStub: EngineRegistry = { ...ENGINE_REGISTRY, stub };
     // Every lookup the CLI and the validator use — no other file touched.
-    expect(supportedEngines(withStub)).toEqual(['container', 'pipeline', 'process', 'stub']);
+    expect(supportedEngines(withStub)).toEqual(['claude-code', 'container', 'pipeline', 'process', 'stub']);
     expect(lookupEngine('stub', withStub)).toEqual(stub);
     expect(engineToAdapterId('stub', withStub)).toBe('stub-engine');
     expect(adapterIdToEngine('stub-engine', withStub)).toBe('stub');
@@ -191,7 +216,7 @@ describe('adding an engine is the registry plus the enum (06 §6)', () => {
   });
 
   test('the shipped registry is never mutated by any of it', () => {
-    expect(supportedEngines()).toEqual(['container', 'pipeline', 'process']);
+    expect(supportedEngines()).toEqual(['claude-code', 'container', 'pipeline', 'process']);
     expect(lookupEngine('stub')).toBeNull();
   });
 
@@ -201,7 +226,7 @@ describe('adding an engine is the registry plus the enum (06 §6)', () => {
     // missing an `ENGINE_NAMES` member is not a `Record<EngineName, …>`.
     // Adding the name without the row is therefore a build failure, which is
     // what makes "registry + enum, nothing else" enforceable.
-    // @ts-expect-error — 'container' and 'pipeline' are missing
+    // @ts-expect-error — 'claude-code', 'container' and 'pipeline' are missing
     const incomplete: Record<EngineName, EngineDeclaration> = { process: ENGINE_REGISTRY.process };
     expect(Object.keys(incomplete)).toEqual(['process']);
   });
