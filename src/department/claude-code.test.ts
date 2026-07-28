@@ -30,9 +30,11 @@ import {
   ClaudeCodeAdapter,
   DEPARTMENT_MCP_SERVER_NAME,
   EXECUTION_ID_PATTERN,
+  initFrameListsReceiverTools,
   MAX_TRACKED_RECEIVER_CALLS,
   mcpServerStatus,
   narrowResultFrame,
+  NO_REPORT_CHANNEL_FAILURE_REASON,
   RECEIVER_TOOLS,
   receiverToolNames,
   receiverToolUseIds,
@@ -879,6 +881,226 @@ describe('x16: a session that exited claiming success is not the same as one tha
     spawn.last.emitJson(toolAnswer('toolu_0', { isError: true, content: EXPIRED }));
     spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
     expect(events[events.length - 1]!.type).toBe('completed');
+  });
+});
+
+// ── x27: a session that never had a report channel in the first place ──────
+
+/**
+ * The `init` frame's `tools` array, captured from v2.1.220 with the argv this
+ * module builds: 41 entries with the server `connected` (nine of them ours),
+ * 32 with it `pending` (none of them ours). Only the `mcp__` half matters
+ * here, so the built-in tools are represented by two of their real names.
+ */
+function initFrameWithTools(status: string, options: { receiverTools?: boolean } = {}): Record<string, unknown> {
+  return {
+    ...initFrame(status),
+    tools: ['Read', 'Bash', ...(options.receiverTools === true ? receiverToolNames() : [])],
+  };
+}
+
+/** Start a session on an arbitrary `init` frame — the x27 cases turn on what
+ *  that frame says, so they cannot go through `startSession`'s fixed one. */
+async function startOnInit(
+  frame: Record<string, unknown>,
+  options: { logger?: Logger } = {}
+): Promise<{ spawn: FakeJobSpawn; adapter: ClaudeCodeAdapter; events: RuntimeEvent[] }> {
+  const spawn = new FakeJobSpawn();
+  const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), ...(options.logger ? { logger: options.logger } : {}) });
+  const events: RuntimeEvent[] = [];
+  const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+  spawn.last.emitJson(frame);
+  await started;
+  return { spawn, adapter, events };
+}
+
+describe('x27: a session whose MCP server never connected did not complete anything', () => {
+  test('the P4 gate case: `pending` at init, no receiver tools all session, and it still exits is_error:false', async () => {
+    // The live gate transcript, driven frame for frame. The server is still
+    // connecting when `init` is emitted and never finishes, so the session has
+    // none of its nine tools; it does ordinary file work instead, says in
+    // plain words that it reported nothing — and `result` carries
+    // `is_error:false`. Before x27 this was a `completed`: `b4` needs total
+    // silence (there were 13 signals), and x16 needs a receiver call to have
+    // FAILED (there was never one to fail).
+    const logger = capturingLogger();
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'), { logger });
+
+    spawn.last.emitJson({ type: 'assistant', message: { content: [{ type: 'text', text: "I'll check for the department tools first." }] } });
+    spawn.last.emitJson(toolCall('ToolSearch', 'toolu_search'));
+    spawn.last.emitJson(
+      toolAnswer('toolu_search', { content: 'No matching deferred tools found. Some MCP servers are still connecting: pipeline-department.' })
+    );
+    spawn.last.emitJson(toolCall('Read', 'toolu_read'));
+    spawn.last.emitJson(toolAnswer('toolu_read', { content: 'TICKET-4417 …' }));
+    spawn.last.emitJson(toolCall('Write', 'toolu_write'));
+    spawn.last.emitJson(toolAnswer('toolu_write', { content: 'wrote note-slow.md' }));
+    spawn.last.emitJson({
+      type: 'result',
+      is_error: false,
+      subtype: 'success',
+      terminal_reason: 'completed',
+      result:
+        'Because the department tools were unreachable, this summary has reached nobody but you — ' +
+        'ops-oncall@acme.example has received no completion for gate-task-slow. The runner will only observe that the session ended.',
+    });
+
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: NO_REPORT_CHANNEL_FAILURE_REASON, retrySafe: true });
+    expect(NO_REPORT_CHANNEL_FAILURE_REASON).toBe('no_report_channel');
+    // Three failures, three words: an operator sent to the gateway's connect
+    // by this one would be sent to a token by `unreported` and to a hang by
+    // `stuck`.
+    expect(NO_REPORT_CHANNEL_FAILURE_REASON).not.toBe(UNREPORTED_FAILURE_REASON);
+    // The detail is in the log; the wire value stays a bare word.
+    expect(logger.lines.join('\n')).toContain('still connecting when it started');
+    expect(logger.lines.join('\n')).toContain('never held the tools it reports through');
+  });
+
+  test('a slow connect that COMPLETES is not touched — captured live, and the reason this is not a start-time refusal', async () => {
+    // Against a gateway answering `initialize` 12s late, the real binary
+    // reported `pending` at `init` with zero `mcp__…` tools, connected
+    // MID-TURN, and the session then called task.update_progress and
+    // task.complete successfully. Refusing on `pending` at init — the obvious
+    // fix — would have killed exactly this session.
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(toolCall('ToolSearch', 'toolu_wait'));
+    spawn.last.emitJson(toolAnswer('toolu_wait', { content: 'Some MCP servers are still connecting: pipeline-department.' }));
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_p'));
+    spawn.last.emitJson(toolAnswer('toolu_p', { content: 'ACK: task.update_progress recorded.' }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_c'));
+    spawn.last.emitJson(toolAnswer('toolu_c', { content: 'ACK: task marked complete.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'x27 slowok' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'x27 slowok' });
+  });
+
+  test('one landed receiver call is enough — the channel proved itself, whatever init said', async () => {
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_one'));
+    spawn.last.emitJson(toolAnswer('toolu_one'));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+  });
+
+  test('a later `init` reporting connected retires the doubt', async () => {
+    // The CLI re-emits `system`/`init` with a refreshed `mcp_servers` status
+    // (captured: `pending` on the first, `failed` on the second of a
+    // never-connecting server). A `connected` there is the connect completing.
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(initFrameWithTools('connected', { receiverTools: true }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+  });
+
+  test('a session that started CONNECTED is never judged by this rule, even if it called no receiver tool', async () => {
+    // The guard against widening into "believe a completed only if a receiver
+    // call landed". That rule would be right about this defect and wrong about
+    // a parked session, so it is not the rule this implements — the supervisor
+    // (b4) is what judges a connected session that reported nothing.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking' }] } });
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+  });
+
+  test('an older CLI that reports no server list is still tolerated, not failed at the other end', async () => {
+    // "Cannot verify" is not evidence. D24 answers it with a warning and a
+    // start; turning the same non-evidence into a terminal failure would be a
+    // different policy wearing this task's name.
+    const frame = initFrame();
+    delete frame.mcp_servers;
+    const { spawn, events } = await startOnInit(frame);
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+  });
+
+  test('`pending` while the receiver tools are ALREADY listed is treated as usable', async () => {
+    const logger = capturingLogger();
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending', { receiverTools: true }), { logger });
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+    expect(logger.lines.join('\n')).toContain('receiver tools are already available');
+  });
+
+  test('a receiver call that FAILED keeps x16\'s more specific reason', async () => {
+    // Both judgements are true of this session; `unreported` is the one that
+    // says more — it had the tools long enough to be refused.
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_401'));
+    spawn.last.emitJson(toolAnswer('toolu_401', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'all done!' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: UNREPORTED_FAILURE_REASON, retrySafe: true });
+  });
+
+  test('a slow start whose channel then broke and RECOVERED is x16\'s disarm, and still a completion', async () => {
+    // The combination the two flags exist separately to express: init never
+    // confirmed the channel (`pending`), a call was refused, and a later call
+    // landed. x16 disarms on the recovery and x27 stands down on the landed
+    // call — neither judgement is left half-applied.
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_1'));
+    spawn.last.emitJson(toolAnswer('toolu_1', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_2'));
+    spawn.last.emitJson(toolAnswer('toolu_2', { content: 'ACK: task marked complete.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'reviewed the save system' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'reviewed the save system' });
+  });
+
+  test('a stated failure keeps its own reason — `no_report_channel` never overwrites one', async () => {
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson({ type: 'result', is_error: true, terminal_reason: 'api_error', result: 'Overloaded' });
+    const failure = events[events.length - 1] as Extract<RuntimeEvent, { type: 'failed' }>;
+    expect(failure.reason).toContain('api_error');
+    expect(failure.reason).toContain('Overloaded');
+  });
+
+  test('judging it emits no extra event — b4 times out on the same signals as before', async () => {
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson({ type: 'assistant', message: { content: [{ type: 'text', text: 'working' }] } });
+    spawn.last.emitJson(initFrameWithTools('connected', { receiverTools: true }));
+    expect(events).toEqual([{ type: 'progress', note: 'working' }]);
+  });
+
+  test('initFrameListsReceiverTools reads the tools array, and says false when there is none', () => {
+    const names = new Set(receiverToolNames());
+    expect(initFrameListsReceiverTools({ tools: ['Read', ...receiverToolNames()] }, names)).toBe(true);
+    expect(initFrameListsReceiverTools({ tools: ['Read', 'Bash'] }, names)).toBe(false);
+    expect(initFrameListsReceiverTools({ tools: 'not a list' }, names)).toBe(false);
+    expect(initFrameListsReceiverTools({}, names)).toBe(false);
+  });
+});
+
+// ── The parking flow (D34/x17's territory) is untouched by x27 ──────────────
+
+describe('a session that parks on task.request_input still completes its turn (D34/x17, NOT x27)', () => {
+  test('a connected session that parks and ends its turn is a completed, exactly as before', async () => {
+    // Parking is the case the general rule "believe a completed only if a
+    // receiver call landed" would have relabelled. It is not relabelled: the
+    // question DID land, over a channel that WAS confirmed. Whether parking
+    // deserves a terminal state of its own is D34, tracked as x17, and is not
+    // decided here.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_request_input'), 'toolu_ask'));
+    spawn.last.emitJson(
+      toolAnswer('toolu_ask', {
+        content: 'PARKED: the question was delivered to the sender. Their answer will arrive as a new user message in this session.',
+      })
+    );
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'asked the sender which branch to use' });
+    expect(events).toEqual([
+      { type: 'progress', note: `using ${receiver('task_request_input')}` },
+      { type: 'completed', summary: 'asked the sender which branch to use' },
+    ]);
+    // And still no synthesized input_required — the gateway is the parking
+    // authority, and asking twice was already refused in this module.
+    expect(events.every((event) => event.type !== 'input_required')).toBe(true);
+  });
+
+  test('a session that parks after a SLOW connect is a completed too — x27 disarms on the landed question', async () => {
+    const { spawn, events } = await startOnInit(initFrameWithTools('pending'));
+    spawn.last.emitJson(toolCall(receiver('task_request_input'), 'toolu_ask'));
+    spawn.last.emitJson(toolAnswer('toolu_ask', { content: 'PARKED: the question was delivered to the sender.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'waiting on the sender' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'waiting on the sender' });
   });
 });
 

@@ -110,6 +110,46 @@
  * while the report channel is still broken is reported
  * {@link UNREPORTED_FAILURE_REASON} instead of `completed`
  * ({@link ClaudeCodeHandle.unlandedReport}).
+ *
+ * ── The channel that never came up at all (x27) ────────────────────────────
+ * x16 watches a channel that WORKED and then broke. The P4 gate re-run found
+ * the shape one step earlier: a session whose department MCP server is
+ * `pending` on the `init` frame and never finishes connecting. It has none of
+ * the nine receiver tools for its whole life, so it makes no receiver call at
+ * all — x16's tracking records nothing, `unlandedReport` is never armed, and
+ * the ordinary work it does instead (reads, writes, plain prose) is far too
+ * loud for `./manager.ts`'s `stuck` rewrite, which needs total silence. The
+ * live session said so itself: *"Because the department tools were
+ * unreachable, this summary has reached nobody but you … The runner will only
+ * observe that the session ended."* — and the sender was told `completed`.
+ *
+ * Both halves of the cure were settled by capturing the real binary
+ * (v2.1.220) rather than reasoning about it, and the capture overturned the
+ * obvious fix:
+ *
+ *  1. `pending` is NOT a synonym for broken. Against a gateway that answered
+ *     `initialize` 12s late, `init` reported `pending` with ZERO `mcp__…`
+ *     entries in its `tools` list — and the connection then completed
+ *     MID-TURN, the tools appeared, and the session called
+ *     `task.update_progress` and `task.complete` successfully. So refusing at
+ *     `init` on `pending` (D24's shape) would kill sessions that go on to work
+ *     perfectly, and nothing in the stream re-states the status in time to
+ *     re-check: the only later `init` frame the CLI emits arrives on a NEW
+ *     turn, i.e. after the `result` this module already treats as terminal.
+ *  2. So the judgement is made at the TERMINAL, on the narrowest evidence that
+ *     is knowable independently of what the session chose to do: the report
+ *     channel was never once confirmed usable ({@link
+ *     ClaudeCodeHandle.reportChannelUnconfirmed}) AND no receiver call ever
+ *     landed ({@link ClaudeCodeHandle.receiverCallLanded}). Such a `result` is
+ *     reported {@link NO_REPORT_CHANNEL_FAILURE_REASON}.
+ *
+ * That second condition is deliberately narrower than the tempting general
+ * rule "believe a `completed` only if a receiver call landed", and the
+ * narrowing is what keeps this fix inside its own lane: a session that parks
+ * on `task.request_input` ends its turn on purpose so the sender's answer can
+ * arrive, and it made a receiver call that LANDED over a channel that WAS
+ * confirmed — so nothing here touches it. Parking becoming its own terminal
+ * state is [D34]/`x17`, and is not this module's to invent.
  */
 
 import { existsSync } from 'node:fs';
@@ -197,6 +237,33 @@ export const RECEIVER_TOOLS = [
  * the STRING is the contract and is identical either way.
  */
 export const UNREPORTED_FAILURE_REASON = 'unreported';
+
+/**
+ * x27: the CODED terminal reason for a session that never had a working report
+ * channel at all — its department MCP server was still `pending` when the
+ * session started and was never once observed working, so not one of the nine
+ * receiver tools was ever in its hands.
+ *
+ * A third word, because it is a third failure and an operator acts on each
+ * differently. `stuck` means the session went quiet. `unreported` means it
+ * spoke and the gateway refused the call — a token or an authorization
+ * problem, and the session did have tools once. This one means the connection
+ * to the gateway never completed: the thing to look at is the gateway's
+ * reachability and the connect itself, and neither of the other two words
+ * would send anyone there.
+ *
+ * Same hardcoding rationale as `UNREPORTED_FAILURE_REASON` above,
+ * `./manager.ts`'s `STUCK_FAILURE_REASON` and its
+ * `ISOLATION_UNSUPPORTED_FAILURE_REASON`: this package exact-pins
+ * `@baizor/pipeline-protocol@0.4.0`, whose `DEPT_FAILURE_REASONS` is merged
+ * but unpublished. The value rides the existing `failed` event's `reason`
+ * (already `z.string().min(1)`), so no consumer needs a schema change and the
+ * cloud passes a reason it has never heard of through verbatim ([D35], proven
+ * live by the P4 gate). The STRING is the contract and is identical either
+ * way; adding it to that constant when it next ships is a protocol-side
+ * follow-up.
+ */
+export const NO_REPORT_CHANNEL_FAILURE_REASON = 'no_report_channel';
 
 /** Claude Code session startup (process spawn → `system`/`init` line) is a
  *  cold binary start plus MCP connect; 60s is generous rather than tight, and
@@ -523,8 +590,19 @@ function tryParseLine(line: string): Record<string, unknown> | null {
 /** MCP connection states the CLI reports on `system`/`init`
  *  (`connected` | `failed` | `needs-auth` | `pending` | `disabled`). Only the
  *  first two of these are acceptable to start on — `pending` because a
- *  connect may legitimately still be in flight when `init` is emitted. */
+ *  connect may legitimately still be in flight when `init` is emitted, which
+ *  x27 confirmed against the real binary: a 12s-late `initialize` was
+ *  `pending` at `init` and the session went on to report perfectly. What x27
+ *  adds is not a refusal here but a memory of it — see
+ *  {@link reportChannelUnconfirmedAtInit}. */
 const USABLE_MCP_STATUSES = new Set(['connected', 'pending']);
+
+/** The one status that means "usable, right now, confirmed". */
+const CONNECTED_MCP_STATUS = 'connected';
+/** The one tolerated status that means "not usable YET, and it may never be".
+ *  Every other non-`connected` status is refused outright by
+ *  {@link ClaudeCodeAdapter.checkMcpConnection}. */
+const PENDING_MCP_STATUS = 'pending';
 
 /**
  * Our server's reported status on the `init` frame, or `null` when the frame
@@ -542,6 +620,30 @@ export function mcpServerStatus(initFrame: Record<string, unknown>, serverName: 
     }
   }
   return 'absent';
+}
+
+/**
+ * x27 — the SECOND, independent piece of evidence the `init` frame carries
+ * about whether this session can report: its `tools` array, the list of
+ * callables the model actually has.
+ *
+ * Captured from the shipped binary (v2.1.220), same argv this module builds:
+ *   - server `connected` ⇒ all nine `mcp__pipeline-department__task_*`
+ *     callables are in `tools` (41 entries total);
+ *   - server `pending`   ⇒ NONE of them are (32 entries), and a `ToolSearch`
+ *     for one answers *"No matching deferred tools found. Some MCP servers are
+ *     still connecting: pipeline-department."*
+ *
+ * `true` therefore means "this session demonstrably holds a receiver tool";
+ * `false` means "it does not, or this build does not say". Used only to
+ * WITHHOLD the x27 judgement, never to trigger it — so a future CLI that
+ * exposes the tools while still calling the server `pending` costs a correct
+ * completion nothing.
+ */
+export function initFrameListsReceiverTools(initFrame: Record<string, unknown>, receiverNames: ReadonlySet<string>): boolean {
+  const tools = initFrame.tools;
+  if (!Array.isArray(tools)) return false;
+  return tools.some((tool) => typeof tool === 'string' && receiverNames.has(tool));
 }
 
 /** The terminal `result` frame, normalized. `is_error` is the ONLY reliable
@@ -740,13 +842,34 @@ class ClaudeCodeHandle implements RuntimeHandle {
    *  (which a `headersHelper` re-authorization legitimately does), and a
    *  completion may be believed. */
   unlandedReport: string | null = null;
+  /** x27: `true` when no `init` frame has ever confirmed the department MCP
+   *  server usable — it was `pending` at session start, and no later `init`
+   *  has reported it `connected`. `false` on every session whose server was
+   *  `connected` at start, and on every build too old to report a server list
+   *  at all (that is "cannot verify", which D24 already answers with a
+   *  warning, not a verdict).
+   *
+   *  Deliberately records only what the INIT FRAMES said. The other half of
+   *  the evidence — whether a call actually reached the gateway — is
+   *  {@link receiverCallLanded}, and the two are combined once, at the
+   *  terminal, rather than folded into each other here. */
+  reportChannelUnconfirmed: boolean;
+  /** x27: `true` once ANY receiver-tool call has come back without an error —
+   *  the only frame in the stream that proves the report channel reached the
+   *  gateway. Distinct from x16's `unlandedReport === null`, which is also the
+   *  state of a session that never called a receiver tool at all: THAT is the
+   *  gap x27 closes, so it needs a flag that only a landed call can set. */
+  receiverCallLanded = false;
 
   constructor(
     readonly taskId: string,
     readonly contextId: string,
     readonly proc: ProcessHandle,
-    readonly gracefulShutdownSeconds: number
-  ) {}
+    readonly gracefulShutdownSeconds: number,
+    reportChannelUnconfirmed = false
+  ) {
+    this.reportChannelUnconfirmed = reportChannelUnconfirmed;
+  }
 }
 
 function asClaudeCodeHandle(handle: RuntimeHandle): ClaudeCodeHandle {
@@ -1066,7 +1189,11 @@ export class ClaudeCodeAdapter implements EngineModule {
             task.taskId,
             task.contextId,
             proc,
-            runtime.gracefulShutdownSeconds ?? DEFAULT_GRACEFUL_SHUTDOWN_S
+            runtime.gracefulShutdownSeconds ?? DEFAULT_GRACEFUL_SHUTDOWN_S,
+            // x27: carried for the session's whole life, because `pending` is
+            // the one status this module starts on without knowing whether the
+            // channel works.
+            this.reportChannelUnconfirmedAtInit(parsed, task.taskId)
           );
           resolve(handle);
           return;
@@ -1141,17 +1268,51 @@ export class ClaudeCodeAdapter implements EngineModule {
       );
       return null;
     }
-    if (USABLE_MCP_STATUSES.has(status)) {
-      if (status === 'pending') {
-        this.logger.warn(`claude-code[${taskId}]: department MCP server still connecting at session start`);
-      }
-      return null;
-    }
+    if (USABLE_MCP_STATUSES.has(status)) return null;
     return new EngineMcpUnavailableError(
       `claude-code: refusing to start — the department MCP server '${this.serverName}' is '${status}' in the new session, ` +
         'so it has none of the receiver tools it reports through. ' +
         'A session that cannot report its own completion is worse than one that never began.'
     );
+  }
+
+  /**
+   * x27, the other half of the `init` frame's answer: not "may this session
+   * start?" (above) but "has its report channel been CONFIRMED usable?".
+   *
+   * `true` — meaning not confirmed — only when the frame states our server is
+   * `pending` AND does not already list a receiver tool. Everything else is
+   * `false`, and each for its own reason:
+   *   - `connected`, the overwhelmingly common case: confirmed, nothing to
+   *     remember.
+   *   - any other status: `checkMcpConnection` already refused, so no handle
+   *     is built at all.
+   *   - no server list (an older CLI): D24's standing answer to "cannot
+   *     verify" is a warning and a start, and turning the same non-evidence
+   *     into a terminal FAILURE at the other end of the session would be a
+   *     different policy wearing this task's name. Left alone deliberately.
+   *
+   * Being wrong in the `true` direction costs nothing on its own — this only
+   * ever matters for a session that ALSO never landed a single receiver call,
+   * which is precisely the session that reported nothing.
+   */
+  private reportChannelUnconfirmedAtInit(initFrame: Record<string, unknown>, taskId: string): boolean {
+    if (mcpServerStatus(initFrame, this.serverName) !== PENDING_MCP_STATUS) return false;
+    if (initFrameListsReceiverTools(initFrame, this.receiverNames)) {
+      // Belt and braces: the status word says "still connecting" while the
+      // tools it would bring are already in hand. Observed never; costs one
+      // comparison to not fail such a session.
+      this.logger.warn(
+        `claude-code[${taskId}]: department MCP server reports '${PENDING_MCP_STATUS}' at session start but its receiver ` +
+          'tools are already available — treating the report channel as usable'
+      );
+      return false;
+    }
+    this.logger.warn(
+      `claude-code[${taskId}]: department MCP server still connecting at session start — this session holds none of its ` +
+        'receiver tools yet, so nothing it says can reach the sender until that connect completes'
+    );
+    return true;
   }
 
   /** Route one ACTIVE-phase frame. Everything that is not a `result` is a
@@ -1183,6 +1344,23 @@ export class ClaudeCodeAdapter implements EngineModule {
         this.noteToolResults(handle, parsed);
         return;
       case 'system':
+        // x27: one system frame is worth a second look. The CLI re-emits
+        // `system`/`init` with a REFRESHED `mcp_servers` status (captured: a
+        // never-connecting server listed `pending` on the first and `failed`
+        // on the second), so a `connected` here is the connect completing and
+        // retires the doubt this session started under. Observed only on a new
+        // turn — i.e. after a `result` this module already treats as terminal
+        // — so it is a disarm that may never fire in practice. It is here
+        // because it can only ever REMOVE a failure, never cause one.
+        if (
+          handle.reportChannelUnconfirmed &&
+          parsed.subtype === 'init' &&
+          mcpServerStatus(parsed, this.serverName) === CONNECTED_MCP_STATUS
+        ) {
+          handle.reportChannelUnconfirmed = false;
+          this.logger.debug(`claude-code[${handle.taskId}]: department MCP server reported connected after a pending start`);
+        }
+        return;
       case 'stream_event':
       case 'rate_limit_event':
         // Hook lifecycle, partial deltas, quota notices: real frames with
@@ -1221,6 +1399,12 @@ export class ClaudeCodeAdapter implements EngineModule {
     for (const outcome of toolResultOutcomes(parsed)) {
       if (!handle.pendingReceiverCalls.delete(outcome.toolUseId)) continue; // some other tool's result
       handle.unlandedReport = outcome.isError ? (outcome.text ?? 'the call did not succeed') : null;
+      // x27: a receiver call that came back is the report channel working,
+      // whatever the `init` frame said about it — and it stays proven, because
+      // this session did reach the gateway at least once. Unlike
+      // `unlandedReport` above, this one is never un-set: a later failure is
+      // x16's to judge, and cannot make an earlier landed call un-happen.
+      if (!outcome.isError) handle.receiverCallLanded = true;
     }
   }
 
@@ -1243,6 +1427,27 @@ export class ClaudeCodeAdapter implements EngineModule {
           // `resolveMcpEnv`), so this is precisely the kind of failure a later
           // attempt gets past — unlike `b4`'s `stuck`, where nothing suggests
           // the next run would say any more than this one did.
+          retrySafe: true,
+        };
+      }
+      // x27: and the shape one step earlier — a session that never had the
+      // channel at all. Checked AFTER x16 so a session that did once hold its
+      // tools keeps the more specific `unreported`; reached only when the
+      // server was `pending` at `init` and not one receiver call ever came
+      // back, which is a session whose every word stayed inside itself.
+      if (handle.reportChannelUnconfirmed && !handle.receiverCallLanded) {
+        this.logger.warn(
+          `claude-code[${handle.taskId}]: the session ended claiming success, but its department MCP server was still ` +
+            'connecting when it started and no department tool call ever came back — it never held the tools it reports ' +
+            `through, so nothing it did reached the sender; reporting '${NO_REPORT_CHANNEL_FAILURE_REASON}' rather than ` +
+            'a completion nothing vouches for'
+        );
+        return {
+          type: 'failed',
+          reason: NO_REPORT_CHANNEL_FAILURE_REASON,
+          // A fresh spawn re-connects from scratch with a fresh execution
+          // token, so a gateway that was slow, restarting or briefly
+          // unreachable is exactly what a later attempt gets past.
           retrySafe: true,
         };
       }
