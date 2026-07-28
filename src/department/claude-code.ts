@@ -1541,21 +1541,26 @@ export class ClaudeCodeAdapter implements EngineModule {
    *  `tool_result` that answers one can be told apart from every other tool's.
    *  Bounded — see `MAX_TRACKED_RECEIVER_CALLS`. */
   private trackReceiverCalls(handle: ClaudeCodeHandle, parsed: Record<string, unknown>): void {
+    // x31: which of this frame's calls address a TERMINAL receiver tool, so
+    // the `tool_result` answering a `task.complete` can be told from the one
+    // answering a progress note. Computed first and consulted INSIDE the loop
+    // below, so an id enters the terminal set only in the same step it enters
+    // the tracked set — that is what makes the one a true subset of the other,
+    // and what keeps the bound below binding on both.
+    const terminalIds = new Set(receiverToolUseIds(parsed, this.terminalReceiverNames));
     for (const id of receiverToolUseIds(parsed, this.receiverNames)) {
       if (handle.pendingReceiverCalls.size >= MAX_TRACKED_RECEIVER_CALLS) {
         const oldest = handle.pendingReceiverCalls.values().next();
         if (!oldest.done) {
           handle.pendingReceiverCalls.delete(oldest.value);
-          // x31: the terminal subset is exactly that — a subset. An id the
-          // bound forgets is forgotten in both, so the two can never drift.
+          // An id the bound forgets is forgotten in both, so the two can never
+          // drift apart.
           handle.pendingTerminalCalls.delete(oldest.value);
         }
       }
       handle.pendingReceiverCalls.add(id);
+      if (terminalIds.has(id)) handle.pendingTerminalCalls.add(id);
     }
-    // x31: and again for the terminal pair, so the `tool_result` that answers
-    // a `task.complete` can be told from the one answering a progress note.
-    for (const id of receiverToolUseIds(parsed, this.terminalReceiverNames)) handle.pendingTerminalCalls.add(id);
   }
 
   /**
