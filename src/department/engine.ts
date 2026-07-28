@@ -523,3 +523,41 @@ export function adapterIdToEngine(adapterId: string, registry: EngineRegistry = 
   }
   return null;
 }
+
+/**
+ * x14 — every `adapterId` this build has a module for, sorted.
+ *
+ * The mirror image of `supportedEngines()`, and it exists for the one caller
+ * `supportedEngines()` cannot serve: `../cli.ts`'s `bind`, whose `--adapter`
+ * flag takes the INTERNAL id rather than the user-facing engine name (it is a
+ * machine seam — the `pipeline` CLI's `department serve` shells it, having
+ * already done the `engine:` → `adapterId` translation on its side).
+ *
+ * Sorted rather than declaration-ordered for the same reason
+ * `supportedEngines()` sorts: the list a user reads in a refusal must not
+ * silently reorder when an engine is added.
+ */
+export function registeredAdapterIds(registry: EngineRegistry = ENGINE_REGISTRY): string[] {
+  return [...new Set(Object.values(registry).map((row) => row.adapterId))].sort();
+}
+
+/**
+ * x14 — does this build have an engine module behind `adapterId`?
+ *
+ * This is the fact the runner OWNS and, until x14, never stated: `bind` wrote
+ * whatever `--adapter` string it was handed (`b1`'s `narrowRuntimeConfig`
+ * validates the SHAPE of a runtime spec, never the existence of the adapter),
+ * so a caller guessing at an id got a stored binding, a `● online` report, and
+ * a `capability` reject on the first offer that ever arrived for it. The plugin
+ * kept its own hand-written mirror of this table precisely because asking was
+ * not possible; `x32` found that mirror had gone stale and made `claude-code`
+ * — the only engine P4 built — unreachable.
+ *
+ * Deliberately checked against the ADAPTER id and not the engine name: a
+ * binding stores `adapterId`, `DepartmentManager` resolves adapters by it, and
+ * the flag is spelled that way. `adapterIdToEngine` names the engine behind an
+ * id when a message wants to be helpful about it.
+ */
+export function isRegisteredAdapterId(adapterId: string, registry: EngineRegistry = ENGINE_REGISTRY): boolean {
+  return Object.values(registry).some((row) => row.adapterId === adapterId);
+}

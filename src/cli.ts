@@ -47,6 +47,28 @@
  *       seam another package shells out to rather than writing this package's
  *       config store itself (D26's rule, applied to the binding too).
  *
+ *       x14: `--adapter` is now CHECKED against `./department/engine.ts`'s
+ *       `ENGINE_REGISTRY` and an id this build has no module for is refused,
+ *       naming the ones it has. Before that, `bind` stored any string it was
+ *       given (b1 validates the SHAPE of a runtime spec, not the existence of
+ *       the adapter), so a caller guessing at an id got a stored binding and a
+ *       success line, and the mistake surfaced only as a `capability` reject on
+ *       the first offer that ever arrived. That asymmetry is why the `pipeline`
+ *       CLI kept a hand-written mirror of this table at all.
+ *
+ *   journal --department <id> [--json] [--limit <n>] [--name <n>] [--home <p>]
+ *       simplified-onboarding x22: what THIS machine recorded for one
+ *       department — the per-department admission index b4 writes
+ *       (`./department/events.ts`), read back. `--json` is a stable-key
+ *       contract (`./department/journal-read.ts`'s `JournalReadOutput`).
+ *       Exists because `pipeline department status` had to MIRROR this
+ *       package's path knowledge and resolve the data dir as the INVOKING
+ *       user, which finds nothing when the runner runs as a service under
+ *       another OS account — the shape `serve` installs. This command also
+ *       consults the installed service definition, which a mirror cannot.
+ *       Read `./department/journal-read.ts`'s module doc BEFORE touching it:
+ *       it carries the privacy position for this surface.
+ *
  *   status   Print the stored identity (token redacted).
  */
 
@@ -100,7 +122,10 @@ import {
 // calls out the two-shapes collision this alias avoids at the import site.
 import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './relay';
 // T1-15: service install/uninstall/status lives in ./service (its own module).
-import { runService } from './service';
+// x24 added start/uninstall/restart there; x22 added `inspectInstalledService`,
+// the read-only look at the INSTALLED definition that `journal` uses to find a
+// journal owned by another OS account (see ./department/journal-read.ts).
+import { inspectInstalledService, runService } from './service';
 // department-mesh (task d1): a SECOND, PARALLEL admission surface for
 // department tasks (`department.offer`/`.message`/`.cancel`) — mirrors
 // attachJobExecution's construction shape without touching pipeline dispatch.
@@ -109,6 +134,17 @@ import { runService } from './service';
 // survives inside it as a deprecated, boot-time-only fallback.
 import { BindingStoreError, DepartmentBindingStore } from './department/bindings';
 import { DEPARTMENT_RUNTIMES_ENV } from './department/config';
+// x14: the engine registry is the runner's own answer to "is this adapter real?"
+// — `bind` asks it before storing a binding, so a caller can stop guessing and
+// stop mirroring the table (see `runBind` below).
+import { adapterIdToEngine, isRegisteredAdapterId, registeredAdapterIds } from './department/engine';
+// x22: the LOCAL journal read surface — `journal` below.
+import {
+  journalExitCode,
+  type JournalReadOutput,
+  readDepartmentJournal,
+  renderJournalText,
+} from './department/journal-read';
 // simplified-onboarding b3 (D9/D23/D24, design 06 §4): the `claude-code`
 // engine module — the first one that REFUSES to start without its department
 // MCP connection, because everything it reports it reports by calling a
@@ -176,8 +212,12 @@ function usage(): never {
       '       [--spec <json>] [--home <path>]',
       '  unbind --department <id> [--home <path>]',
       '  bindings [--json] [--home <path>]',
+      '  journal --department <id> [--json] [--limit <n>] [--name <name>] [--home <path>]',
       '  status',
-      '  service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
+      '  service <install|uninstall|status|start|stop|restart> [--dry-run] [--name <name>] [--home <path>]',
+      '',
+      '  `bind --adapter` is checked against this build\'s engine registry — an adapter',
+      `  it has no module for is refused. Registered: ${describeRegisteredAdapters()}.`,
       '',
       `  ${CLIENT_ID_ENV} / ${CLIENT_SECRET_ENV} may supply the OAuth client`,
       '  credentials instead of the flags (keeps the secret out of argv).',
@@ -745,6 +785,22 @@ function signalSupervisorReload(): void {
   }
 }
 
+/**
+ * x14: the registered adapters, each annotated with the `engine:` name a user
+ * actually writes in `department.yml`. The flag takes the internal id (this is
+ * a machine seam — see `isRegisteredAdapterId`'s doc), but a human who hits the
+ * refusal is far more likely to be holding an engine name, so the message
+ * carries both rather than making them guess at the mapping.
+ */
+function describeRegisteredAdapters(): string {
+  return registeredAdapterIds()
+    .map((id) => {
+      const engine = adapterIdToEngine(id);
+      return engine === null || engine === id ? id : `${id} (engine: ${engine})`;
+    })
+    .join(', ');
+}
+
 function bindingStoreFor(home: string | undefined, quiet = false): DepartmentBindingStore {
   // Same idiom as `runStart`/`runSetCredentials`: set the env var FIRST so
   // every path resolver below lands in the right home.
@@ -794,6 +850,25 @@ function runBind(argv: string[]): void {
   if (values.lifecycle !== undefined) spec.lifecycle = values.lifecycle;
   if (typeof spec.command !== 'string' || spec.command.length === 0) {
     fail('--command <cmd> is required (or a `command` field in --spec)');
+  }
+  // x14: refuse an adapter this build has no module for, and name the ones it
+  // has. Until this check, `bind` accepted ANY string — `narrowRuntimeConfig`
+  // validates the shape of a runtime spec, never the existence of the adapter
+  // — so a caller guessing at an id got a stored binding and a success line,
+  // and the mistake only surfaced as a `capability` reject on the first offer
+  // that ever arrived, on a machine nobody was watching. The registry is this
+  // package's own (`./department/engine.ts`); asking it here is what lets the
+  // `pipeline` CLI stop mirroring it, over argv, with no npm dependency in
+  // either direction (D26).
+  //
+  // Checked on the RESOLVED id, so `--spec '{"adapterId":"…"}'` is covered by
+  // the same gate as the flag, and the `jsonl-process` default trivially passes.
+  if (typeof spec.adapterId !== 'string' || !isRegisteredAdapterId(spec.adapterId)) {
+    const supplied = typeof spec.adapterId === 'string' ? spec.adapterId : JSON.stringify(spec.adapterId);
+    fail(
+      `unknown --adapter '${supplied}' — this runner has no engine module for it, so it could not execute a single ` +
+        `task for this department.\n  Adapters this build has: ${describeRegisteredAdapters()}`
+    );
   }
 
   const store = bindingStoreFor(values.home);
@@ -878,6 +953,65 @@ function runBindings(argv: string[]): void {
   }
 }
 
+// ── simplified-onboarding x22: reading the local department journal ─────────
+
+/**
+ * `pipeline-runner journal --department <id> [--json]` — what THIS machine
+ * recorded for one department.
+ *
+ * The whole rationale, the resolution order, and the PRIVACY POSITION live in
+ * `./department/journal-read.ts`'s module doc; this function is the argv/exit-
+ * code shell around it. Two things are contracts and must not drift:
+ *
+ *  - `--json` prints `JournalReadOutput` verbatim (stable keys, always present).
+ *  - The exit code is 0 for `ok` AND `absent` — never having served this
+ *    department here is an ordinary state, not a failure — and 1 for
+ *    `unreadable`/`unlocatable`. The JSON is printed either way, so a caller
+ *    always gets a machine-readable reason, and `x11`'s meaning of exit 1 for
+ *    an unknown verb stays distinguishable via the presence of that JSON.
+ */
+function runJournal(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      department: { type: 'string' },
+      json: { type: 'boolean' },
+      home: { type: 'string' },
+      name: { type: 'string' },
+      limit: { type: 'string' },
+    },
+  });
+  if (!values.department) fail('--department <id> is required');
+  let limit: number | undefined;
+  if (values.limit !== undefined) {
+    limit = Number(values.limit);
+    if (!Number.isInteger(limit) || limit <= 0) fail('--limit must be a positive integer');
+  }
+
+  const output: JournalReadOutput = readDepartmentJournal({
+    departmentId: values.department,
+    homeFlag: values.home,
+    limit,
+    // The installed-service probe (x22's point: this package can read its own
+    // service definition, and a mirror in another package cannot). Passed as a
+    // thunk because `readDepartmentJournal` only calls it when the ordinary
+    // location turned up nothing — no `sc.exe` spawn on the happy path.
+    // `--name` selects a named instance's definition (D17), matching every
+    // other command that takes one.
+    probeSupervisor: () =>
+      inspectInstalledService({
+        ...(values.name !== undefined ? { name: values.name } : {}),
+        // Warnings from a best-effort probe would be noise on stdout of a
+        // command whose stdout is a JSON contract.
+        logger: { ...consoleLogger, info: () => {}, warn: () => {} },
+      }),
+  });
+
+  console.log(values.json === true ? JSON.stringify(output, null, 2) : renderJournalText(output));
+  const code = journalExitCode(output);
+  if (code !== 0) process.exit(code);
+}
+
 function runStatus(): void {
   const store = new ConfigStore();
   const identity = store.load();
@@ -905,6 +1039,10 @@ switch (command) {
     break;
   case 'bindings':
     runBindings(rest);
+    break;
+  // simplified-onboarding x22: the local department journal, read back.
+  case 'journal':
+    runJournal(rest);
     break;
   case 'status':
     runStatus();

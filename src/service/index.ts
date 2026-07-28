@@ -9,7 +9,9 @@
  *
  * Public surface:
  *   - installService / uninstallService / serviceStatus  (structured results)
+ *   - startService / stopService / restartService        (x24 — the missing verbs)
  *   - previewService                                     (pure definition preview)
+ *   - inspectInstalledService                            (x22 — ./inspect.ts)
  *   - runService(argv)                                   (the CLI dispatcher)
  */
 
@@ -31,6 +33,9 @@ import {
 
 export * from './types';
 export * from './plan';
+// x22: read-only inspection of the INSTALLED definition (where the supervisor
+// was told to live, and as whom it runs) — a different question from `status`.
+export * from './inspect';
 export {
   renderSystemdUnit,
   systemdUnitName,
@@ -114,6 +119,33 @@ export function serviceStatus(opts: ServiceOptions = {}): ServiceResult {
   return backend.status(plan, ctx);
 }
 
+/**
+ * x24 — the three verbs that were missing.
+ *
+ * Before this, the only route from `stopped` to `running` was `installService`,
+ * which stop+deletes+recreates the service (and needs elevation on Windows) to
+ * do what `start` does. `x13` had already taught `pipeline department serve` to
+ * detect and report a stopped supervisor, so the product could name the problem
+ * with no clean command to name as the fix; `department-serve.ts`'s
+ * `SUPERVISOR_START_HINT` is literally `pipeline-runner service install` for
+ * exactly that reason. See `ServiceBackend.start`'s doc for the rules every
+ * backend keeps about the awkward states.
+ */
+export function startService(opts: ServiceOptions = {}): ServiceResult {
+  const { backend, plan, ctx } = resolve(opts);
+  return backend.start(plan, ctx);
+}
+
+export function stopService(opts: ServiceOptions = {}): ServiceResult {
+  const { backend, plan, ctx } = resolve(opts);
+  return backend.stop(plan, ctx);
+}
+
+export function restartService(opts: ServiceOptions = {}): ServiceResult {
+  const { backend, plan, ctx } = resolve(opts);
+  return backend.restart(plan, ctx);
+}
+
 /** Pure preview: the generated definition + its target path. No system touch. */
 export interface ServicePreview {
   backend: string;
@@ -137,11 +169,15 @@ export function previewService(opts: ServiceOptions = {}): ServicePreview {
 function serviceUsage(): void {
   console.log(
     [
-      'usage: pipeline-runner service <install|uninstall|status> [--dry-run] [--name <name>] [--home <path>]',
+      'usage: pipeline-runner service <install|uninstall|status|start|stop|restart> [--dry-run] [--name <name>] [--home <path>]',
       '',
       '  install    register + start the runner as an OS service (systemd/launchd/Windows)',
       '  uninstall  stop + deregister the service',
       '  status     report running/enabled state',
+      '  start      start the ALREADY-INSTALLED service (no re-registration, no elevation on',
+      '             systemd/launchd). Fails if it is not installed; a no-op if already running.',
+      '  stop       stop it, keeping it installed. A no-op if not installed or already stopped.',
+      '  restart    stop then start it, in one verb.',
       '',
       '  --dry-run       (install) print the generated unit/plist/command; touch nothing',
       '  --name <name>   NAMED instance (D17): systemd pipeline-runner@<name>, a per-label',
@@ -193,6 +229,19 @@ export function runService(argv: string[]): void {
         return;
       case 'status':
         printResult(serviceStatus(opts));
+        return;
+      // x24: the three verbs `install` was standing in for. Each throws a
+      // `ServiceError` (caught below → stderr, exit 1) when it did not reach
+      // the state it names, so a caller that only inspects the exit code — the
+      // `pipeline` CLI does exactly that — can trust it.
+      case 'start':
+        printResult(startService(opts));
+        return;
+      case 'stop':
+        printResult(stopService(opts));
+        return;
+      case 'restart':
+        printResult(restartService(opts));
         return;
       // Asking for help is not an error: no verb at all, `--help`, and `-h`
       // all print the usage text and exit 0 — mirrors src/cli.ts's top-level

@@ -109,6 +109,66 @@ function isMissing(r: { code: number; stdout: string; stderr: string }): boolean
   );
 }
 
+// ── x24 helpers: reading `sc.exe` honestly ──────────────────────────────────
+
+/** `sc.exe` exit code when the caller lacks SERVICE_START/SERVICE_STOP rights. */
+const ERROR_ACCESS_DENIED = 5;
+/** `sc stop` on a service that is not running. */
+const ERROR_SERVICE_NOT_ACTIVE = 1062;
+/** `sc start` on a service that is already running. */
+const ERROR_SERVICE_ALREADY_RUNNING = 1056;
+
+/** What `sc query` says right now. `'missing'` is distinct from `'unknown'`:
+ *  one means the service does not exist, the other that it exists in a state
+ *  this parse does not name (both PENDING states land here). */
+function queryState(r: { code: number; stdout: string; stderr: string }): 'missing' | 'running' | 'stopped' | 'unknown' {
+  if (isMissing(r)) return 'missing';
+  if (/\bRUNNING\b/.test(r.stdout)) return 'running';
+  if (/\bSTOPPED\b/.test(r.stdout)) return 'stopped';
+  return 'unknown';
+}
+
+/** START_PENDING / STOP_PENDING — the SCM accepted the request and the
+ *  transition is in flight. Genuinely inconclusive, and said as such rather
+ *  than rounded to the outcome we were hoping for. */
+function isPending(stdout: string): boolean {
+  return /\b(START_PENDING|STOP_PENDING)\b/.test(stdout);
+}
+
+function isAlreadyRunning(r: { code: number; stdout: string; stderr: string }): boolean {
+  return r.code === ERROR_SERVICE_ALREADY_RUNNING || /1056|already running/i.test(`${r.stdout}\n${r.stderr}`);
+}
+
+function isNotActive(r: { code: number; stdout: string; stderr: string }): boolean {
+  return r.code === ERROR_SERVICE_NOT_ACTIVE || /1062|has not been started/i.test(`${r.stdout}\n${r.stderr}`);
+}
+
+/** x24: name elevation when — and only when — it is what actually went wrong.
+ *  A blanket "try Administrator" on every failure trains people to ignore it. */
+function elevationHint(r: { code: number; stdout: string; stderr: string }, what: string): string {
+  const denied = r.code === ERROR_ACCESS_DENIED || /access is denied|\b5\b\s*:\s*access/i.test(`${r.stdout}\n${r.stderr}`);
+  return denied ? `\nhint: ${what} requires an elevated (Administrator) shell.` : '';
+}
+
+/** x24: `start`/`restart` against a service the SCM has never heard of. */
+function notInstalled(name: string, verb: string): ServiceError {
+  return new ServiceError(
+    `service '${name}' is not installed — there is nothing to ${verb}.\n` +
+      'hint: install it first (`pipeline-runner service install`, which needs an elevated shell), or run a ' +
+      'supervisor in the foreground (`pipeline-runner start`).'
+  );
+}
+
+function winResult(
+  action: ServiceResult['action'],
+  ctx: ServiceContext,
+  state: ServiceState,
+  commands: RanCommand[],
+  messages: string[]
+): ServiceResult {
+  return { action, backend: 'windows', platform: ctx.platform, definitionPath: null, state, commands, messages };
+}
+
 class WindowsBackend implements ServiceBackend {
   readonly id = 'windows';
 
@@ -206,6 +266,129 @@ class WindowsBackend implements ServiceBackend {
       definitionPath: null,
       commands,
       messages: [`deleted Windows service '${name}'`],
+    };
+  }
+
+  // ── x24: start / stop / restart ───────────────────────────────────────────
+
+  start(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const commands: RanCommand[] = [];
+    const run = (args: string[]) => {
+      commands.push({ cmd: SC, args });
+      return ctx.exec.run(SC, args);
+    };
+    const name = plan.identity.serviceName;
+
+    const before = queryState(run(['query', name]));
+    if (before === 'missing') throw notInstalled(name, 'start');
+    if (before === 'running') {
+      return winResult('start', ctx, 'running', commands, [`service '${name}' is already running — nothing to do`]);
+    }
+
+    const started = run(['start', name]);
+    if (started.code !== 0) {
+      // 1056 = ERROR_SERVICE_ALREADY_RUNNING. It raced us between the query
+      // above and here — the end state is the wanted one, so this is success.
+      if (isAlreadyRunning(started)) {
+        return winResult('start', ctx, 'running', commands, [`service '${name}' was already running — nothing to do`]);
+      }
+      throw new ServiceError(
+        `\`${SC} start ${name}\` failed (exit ${started.code})` +
+          `${started.stderr ? `: ${started.stderr.trim()}` : ''}${elevationHint(started, 'starting a service')}`
+      );
+    }
+
+    // `sc start` returns as soon as the SCM ACCEPTS the request, so its exit
+    // code is not evidence the process is up. Re-query and report exactly what
+    // was seen — including the genuinely inconclusive START_PENDING, which the
+    // wrapper caveat at the top of this file makes a normal outcome here.
+    const after = run(['query', name]);
+    const state = queryState(after);
+    if (state === 'running') {
+      return winResult('start', ctx, 'running', commands, [
+        `started service '${name}'`,
+        `check it: ${SC} query ${name}`,
+      ]);
+    }
+    if (isPending(after.stdout)) {
+      return winResult('start', ctx, 'unknown', commands, [
+        `requested start of service '${name}'; the SCM reports START_PENDING`,
+        `it is not confirmed running yet — check it: ${SC} query ${name}`,
+      ]);
+    }
+    throw new ServiceError(
+      `\`${SC} start ${name}\` was accepted but the service is not running (${after.stdout.trim() || 'no state reported'}) — ` +
+        'a script-backed service that exits immediately looks exactly like this; see the WinSW/NSSM wrapper caveat, ' +
+        `and check the daemon by hand: pipeline-runner start`
+    );
+  }
+
+  stop(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const commands: RanCommand[] = [];
+    const run = (args: string[]) => {
+      commands.push({ cmd: SC, args });
+      return ctx.exec.run(SC, args);
+    };
+    const name = plan.identity.serviceName;
+
+    const before = queryState(run(['query', name]));
+    if (before === 'missing') {
+      return winResult('stop', ctx, 'not-installed', commands, [`service '${name}' is not installed — nothing to stop`]);
+    }
+    if (before === 'stopped') {
+      return winResult('stop', ctx, 'stopped', commands, [`service '${name}' is already stopped — nothing to do`]);
+    }
+
+    const stopped = run(['stop', name]);
+    if (stopped.code !== 0) {
+      // 1062 = ERROR_SERVICE_NOT_ACTIVE — it stopped between the query and
+      // here. The wanted end state holds, so this is success, not a failure.
+      if (isNotActive(stopped)) {
+        return winResult('stop', ctx, 'stopped', commands, [`service '${name}' was already stopped — nothing to do`]);
+      }
+      throw new ServiceError(
+        `\`${SC} stop ${name}\` failed (exit ${stopped.code})` +
+          `${stopped.stderr ? `: ${stopped.stderr.trim()}` : ''}${elevationHint(stopped, 'stopping a service')}`
+      );
+    }
+
+    const after = run(['query', name]);
+    const state = queryState(after);
+    if (state === 'stopped') {
+      return winResult('stop', ctx, 'stopped', commands, [
+        `stopped service '${name}'`,
+        `it is still registered and will start again at boot — \`pipeline-runner service uninstall\` removes it`,
+      ]);
+    }
+    if (isPending(after.stdout)) {
+      return winResult('stop', ctx, 'unknown', commands, [
+        `requested stop of service '${name}'; the SCM reports STOP_PENDING`,
+        `it is not confirmed stopped yet — check it: ${SC} query ${name}`,
+      ]);
+    }
+    throw new ServiceError(
+      `\`${SC} stop ${name}\` was accepted but the service is still not stopped ` +
+        `(${after.stdout.trim() || 'no state reported'}) — check it: ${SC} query ${name}`
+    );
+  }
+
+  restart(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const name = plan.identity.serviceName;
+    const probe = ctx.exec.run(SC, ['query', name]);
+    if (queryState(probe) === 'missing') throw notInstalled(name, 'restart');
+
+    // The SCM has no restart verb, so this is genuinely stop-then-start and is
+    // composed out of the two above rather than re-implemented — including
+    // their tolerance of "already stopped" and their post-action verification.
+    // The probe above is what keeps the composed pair from reporting the
+    // not-installed case as `stop`'s benign no-op.
+    const stopped = this.stop(plan, ctx);
+    const started = this.start(plan, ctx);
+    return {
+      ...started,
+      action: 'restart',
+      commands: [{ cmd: SC, args: ['query', name] }, ...stopped.commands, ...started.commands],
+      messages: [...stopped.messages, ...started.messages],
     };
   }
 

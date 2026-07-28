@@ -79,6 +79,42 @@ function withLoginctlHint(stderr: string): string {
   return '';
 }
 
+/** `systemctl is-active` prints one word; anything but `active` is not up
+ *  (`inactive`, `failed`, `activating`, and — for a unit systemd has never
+ *  heard of — `unknown` with a non-zero exit). */
+function isActive(r: { stdout: string }): boolean {
+  return r.stdout.trim() === 'active';
+}
+
+/** `systemctl is-enabled` — `enabled` (or `enabled-runtime`) means it comes
+ *  back at boot/login. */
+function isEnabled(r: { stdout: string }): boolean {
+  return /^enabled(-runtime)?$/.test(r.stdout.trim());
+}
+
+/** x24: `start`/`restart` on a unit that does not exist. A `start` that
+ *  started nothing must not exit 0, and the message must name the verb that
+ *  actually helps — which is `install`, precisely BECAUSE this one refuses to
+ *  pretend it can substitute for it. */
+function notInstalled(unit: string, unitPath: string, verb: string): ServiceError {
+  return new ServiceError(
+    `${unit} is not installed (no unit at ${unitPath}) — there is nothing to ${verb}.\n` +
+      'hint: install it first (`pipeline-runner service install`), or run a supervisor in the foreground ' +
+      '(`pipeline-runner start`).'
+  );
+}
+
+function result(
+  action: ServiceResult['action'],
+  ctx: ServiceContext,
+  unitPath: string,
+  state: ServiceState,
+  commands: RanCommand[],
+  messages: string[]
+): ServiceResult {
+  return { action, backend: 'systemd', platform: ctx.platform, definitionPath: unitPath, state, commands, messages };
+}
+
 class SystemdBackend implements ServiceBackend {
   readonly id = 'systemd';
 
@@ -177,6 +213,119 @@ class SystemdBackend implements ServiceBackend {
       commands,
       messages: [`disabled + removed ${unit}`, `deleted unit: ${unitPath}`],
     };
+  }
+
+  // ── x24: start / stop / restart ───────────────────────────────────────────
+
+  start(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const commands: RanCommand[] = [];
+    const run = (args: string[]) => {
+      commands.push({ cmd: SYSTEMCTL, args });
+      return ctx.exec.run(SYSTEMCTL, args);
+    };
+    const unit = systemdUnitName(plan);
+    const unitPath = systemdUnitPath(plan, ctx.env);
+
+    if (!ctx.fs.exists(unitPath)) throw notInstalled(unit, unitPath, 'start');
+    if (isActive(run([USER, 'is-active', unit]))) {
+      return result('start', ctx, unitPath, 'running', commands, [`${unit} is already running — nothing to do`]);
+    }
+
+    const started = run([USER, 'start', unit]);
+    if (started.code !== 0) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} start ${unit}\` failed (exit ${started.code})` +
+          `${started.stderr ? `: ${started.stderr.trim()}` : ''}${withLoginctlHint(started.stderr)}`
+      );
+    }
+    // The exit code says the REQUEST was accepted; only `is-active` says the
+    // unit is up. A unit whose ExecStart dies immediately exits 0 here.
+    if (!isActive(run([USER, 'is-active', unit]))) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} start ${unit}\` returned success but ${unit} is NOT active — it started and exited. ` +
+          `Look at why: systemctl --user status ${unit} ; journalctl --user -u ${unit} -n 50`
+      );
+    }
+
+    const messages = [`started ${unit}`, `check it: systemctl --user status ${unit}`];
+    // `start` starts; it does not enable. Saying so is the difference between
+    // a supervisor that is up now and one that is up after the next reboot.
+    if (!isEnabled(run([USER, 'is-enabled', unit]))) {
+      messages.push(
+        `note: ${unit} is NOT enabled, so it will not come back at boot/login. Enable it with ` +
+          `\`pipeline-runner service install\` (idempotent) or \`systemctl --user enable ${unit}\`.`
+      );
+    }
+    return result('start', ctx, unitPath, 'running', commands, messages);
+  }
+
+  stop(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const commands: RanCommand[] = [];
+    const run = (args: string[]) => {
+      commands.push({ cmd: SYSTEMCTL, args });
+      return ctx.exec.run(SYSTEMCTL, args);
+    };
+    const unit = systemdUnitName(plan);
+    const unitPath = systemdUnitPath(plan, ctx.env);
+
+    if (!ctx.fs.exists(unitPath)) {
+      return result('stop', ctx, unitPath, 'not-installed', commands, [`${unit} is not installed — nothing to stop`]);
+    }
+    if (!isActive(run([USER, 'is-active', unit]))) {
+      return result('stop', ctx, unitPath, 'stopped', commands, [`${unit} is already stopped — nothing to do`]);
+    }
+
+    const stopped = run([USER, 'stop', unit]);
+    if (stopped.code !== 0) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} stop ${unit}\` failed (exit ${stopped.code})` +
+          `${stopped.stderr ? `: ${stopped.stderr.trim()}` : ''}${withLoginctlHint(stopped.stderr)}`
+      );
+    }
+    if (isActive(run([USER, 'is-active', unit]))) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} stop ${unit}\` returned success but ${unit} is STILL active — check ` +
+          `\`systemctl --user status ${unit}\``
+      );
+    }
+
+    return result('stop', ctx, unitPath, 'stopped', commands, [
+      `stopped ${unit}`,
+      // Stopping is not disabling; a still-enabled unit is back after a reboot.
+      `it is still installed and will start again at boot/login — \`pipeline-runner service uninstall\` removes it`,
+    ]);
+  }
+
+  restart(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
+    const commands: RanCommand[] = [];
+    const run = (args: string[]) => {
+      commands.push({ cmd: SYSTEMCTL, args });
+      return ctx.exec.run(SYSTEMCTL, args);
+    };
+    const unit = systemdUnitName(plan);
+    const unitPath = systemdUnitPath(plan, ctx.env);
+
+    if (!ctx.fs.exists(unitPath)) throw notInstalled(unit, unitPath, 'restart');
+
+    // `systemctl restart` starts a stopped unit rather than failing, which is
+    // exactly the semantics wanted here: "make it be running, freshly".
+    const restarted = run([USER, 'restart', unit]);
+    if (restarted.code !== 0) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} restart ${unit}\` failed (exit ${restarted.code})` +
+          `${restarted.stderr ? `: ${restarted.stderr.trim()}` : ''}${withLoginctlHint(restarted.stderr)}`
+      );
+    }
+    if (!isActive(run([USER, 'is-active', unit]))) {
+      throw new ServiceError(
+        `\`${SYSTEMCTL} ${USER} restart ${unit}\` returned success but ${unit} is NOT active — it started and exited. ` +
+          `Look at why: systemctl --user status ${unit} ; journalctl --user -u ${unit} -n 50`
+      );
+    }
+    return result('restart', ctx, unitPath, 'running', commands, [
+      `restarted ${unit}`,
+      `check it: systemctl --user status ${unit}`,
+    ]);
   }
 
   status(plan: ServicePlan, ctx: ServiceContext): ServiceResult {
