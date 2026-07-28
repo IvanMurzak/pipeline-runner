@@ -1,0 +1,45 @@
+README.md
+  s_ac0d8cfb5e5a91::t_de39ca6431eb26 43-45,51-53,113-137,253-260,272-320,371-373,375-377
+src/cli.ts
+  s_ac0d8cfb5e5a91::t_be3fa777dcaad5 50-71,125-128,137-147,215,217-220,788-803,854-872,956-1014,1043-1046
+src/department/engine.ts
+  s_ac0d8cfb5e5a91::t_779f33c12a0e44 526-563
+src/department/journal-read.test.ts
+  s_ac0d8cfb5e5a91::t_6dd0038959bcf0 1-364
+src/department/journal-read.ts
+  s_ac0d8cfb5e5a91::t_bb62e39fc68c55 1-511
+src/service/index.ts
+  s_ac0d8cfb5e5a91::t_f97e33016ac104 12,14,36-38,122-148,172,177-180,233-245
+src/service/inspect.ts
+  s_ac0d8cfb5e5a91::t_43ea4eabf1ca18 1-210
+src/service/launchd.ts
+  s_ac0d8cfb5e5a91::t_729001d0afa4d6 82-151,224-322
+src/service/systemd.ts
+  s_ac0d8cfb5e5a91::t_03748d97aa97d5 82-117,218-330
+src/service/types.ts
+  s_ac0d8cfb5e5a91::t_eb862c11bfd40f 60-71,74,119-149
+src/service/windows.ts
+  s_ac0d8cfb5e5a91::t_5793dec0b15f0c 112-171,272-394
+tests/cli.test.ts
+  s_ac0d8cfb5e5a91::t_642a0bfa2b7966 11-13,18-23,31-41,98,105,111-286
+tests/service.inspect.test.ts
+  s_ac0d8cfb5e5a91::t_512718c191d7df 1-199
+tests/service.lifecycle.test.ts
+  s_ac0d8cfb5e5a91::t_506ef49289049b 1-443
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "c4b8817f27ec1de03401c8725b5112ad904dba6a",
+  "prompts": {},
+  "sessions": {
+    "s_ac0d8cfb5e5a91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e0434d5a-da92-4407-b398-3f5e8643c5bd",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
