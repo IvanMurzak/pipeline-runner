@@ -16,13 +16,35 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { CaptureLogger, FakeClock } from '../../tests/_helpers';
+import { DeptEventMessageSchema } from '@baizor/pipeline-protocol';
+import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
+import { Dispatcher } from '../core/dispatcher';
+import type { WireFrame } from '../core/wire';
 import { DRIVE_COMPLETED, DRIVE_HALTED, DRIVE_PROVIDER_LIMIT, FakeJobExec, driveAwaiting } from '../jobs/_helpers';
 import type { JobExec, JobExecResult } from '../jobs/types';
-import type { DeptMessage, InvocationEnvelope, PipelineDriveSpec, RuntimeEvent } from './adapter';
+import type { DeptMessage, InvocationEnvelope, PipelineDriveSpec, RuntimeConfig, RuntimeEvent } from './adapter';
 import { RuntimeAdapterError } from './adapter';
 import { makeMessage, makeTaskSpec } from './_test-helpers';
-import { PIPELINE_DRIVE_CAPABILITIES, PipelineDriveAdapter, narrowPipelineDriveSpec } from './pipeline-drive';
+import type { DepartmentOfferInput, JournalWriter } from './manager';
+import { DepartmentManager } from './manager';
+import {
+  DRIVE_STARTED_STATUS_MESSAGE,
+  PIPELINE_DRIVE_CAPABILITIES,
+  PipelineDriveAdapter,
+  narrowPipelineDriveSpec,
+} from './pipeline-drive';
+
+/**
+ * x40: the `{type:'status', state:'WORKING'}` announcement every `runOnce()`
+ * makes immediately before it spawns its `pipeline drive` child — so a
+ * `pipeline`-engine task leaves `SUBMITTED` while it runs instead of staying
+ * `queued` to its sender for the whole invocation.
+ *
+ * Written into every ordered `toEqual` below rather than filtered out of them,
+ * because the ORDER is the fix: an announcement that does not precede the
+ * event it exists to unblock is not one.
+ */
+const DRIVE_STARTED: RuntimeEvent = { type: 'status', state: 'WORKING', message: DRIVE_STARTED_STATUS_MESSAGE };
 
 function makeDriveSpec(overrides: Partial<PipelineDriveSpec> = {}): PipelineDriveSpec {
   return {
@@ -126,7 +148,7 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'completed', summary: 'completed' }]);
+    expect(events).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 
   test('exit 1 (halted) → RuntimeEvent failed, retrySafe:false', async () => {
@@ -135,7 +157,7 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'failed', reason: 'step 02 halted: tests failed', retrySafe: false }]);
+    expect(events).toEqual([DRIVE_STARTED, { type: 'failed', reason: 'step 02 halted: tests failed', retrySafe: false }]);
   });
 
   test('exit 2 (usage error) → RuntimeEvent failed', async () => {
@@ -145,6 +167,7 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
     expect(events).toEqual([
+      DRIVE_STARTED,
       { type: 'failed', reason: 'pipeline drive usage error (exit 2): pipeline drive: --start is required', retrySafe: false },
     ]);
   });
@@ -155,7 +178,10 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'failed', reason: 'pipeline drive did not run: spawn pipeline ENOENT', retrySafe: false }]);
+    expect(events).toEqual([
+      DRIVE_STARTED,
+      { type: 'failed', reason: 'pipeline drive did not run: spawn pipeline ENOENT', retrySafe: false },
+    ]);
   });
 
   test('exit 4 (awaiting_input) → RuntimeEvent input_required, question_id passed through verbatim', async () => {
@@ -165,6 +191,7 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
     expect(events).toEqual([
+      DRIVE_STARTED,
       {
         type: 'input_required',
         questionId: 'drive-q-42',
@@ -180,6 +207,7 @@ describe('PipelineDriveAdapter — outcome mapping (classifyDriveOutcome, unchan
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
     expect(events).toEqual([
+      DRIVE_STARTED,
       { type: 'input_required', questionId: 'minted-1', question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] } },
     ]);
   });
@@ -199,6 +227,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     await adapter.start(makeInvocation({ taskId: 'dtask-park-1' }), (e) => events1.push(e));
     await flush();
     expect(events1).toEqual([
+      DRIVE_STARTED,
       { type: 'input_required', questionId: 'q-1', question: { text: 'Which host?', context: 'ctx', options: ['a', 'b'] } },
     ]);
     expect(exec.calls[0]!.args).toContain('steps/01-plan.md');
@@ -229,7 +258,11 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
       '--json',
     ]);
     expect(exec.calls[1]!.args).not.toContain('steps/01-plan.md');
-    expect(events2).toEqual([{ type: 'completed', summary: 'completed' }]);
+    // x40: the RESPAWN announces its own invocation too. It restates a state
+    // the cloud has already taken itself (`INPUT_REQUIRED -> WORKING` on the
+    // sender's answer), and can never reach a still-parked task — this line is
+    // only ever reached with an answer already in hand.
+    expect(events2).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 
   test('a SECOND park mid-resume overwrites the remembered iteration for the NEXT answer', async () => {
@@ -253,6 +286,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     );
     await flush();
     expect(events2).toEqual([
+      DRIVE_STARTED,
       { type: 'input_required', questionId: 'q-2', question: { text: 'Which region?', context: 'ctx', options: ['a', 'b'] } },
     ]);
     expect(exec.calls[1]!.args).toContain('steps/02-deploy.md'); // resumed at the FIRST park
@@ -266,7 +300,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     await flush();
     expect(exec.calls[2]!.args).toContain('steps/03-verify.md'); // the SECOND park's iteration, not the first
     expect(exec.calls[2]!.args).toContain('eu-west');
-    expect(events3).toEqual([{ type: 'completed', summary: 'completed' }]);
+    expect(events3).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 
   test('a respawn whose replayed history has no usable answer text fails cleanly instead of resuming with a blank --answer', async () => {
@@ -289,6 +323,10 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     await flush();
 
     expect(exec.calls).toHaveLength(1); // no second exec was even attempted
+    // x40, and this is the whole point of announcing where it is announced:
+    // NO `status` here. This branch never launches a child, so it never claims
+    // one started — the announcement means "a drive invocation is being
+    // spawned", not "an execution was admitted".
     expect(events2).toEqual([
       {
         type: 'failed',
@@ -318,7 +356,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
       (e) => events2.push(e)
     );
     await flush();
-    expect(events2).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
+    expect(events2).toEqual([DRIVE_STARTED, { type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
     expect(exec.calls[1]!.args).toContain('--answer');
 
     // A later start() for the SAME taskId (whatever triggers it) still
@@ -331,7 +369,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     await flush();
     expect(exec.calls[2]!.args).toContain('steps/02-deploy.md');
     expect(exec.calls[2]!.args).not.toContain('steps/01-plan.md');
-    expect(events3).toEqual([{ type: 'completed', summary: 'completed' }]);
+    expect(events3).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 });
 
@@ -381,7 +419,7 @@ describe('PipelineDriveAdapter — bounding parked-resume state (leak fix: cance
     expect(exec.calls[2]!.args).toContain('steps/01-plan.md'); // the ORIGINAL configured start, not a resume
     expect(exec.calls[2]!.args).not.toContain('--answer');
     expect(exec.calls[2]!.args).not.toContain('--resume');
-    expect(eventsA).toEqual([{ type: 'completed', summary: 'completed' }]);
+    expect(eventsA).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 
   test('a hard ceiling bounds the map even without any TTL elapsing — oldest-parked entry is evicted first', async () => {
@@ -443,7 +481,7 @@ describe('PipelineDriveAdapter — provider limits (06.7, precedence over exit-c
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
+    expect(events).toEqual([DRIVE_STARTED, { type: 'failed', reason: 'pipeline drive provider limit: usage limit', retrySafe: true }]);
   });
 
   test('a custom detectProviderLimit is honored', async () => {
@@ -452,7 +490,10 @@ describe('PipelineDriveAdapter — provider limits (06.7, precedence over exit-c
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'failed', reason: 'pipeline drive provider limit: custom throttle hit', retrySafe: true }]);
+    expect(events).toEqual([
+      DRIVE_STARTED,
+      { type: 'failed', reason: 'pipeline drive provider limit: custom throttle hit', retrySafe: true },
+    ]);
   });
 
   test('a completed run is never limit-paused even if the detector would otherwise fire on stray text', async () => {
@@ -461,7 +502,7 @@ describe('PipelineDriveAdapter — provider limits (06.7, precedence over exit-c
     const events: RuntimeEvent[] = [];
     await adapter.start(makeInvocation(), (e) => events.push(e));
     await flush();
-    expect(events).toEqual([{ type: 'completed', summary: 'completed' }]);
+    expect(events).toEqual([DRIVE_STARTED, { type: 'completed', summary: 'completed' }]);
   });
 });
 
@@ -471,14 +512,43 @@ describe('PipelineDriveAdapter — fire-and-forget safety (unhandled rejection g
     const logger = new CaptureLogger();
     const adapter = new PipelineDriveAdapter({ exec, logger });
     let sinkCalls = 0;
-    await adapter.start(makeInvocation(), () => {
+    // Throws on the TERMINAL event only — the original subject of this test.
+    // x40 added an earlier `status` call to the same sink, and letting that one
+    // throw here would have silently retargeted the test at the announcement
+    // and stopped covering the terminal at all (the exec never runs if the
+    // announcement throws — see the next test, which covers that separately).
+    await adapter.start(makeInvocation(), (event) => {
       sinkCalls += 1;
-      throw new Error('sink boom');
+      if (event.type !== 'status') throw new Error('sink boom');
     });
     await flush();
-    expect(sinkCalls).toBe(1);
+    expect(sinkCalls).toBe(2);
     expect(
       logger.lines.some((l) => l.includes('warn:') && l.includes('runOnce failed unexpectedly') && l.includes('sink boom'))
+    ).toBe(true);
+  });
+
+  test('x40: a sink that throws on the WORKING announcement is caught the same way, and no drive child is spawned', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const logger = new CaptureLogger();
+    const adapter = new PipelineDriveAdapter({ exec, logger });
+    let sinkCalls = 0;
+    await adapter.start(makeInvocation(), () => {
+      sinkCalls += 1;
+      throw new Error('announce boom');
+    });
+    await flush();
+
+    expect(sinkCalls).toBe(1);
+    // The announcement is emitted BEFORE `exec.run()`, so a throwing sink
+    // aborts `runOnce` before the child is spawned. That is the honest cost of
+    // announcing before the spawn rather than after it, and it is bounded the
+    // same way every other `runOnce` throw is: caught by `start()`'s
+    // `.catch()`, logged, never an unhandled rejection that takes the daemon
+    // down (see the module doc's fire-and-forget note).
+    expect(exec.calls).toHaveLength(0);
+    expect(
+      logger.lines.some((l) => l.includes('warn:') && l.includes('runOnce failed unexpectedly') && l.includes('announce boom'))
     ).toBe(true);
   });
 });
@@ -579,7 +649,10 @@ describe('PipelineDriveAdapter — cancel() / dispose() (07 §7)', () => {
     resolveExec!(DRIVE_COMPLETED);
     await flush();
 
-    expect(events).toEqual([]);
+    // x40: the WORKING announcement already went out inside `start()` — the
+    // child really was spawned — and nothing else follows it. The subject of
+    // this test is the TERMINAL: a late result after dispose() is dropped.
+    expect(events).toEqual([DRIVE_STARTED]);
   });
 
   test('cancel() ALONE (no dispose() call following) also suppresses a late result — its own doc comment promises this', async () => {
@@ -598,7 +671,7 @@ describe('PipelineDriveAdapter — cancel() / dispose() (07 §7)', () => {
     resolveExec!(DRIVE_COMPLETED);
     await flush();
 
-    expect(events).toEqual([]);
+    expect(events).toEqual([DRIVE_STARTED]); // x40's announcement only; no terminal
   });
 
   test('cancel() then dispose() (the DepartmentManager terminateExecution sequence) suppresses the eventual event', async () => {
@@ -619,7 +692,191 @@ describe('PipelineDriveAdapter — cancel() / dispose() (07 §7)', () => {
     resolveExec!({ code: null, stdout: '', stderr: '', error: 'aborted before spawn' });
     await flush();
 
-    expect(events).toEqual([]);
+    expect(events).toEqual([DRIVE_STARTED]); // x40's announcement only; no terminal
+  });
+});
+
+// ── x40: a `pipeline`-engine task leaves SUBMITTED ─────────────────────────
+//
+// The defect x36 fixed in `./claude-code.ts`, in the second engine that had
+// it. `{type:'status', state:'WORKING'}` is the ONLY event that moves a task
+// out of `SUBMITTED`; this adapter emitted none, ever, so a `pipeline`
+// department's task was rendered `queued` to its sender for the entire run and
+// its failures landed `REJECTED` (the only terminal reachable from SUBMITTED)
+// instead of `FAILED`.
+//
+// These tests run the manager for real — a real `PipelineDriveAdapter`, a real
+// `DepartmentManager`, a fake `pipeline` binary — because the claim is about
+// what reaches the WIRE, not about what an adapter hands its sink.
+
+/** In-memory journal, same shape `./manager.test.ts` and
+ *  `./manager.stuck.test.ts` each use. */
+class MemJournal implements JournalWriter {
+  lines = new Map<string, string[]>();
+  ensureDir(): void {}
+  appendLine(path: string, line: string): void {
+    const list = this.lines.get(path) ?? [];
+    list.push(line);
+    this.lines.set(path, list);
+  }
+  allParsed(): Array<Record<string, unknown>> {
+    return [...this.lines.values()].flat().map((line) => JSON.parse(line));
+  }
+}
+
+function makePipelineDepartment(exec: JobExec) {
+  const clock = new FakeClock();
+  const logger = new CaptureLogger();
+  const journal = new MemJournal();
+  const frames: WireFrame[] = [];
+  const dispatcher = new Dispatcher();
+  const adapter = new PipelineDriveAdapter({ exec, logger });
+  const runtime: RuntimeConfig = {
+    adapterId: 'pipeline-drive',
+    command: 'pipeline',
+    cwd: '/ws',
+    pipelineDrive: makeDriveSpec(),
+  };
+  const manager = new DepartmentManager({
+    adapters: [adapter],
+    resolveRuntimeConfig: (departmentId) => (departmentId === 'support-department' ? runtime : null),
+    send: (frame) => {
+      frames.push(frame);
+      return true;
+    },
+    dispatcher,
+    journal,
+    journalRoot: '/data/department',
+    clock,
+    logger,
+  });
+  manager.attach(dispatcher);
+  const offerFrame: WireFrame = {
+    type: 'department.offer',
+    execution_id: 'dexec-x40',
+    task_id: 'dtask-x40',
+    context_id: 'dctx-x40',
+    department_id: 'support-department',
+    attempt: 1,
+    lease_token: 'lease-x40',
+    lease_ttl_s: 900,
+    adapter: 'pipeline-drive',
+    accepted_output_modes: ['text/markdown'],
+    deadline_at: '2026-07-28T18:00:00.000Z',
+    event_seq_base: 0,
+    messages: [
+      { message_id: 'm1', role: 'ROLE_USER', parts: [{ text: 'answer this ticket' }], created_at: '2026-07-28T12:00:00.000Z' },
+    ],
+  };
+  /** The `event` payload of every shipped `department.event`, in order. */
+  const shipped = (): Array<Record<string, unknown>> =>
+    frames
+      .filter((f) => f.type === 'department.event')
+      .map((f) => (f as unknown as { event: Record<string, unknown> }).event);
+  return { manager, dispatcher, offerFrame, frames, shipped, journal, clock, logger, adapter };
+}
+
+/** Dispatch the offer and let the whole admission + fire-and-forget drive
+ *  chain settle. */
+async function runPipelineDepartment(rig: ReturnType<typeof makePipelineDepartment>): Promise<void> {
+  rig.dispatcher.dispatch(rig.offerFrame);
+  await tick();
+  await flush();
+}
+
+describe('x40 — a `pipeline`-engine task says it is WORKING', () => {
+  test('the WORKING announcement is the FIRST event of every start(), before anything the invocation reports', async () => {
+    const exec = new FakeJobExec(() => DRIVE_COMPLETED);
+    const adapter = new PipelineDriveAdapter({ exec });
+    const events: RuntimeEvent[] = [];
+    await adapter.start(makeInvocation(), (e) => events.push(e));
+    await flush();
+
+    expect(events[0]).toEqual(DRIVE_STARTED);
+    expect(events.filter((e) => e.type === 'status')).toHaveLength(1);
+  });
+
+  test('it is emitted BEFORE the drive child is spawned, not after it exits', async () => {
+    // The ordering claim in full: with a buffered `JobExec` the only signal
+    // available after the exec is the exit itself, so an announcement made
+    // there would be simultaneous with the terminal. This asserts the sink
+    // was already called when `exec.run()` was entered.
+    const seen: string[] = [];
+    const events: RuntimeEvent[] = [];
+    const exec: JobExec = {
+      run: async () => {
+        seen.push(`exec:${events.map((e) => e.type).join(',')}`);
+        return DRIVE_COMPLETED;
+      },
+    };
+    const adapter = new PipelineDriveAdapter({ exec });
+    await adapter.start(makeInvocation(), (e) => events.push(e));
+    await flush();
+
+    expect(seen).toEqual(['exec:status']);
+    expect(events.map((e) => e.type)).toEqual(['status', 'completed']);
+  });
+
+  test('through DepartmentManager it reaches the wire as a department.event status/WORKING, ahead of the terminal', async () => {
+    const rig = makePipelineDepartment(new FakeJobExec(() => DRIVE_COMPLETED));
+    await runPipelineDepartment(rig);
+
+    expect(rig.shipped().map((e) => e.type)).toEqual(['status', 'completed']);
+    expect(rig.shipped()[0]).toEqual({ type: 'status', state: 'WORKING', message: DRIVE_STARTED_STATUS_MESSAGE });
+    // The frame an older consumer receives is an ordinary, schema-valid one —
+    // no protocol change was needed for any of this (D35 / the `b4` precedent).
+    const statusFrame = rig.frames.filter((f) => f.type === 'department.event')[0]!;
+    expect(DeptEventMessageSchema.safeParse(statusFrame).success).toBe(true);
+    // Stated rather than glossed over: the announcement is emitted
+    // SYNCHRONOUSLY inside `start()`, so it OVERTAKES `department.accept`,
+    // which `handleOfferFrame` only sends once `admitTask` has resolved. That
+    // is harmless and already precedented — `x20`'s isolation refusal ships
+    // its terminal `department.event` before its reject frame the same way —
+    // because the cloud's accept handler persists nothing
+    // (`scheduler.ts#handleDepartmentAccept` is four anti-spoof checks and no
+    // writes) and its event handler resolves the execution from the lease,
+    // never from a prior accept. Exactly one accept is still sent.
+    expect(rig.frames[0]!.type).toBe('department.event');
+    expect(rig.frames.filter((f) => f.type === 'department.accept')).toHaveLength(1);
+  });
+
+  test('a drive that FAILS still announces first — which is what lets the cloud land it as FAILED rather than REJECTED', async () => {
+    const rig = makePipelineDepartment(new FakeJobExec(() => DRIVE_HALTED));
+    await runPipelineDepartment(rig);
+
+    expect(rig.shipped().map((e) => e.type)).toEqual(['status', 'failed']);
+    expect(rig.shipped()[1]).toMatchObject({ type: 'failed', reason: 'step 02 halted: tests failed' });
+  });
+
+  test('a parked run announces before parking, so INPUT_REQUIRED is reached from WORKING', async () => {
+    const rig = makePipelineDepartment(new FakeJobExec(() => driveAwaiting('steps/02-deploy.md', 'Which host?', 'q-1')));
+    await runPipelineDepartment(rig);
+
+    expect(rig.shipped().map((e) => e.type)).toEqual(['status', 'input_required']);
+  });
+
+  test('b4 is untouched: `pipeline` is still not a watched engine, and the announcement changes nothing about that', async () => {
+    // Two independent reasons this cannot have re-armed or retired b4, both
+    // asserted rather than argued:
+    //  1. `pipeline` declares `supportsStreaming: 'partial'` (`./engine.ts`),
+    //     so `resolveStuckAfterMs` returns null — the silence watchdog never
+    //     arms and `judgeTerminalEvent` returns early. Shape 2 was never
+    //     applicable to this engine and still is not.
+    //  2. `./manager.ts`'s runtime-signal count excludes `status` outright
+    //     (x36), engine-agnostically — so even on a watched engine this event
+    //     could not make "emitted NOT ONE signal" trivially false.
+    const rig = makePipelineDepartment(new FakeJobExec(() => DRIVE_COMPLETED));
+    await runPipelineDepartment(rig);
+
+    // A `completed` preceded ONLY by the announcement still stands as a
+    // completion — not rewritten to `stuck`.
+    expect(rig.shipped().map((e) => e.type)).toEqual(['status', 'completed']);
+    expect(rig.journal.allParsed().some((line) => line.type === 'department.failed')).toBe(false);
+
+    // And no watchdog fires however long the clock runs.
+    rig.clock.advance(100 * 30 * 60 * 1000);
+    await tick();
+    expect(rig.shipped().map((e) => e.type)).toEqual(['status', 'completed']);
   });
 });
 

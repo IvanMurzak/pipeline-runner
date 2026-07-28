@@ -306,6 +306,30 @@ describe('stuck detection — shape 2: the session ends having reported nothing 
     expect(reportedFailure(sink)).toBeNull();
     expect(journalledTypes(journal)).toContain('department.completed');
   });
+
+  test('x40: the same is true once a `pipeline` run announces itself — the announcement neither arms nor disarms anything here', async () => {
+    // `./pipeline-drive.ts` now emits one `{type:'status', state:'WORKING'}`
+    // per invocation, for the same reason `./claude-code.ts` does (x36): it is
+    // the only event that moves a task off SUBMITTED. Two independent things
+    // keep b4 exactly where it was, and both are asserted rather than argued:
+    //
+    //  1. `pipeline` is not a WATCHED engine at all (`supportsStreaming:
+    //     'partial'` ⇒ `resolveStuckAfterMs` returns null), so shape 2 was
+    //     never applicable to it and still is not — this `completed` stands.
+    //  2. Independently, `status` is excluded from the runtime-signal count
+    //     engine-agnostically, so the announcement could not have made
+    //     "emitted NOT ONE signal" trivially false even on a watched engine —
+    //     which the `claude-code` test above already proves directly.
+    const { manager, adapter, runtimes, sink, journal } = makeManager({ adapterId: 'pipeline-drive' });
+    runtimes.set('review-department', { adapterId: 'pipeline-drive', command: 'pipeline' });
+    await manager.admitTask(makeOffer({ departmentId: 'review-department' }));
+
+    adapter.emitLatest({ type: 'status', state: 'WORKING', message: 'pipeline drive invocation started' });
+    adapter.emitLatest({ type: 'completed', summary: 'drive finished' });
+
+    expect(reportedFailure(sink)).toBeNull();
+    expect(journalledTypes(journal)).toContain('department.completed');
+  });
 });
 
 describe('stuck detection — who is watched at all (the engine\'s own declaration, b2)', () => {

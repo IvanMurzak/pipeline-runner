@@ -188,6 +188,30 @@ describe('ExecutionTokenEndpoint — the seam D23 needed and b3 could not build'
     endpoint.stop();
   });
 
+  test('x38: a refusal is LOGGED — until now the one failure that silently costs a session its tools left no trace at all', async () => {
+    // The response stays a bare `401 {"error":"unauthorized"}` (the test above
+    // is the guard for that). The LOG is a different surface: without a line
+    // here, a helper that is refused is invisible everywhere — its own stderr
+    // explains the problem to Claude Code, which discards it. Four P4 gate
+    // runs could not tell "the helper was refused" from "the helper never
+    // ran", and this is the instrument that separates them.
+    const { endpoint, logger } = harness();
+    const one = (await endpoint.grant('exec-1'))!;
+
+    await ask(one.url, 'exec-1', 'not-the-secret');
+    await ask(one.url, 'exec-nonexistent', one.secret);
+    await fetch(`${one.url}?execution=exec-1`); // no bearer at all
+
+    const lines = logger.lines.filter((line) => line.includes('warn:'));
+    expect(lines.some((line) => line.includes('exec-1') && line.includes('does not match'))).toBe(true);
+    expect(lines.some((line) => line.includes('exec-nonexistent') && line.includes('no live grant'))).toBe(true);
+    expect(lines.some((line) => line.includes('without an execution id or a bearer'))).toBe(true);
+    // Never the credential, on any of the three.
+    expect(logger.joined()).not.toContain(one.secret);
+    expect(logger.joined()).not.toContain('not-the-secret');
+    endpoint.stop();
+  });
+
   test('a revoked execution is refused — the lease is gone, so the door is closed', async () => {
     const { endpoint } = harness();
     const a = (await endpoint.grant('exec-1'))!;
