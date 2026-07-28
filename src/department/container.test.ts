@@ -66,6 +66,7 @@ function makeContainerRuntimeConfig(overrides: Partial<RuntimeConfig> = {}): Run
 function makeContainerInvocation(overrides: ConformanceInvocationOverrides = {}): InvocationEnvelope {
   const { runtime: runtimeOverrides, task, ...rest } = overrides;
   return {
+    executionId: 'exec-1',
     ...rest,
     runtime: makeContainerRuntimeConfig(runtimeOverrides),
     task: task ?? makeTaskSpec(),

@@ -211,7 +211,15 @@ import type {
 } from './adapter';
 import type { ArtifactFileSystem } from './artifact-upload';
 import { uploadDepartmentArtifact } from './artifact-upload';
-import { adapterIdToEngine, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, isolationForAdapterId, lookupEngine } from './engine';
+import {
+  adapterIdToEngine,
+  ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_TOKEN_ENV,
+  ENGINE_MCP_URL_ENV,
+  isolationForAdapterId,
+  lookupEngine,
+} from './engine';
 import {
   buildDepartmentIndexEntry,
   buildDepartmentJournalEnvelope,
@@ -219,6 +227,7 @@ import {
   departmentJournalPath,
   senderFromMessages,
 } from './events';
+import type { ExecutionHeaderChannel, ExecutionHeaderChannelSource } from './execution-token-endpoint';
 import type { ExecutionTokenSource } from './execution-token-manager';
 
 // ── d6: pointing model-driven runtimes at the cloud MCP server ──────────────
@@ -239,6 +248,11 @@ import type { ExecutionTokenSource } from './execution-token-manager';
 // whole supervisor to learn what they are called. Same strings, same values.
 export const MESH_MCP_URL_ENV = ENGINE_MCP_URL_ENV;
 export const MESH_EXECUTION_TOKEN_ENV = ENGINE_MCP_TOKEN_ENV;
+// x21 (D33): the same supervisor↔engine contract, for the half that survives
+// the token above expiring. Injected only when `executionHeaderChannel` is
+// wired AND it could mint a grant — three states, exactly like the pair above.
+export const MESH_HELPER_URL_ENV = ENGINE_MCP_HELPER_URL_ENV;
+export const MESH_HELPER_SECRET_ENV = ENGINE_MCP_HELPER_SECRET_ENV;
 
 // ── The journal-writer seam (runner IS the journal writer here — unlike
 //    pipeline runs, where pipeline-cli writes events.jsonl, nothing external
@@ -308,6 +322,20 @@ export interface DepartmentManagerOptions {
    *  spawn and lease renewal skips the re-request — existing (pre-d6)
    *  behaviour, unchanged, for any caller that does not wire this. */
   executionTokens?: ExecutionTokenSource;
+  /**
+   * x21 (D33): the loopback re-auth channel a session's `headersHelper` calls
+   * back into (`./execution-token-endpoint.ts`). Absent ⇒ no
+   * `PIPELINE_MESH_HELPER_*` env is injected and every engine keeps its
+   * pre-x21 behaviour — for `claude-code`, a static header that works until
+   * the execution token's TTL runs out.
+   *
+   * Separate from `executionTokens` rather than folded into it on purpose:
+   * that one is a CACHE (it holds tokens), this one is a LISTENER (it holds a
+   * socket and per-execution grants). A caller may reasonably want the first
+   * without the second — `./mesh-relay.ts` and lease renewal both need the
+   * cache and neither needs a socket.
+   */
+  executionHeaderChannel?: ExecutionHeaderChannelSource;
   capacity?(): number;
   draining?(): boolean;
   /** `per-context` idle window before an inactive handle is disposed (the
@@ -810,6 +838,10 @@ export class DepartmentManager {
     // in-memory cache too, so nothing (a stray relay drain, a respawn race)
     // could ever hand it out again for a lease that is already gone.
     this.options.executionTokens?.discard(executionId);
+    // x21: "revoking the lease revokes the token" applies twice over to a
+    // channel whose entire purpose is minting NEW ones — a surviving grant
+    // here would let a straggling session re-authorize against a dead lease.
+    this.options.executionHeaderChannel?.revoke(executionId);
     // d3 (per code-review finding): this path deliberately bypasses
     // `reportTerminal` (see this method's doc), so it needs its OWN call to
     // reclaim the per-task artifact-budget entry — `reportTerminal` doing it
@@ -1058,6 +1090,10 @@ export class DepartmentManager {
 
   private async startWithInvocation(state: ExecutionState, task: DeptTaskSpec, mcpEnv: Record<string, string> | null): Promise<boolean> {
     const invocation: InvocationEnvelope = {
+      // x21 (D33): the id the engine module needs in order to name its own
+      // execution. The supervisor has held it since admission; until now it
+      // simply never crossed the adapter boundary.
+      executionId: state.executionId,
       runtime: mcpEnv === null ? state.runtime : { ...state.runtime, env: { ...state.runtime.env, ...mcpEnv } },
       task,
       // Enforcement is THIS manager's job (armDeadlineTimer, d2, 07 §7) —
@@ -1090,6 +1126,14 @@ export class DepartmentManager {
    * itself only exists because it IS leased here, but the AS is the source
    * of truth and this must degrade, not throw, either way). NEVER logs the
    * token itself — only the OAuth error code on failure.
+   *
+   * x21 (D33): when an `executionHeaderChannel` is wired, this ALSO mints the
+   * spawn's loopback re-auth grant and injects `PIPELINE_MESH_HELPER_URL` /
+   * `PIPELINE_MESH_HELPER_SECRET` alongside. A failed grant degrades to "no
+   * re-auth channel this spawn" for exactly the reason a failed token
+   * degrades to "no MCP env this spawn": admission is not allowed to depend
+   * on it, and a session with a static header is a session that works until
+   * its token expires — strictly better than one that never started.
    */
   private async resolveMcpEnv(state: ExecutionState): Promise<Record<string, string> | null> {
     if (this.options.executionTokens === undefined) return null;
@@ -1102,7 +1146,33 @@ export class DepartmentManager {
       );
       return null;
     }
-    return { [MESH_MCP_URL_ENV]: resourceUrl, [MESH_EXECUTION_TOKEN_ENV]: result.token.accessToken };
+    const env: Record<string, string> = { [MESH_MCP_URL_ENV]: resourceUrl, [MESH_EXECUTION_TOKEN_ENV]: result.token.accessToken };
+    const channel = await this.resolveHeaderChannel(state);
+    if (channel !== null) {
+      env[MESH_HELPER_URL_ENV] = channel.url;
+      env[MESH_HELPER_SECRET_ENV] = channel.secret;
+    }
+    return env;
+  }
+
+  /** x21: this spawn's loopback re-auth grant, or null. Swallows a rejected
+   *  `grant()` for the same reason `resolveMcpEnv` swallows a refused token —
+   *  a supervisor that fails admission because a CONVENIENCE could not be set
+   *  up has made the product worse, not safer. */
+  private async resolveHeaderChannel(state: ExecutionState): Promise<ExecutionHeaderChannel | null> {
+    if (this.options.executionHeaderChannel === undefined) return null;
+    try {
+      const channel = await this.options.executionHeaderChannel.grant(state.executionId);
+      if (channel === null) {
+        this.logger.warn(
+          `department execution ${state.executionId}: no local re-auth channel this spawn — a session that outlives its execution token will lose its receiver tools`
+        );
+      }
+      return channel;
+    } catch (err) {
+      this.logger.warn(`department execution ${state.executionId}: local re-auth channel unavailable (${describeError(err)})`);
+      return null;
+    }
   }
 
   private handleRuntimeEvent(state: ExecutionState, event: RuntimeEvent): void {
@@ -1226,6 +1296,10 @@ export class DepartmentManager {
     // useless from here on; drop the cache entry (see handleLeaseRevoked's
     // matching note).
     this.options.executionTokens?.discard(state.executionId);
+    // x21: and the loopback grant with it. The listener's whole exposure
+    // window is "an execution that might still need a fresh token is live";
+    // this is one of the two places that window closes.
+    this.options.executionHeaderChannel?.revoke(state.executionId);
     // d3 (per code-review finding): reclaim this task's artifact-budget
     // entry now that this execution is ending — see `releaseTaskArtifactBudgetIfIdle`'s
     // doc for why it only actually deletes when no OTHER execution of the

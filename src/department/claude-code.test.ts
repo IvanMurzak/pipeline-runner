@@ -24,10 +24,12 @@ import {
   assistantProgressNotes,
   buildClaudeArgs,
   buildDepartmentMcpConfig,
+  buildMcpHeadersHelperCommand,
   buildPromptLines,
   buildSessionContext,
   ClaudeCodeAdapter,
   DEPARTMENT_MCP_SERVER_NAME,
+  EXECUTION_ID_PATTERN,
   MAX_TRACKED_RECEIVER_CALLS,
   mcpServerStatus,
   narrowResultFrame,
@@ -39,11 +41,24 @@ import {
   toolResultOutcomes,
   UNREPORTED_FAILURE_REASON,
 } from './claude-code';
-import { ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, EngineMcpUnavailableError } from './engine';
+import {
+  ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_TOKEN_ENV,
+  ENGINE_MCP_URL_ENV,
+  EngineMcpUnavailableError,
+} from './engine';
 import { FakeJobSpawn, makeMessage, makeTaskSpec } from './_test-helpers';
 
 const MCP_URL = 'https://ai-pipeline.dev/mcp';
 const TOKEN = 'eyJhbGciOi-super-secret-execution-token';
+/** x21: the id the envelope now carries and the engine puts on the helper's
+ *  argv. An identifier, never a credential — see `InvocationEnvelope`. */
+const EXECUTION_ID = 'dexec-42';
+/** x21: the loopback grant the supervisor injects. BOTH are secrets in the
+ *  same sense the token is, and neither may reach a command line. */
+const HELPER_URL = 'http://127.0.0.1:51234/mcp-headers';
+const HELPER_SECRET = 'f00dbabe-loopback-grant-secret-32-bytes';
 
 /** A clock whose timers never fire on their own — every test that needs one to
  *  fire drives it explicitly, so nothing here depends on wall time. */
@@ -78,8 +93,9 @@ function capturingLogger(): Logger & { lines: string[] } {
   return { lines, debug: push, info: push, warn: push, error: push };
 }
 
-function makeMcpInvocation(overrides: Partial<InvocationEnvelope['runtime']> = {}): InvocationEnvelope {
+function makeMcpInvocation(overrides: Partial<InvocationEnvelope['runtime']> = {}, executionId = EXECUTION_ID): InvocationEnvelope {
   return {
+    executionId,
     runtime: {
       adapterId: 'claude-code',
       command: 'claude',
@@ -225,6 +241,159 @@ describe('the --mcp-config payload (D23)', () => {
     // Both at once would let a stale static header win the connect that the
     // helper exists to refresh.
     expect(server.headers).toBeUndefined();
+  });
+});
+
+// ── x21: the headers helper the module now builds for itself (D33) ─────────
+
+/** An adapter wired with deterministic paths, so the argv assertions below
+ *  read the command this module builds rather than the test runner's own
+ *  install locations. */
+function helperAdapter(spawn: FakeJobSpawn, options: { logger?: Logger & { lines: string[] }; scriptExists?: boolean } = {}): ClaudeCodeAdapter {
+  return new ClaudeCodeAdapter({
+    spawn,
+    clock: fakeClock(),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
+    bunPath: '/usr/local/bin/bun',
+    helperScriptPath: '/opt/pipeline-runner/src/department/mcp-headers-helper.ts',
+    helperScriptExists: () => options.scriptExists ?? true,
+  });
+}
+
+/** The `--mcp-config` entry the adapter actually spawned with. */
+function spawnedMcpServer(spawn: FakeJobSpawn): Record<string, unknown> {
+  const args = spawn.calls[spawn.calls.length - 1]!.args;
+  const json = args[args.indexOf('--mcp-config') + 1]!;
+  return (JSON.parse(json) as { mcpServers: Record<string, Record<string, unknown>> }).mcpServers[DEPARTMENT_MCP_SERVER_NAME]!;
+}
+
+const helperEnv = { [ENGINE_MCP_HELPER_URL_ENV]: HELPER_URL, [ENGINE_MCP_HELPER_SECRET_ENV]: HELPER_SECRET };
+
+describe('x21: surviving an execution token that expires mid-task (D23 as amended by D33)', () => {
+  test('buildMcpHeadersHelperCommand names the two paths and the execution — and nothing else', () => {
+    expect(
+      buildMcpHeadersHelperCommand({ executionId: 'dexec-42', bunPath: '/usr/local/bin/bun', scriptPath: '/opt/r/helper.ts' })
+    ).toBe('"/usr/local/bin/bun" "/opt/r/helper.ts" "dexec-42"');
+    // Windows paths quote the same way — the command is run with `shell:true`,
+    // which is `cmd.exe /d /s /c` there and `sh -c` everywhere else.
+    expect(
+      buildMcpHeadersHelperCommand({
+        executionId: 'dexec-42',
+        bunPath: 'C:\\Program Files\\bun\\bun.exe',
+        scriptPath: 'C:\\pipeline\\helper.ts',
+      })
+    ).toBe('"C:\\Program Files\\bun\\bun.exe" "C:\\pipeline\\helper.ts" "dexec-42"');
+  });
+
+  test('an execution id that is not an identifier is REFUSED, never escaped', () => {
+    // `execution_id` arrives from the cloud, and this command reaches a shell.
+    // An allow-list is the check that makes putting it there defensible;
+    // escaping for two shells at once is how injection bugs get written.
+    const attacks = ['exec-1"; rm -rf /', 'exec-1 && curl evil', '$(id)', '`id`', 'exec\n1', '%PATH%', ''];
+    for (const executionId of attacks) {
+      expect(buildMcpHeadersHelperCommand({ executionId, bunPath: '/bun', scriptPath: '/h.ts' })).toBeNull();
+    }
+    expect(EXECUTION_ID_PATTERN.test('dexec-42')).toBe(true);
+  });
+
+  test('an install path that cannot be quoted for both shells is refused too', () => {
+    for (const bunPath of ['/opt/b"n/bun', '/opt/$HOME/bun', '/opt/%TEMP%/bun', '/opt/bun\\']) {
+      expect(buildMcpHeadersHelperCommand({ executionId: 'dexec-42', bunPath, scriptPath: '/h.ts' })).toBeNull();
+    }
+  });
+
+  test('with a loopback grant injected, the session gets a headersHelper instead of a static header', async () => {
+    const spawn = new FakeJobSpawn();
+    await startSession({ spawn, adapter: helperAdapter(spawn), invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }) });
+
+    const server = spawnedMcpServer(spawn);
+    // The mechanism D23 specified and b3 could not build: re-runs on connect
+    // and automatically on 401/403, so a token that dies mid-task is replaced
+    // instead of ending the session's ability to report anything.
+    expect(server.headersHelper).toBe('"/usr/local/bin/bun" "/opt/pipeline-runner/src/department/mcp-headers-helper.ts" "dexec-42"');
+    expect(server.headers).toBeUndefined();
+  });
+
+  test('the helper command names the execution — which is why the envelope had to carry it', async () => {
+    const spawn = new FakeJobSpawn();
+    await startSession({
+      spawn,
+      adapter: helperAdapter(spawn),
+      invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }, 'dexec-other'),
+    });
+    expect(spawnedMcpServer(spawn).headersHelper).toContain('"dexec-other"');
+  });
+
+  test('neither the bearer nor the loopback secret is anywhere on the command line', async () => {
+    const spawn = new FakeJobSpawn();
+    await startSession({ spawn, adapter: helperAdapter(spawn), invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }) });
+
+    const call = spawn.calls[spawn.calls.length - 1]!;
+    const argv = [call.cmd, ...call.args].join(' ');
+    // x20's standard, applied to a second command line: `/proc/<pid>/cmdline`
+    // is world-readable (0444), `/proc/<pid>/environ` is owner-only (0400).
+    // Both credentials travel by environment; the argv carries two paths and
+    // an identifier.
+    expect(argv).not.toContain(TOKEN);
+    expect(argv).not.toContain(HELPER_SECRET);
+    expect(argv).not.toContain(HELPER_URL);
+    // …and both are in the environment block that was actually passed.
+    expect(call.opts?.env?.[ENGINE_MCP_HELPER_SECRET_ENV]).toBe(HELPER_SECRET);
+    expect(call.opts?.env?.[ENGINE_MCP_TOKEN_ENV]).toBe(TOKEN);
+  });
+
+  test('no grant injected ⇒ the pre-x21 static header, unchanged — this is the normal degraded state', async () => {
+    const spawn = new FakeJobSpawn();
+    await startSession({ spawn, adapter: helperAdapter(spawn) });
+    const server = spawnedMcpServer(spawn);
+    expect(server.headersHelper).toBeUndefined();
+    expect(server.headers).toEqual({ Authorization: `Bearer \${${ENGINE_MCP_TOKEN_ENV}}` });
+  });
+
+  test('half a grant is no grant — a URL without a secret is not wired', async () => {
+    const spawn = new FakeJobSpawn();
+    await startSession({
+      spawn,
+      adapter: helperAdapter(spawn),
+      invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, [ENGINE_MCP_HELPER_URL_ENV]: HELPER_URL } }),
+    });
+    expect(spawnedMcpServer(spawn).headersHelper).toBeUndefined();
+  });
+
+  test('a missing helper program falls back to the static header, loudly — a helper pointing at nothing breaks the CONNECT', async () => {
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    await startSession({
+      spawn,
+      adapter: helperAdapter(spawn, { logger, scriptExists: false }),
+      invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }),
+    });
+    expect(spawnedMcpServer(spawn).headersHelper).toBeUndefined();
+    expect(spawnedMcpServer(spawn).headers).toBeDefined();
+    expect(logger.lines.join('\n')).toContain('cannot re-authorize');
+  });
+
+  test('an unquotable execution id falls back rather than refusing to start (D24 is about reporting NOTHING)', async () => {
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    await startSession({
+      spawn,
+      adapter: helperAdapter(spawn, { logger }),
+      invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }, 'exec"; id #'),
+    });
+    expect(spawnedMcpServer(spawn).headersHelper).toBeUndefined();
+    expect(logger.lines.join('\n')).toContain('not safe to place in a shell command');
+  });
+
+  test('an operator-configured helper still wins over the one we build', async () => {
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), headersHelper: '/opt/site/mcp-headers' });
+    await startSession({
+      spawn,
+      adapter,
+      invocation: makeMcpInvocation({ env: { [ENGINE_MCP_URL_ENV]: MCP_URL, [ENGINE_MCP_TOKEN_ENV]: TOKEN, ...helperEnv } }),
+    });
+    expect(spawnedMcpServer(spawn).headersHelper).toBe('/opt/site/mcp-headers');
   });
 });
 

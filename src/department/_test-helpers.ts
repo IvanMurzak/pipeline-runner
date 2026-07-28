@@ -160,6 +160,9 @@ export function makeRuntimeConfig(overrides: Partial<RuntimeConfig> = {}): Runti
 
 export function makeInvocation(overrides: Partial<InvocationEnvelope> = {}): InvocationEnvelope {
   return {
+    // x21: required on the envelope since D33 — an engine module must be able
+    // to name its own execution.
+    executionId: 'exec-1',
     runtime: makeRuntimeConfig(),
     task: makeTaskSpec(),
     ...overrides,

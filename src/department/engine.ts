@@ -279,15 +279,72 @@ export interface EngineModule extends AgentRuntimeAdapter {
 export const ENGINE_MCP_URL_ENV = 'PIPELINE_MESH_MCP_URL';
 export const ENGINE_MCP_TOKEN_ENV = 'PIPELINE_MESH_EXECUTION_TOKEN';
 
+/**
+ * x21 (D33) — the OTHER half of responsibility 3, the half D23 specified and
+ * `b3` could not build: not "a token for this spawn" but "a way to get the
+ * NEXT one".
+ *
+ * The two variables above are fixed at spawn. `./manager.ts:511-521` states
+ * outright that a renewal "does not (cannot) push a new token into an
+ * already-running process", so a session that outlives its execution token's
+ * TTL loses every receiver tool it has — including `task.complete` and
+ * `task.fail` — and (pre-`x16`) reported success anyway.
+ *
+ * These two point at a LOOPBACK endpoint the supervisor owns
+ * (`./execution-token-endpoint.ts`), scoped to one execution by a
+ * per-execution secret. A child of the session presents the secret and gets a
+ * FRESH execution token back — the same short-lived, audience-restricted
+ * credential the session already holds a copy of, never anything more. The
+ * daemon's durable OAuth client secret stays where
+ * `./execution-token-manager.ts` says it stays: in the daemon, in memory.
+ *
+ * Injected only when the supervisor actually has such an endpoint, exactly
+ * the way the two above are injected only when a token could be minted —
+ * absent is the normal, working, pre-x21 state and every engine must tolerate
+ * it (`./claude-code.ts` falls back to the static header).
+ */
+export const ENGINE_MCP_HELPER_URL_ENV = 'PIPELINE_MESH_HELPER_URL';
+/** SECRET. Per-execution, loopback-only, in-memory, revoked at terminal. It
+ *  authorizes exactly one thing: "hand me a fresh token for MY execution".
+ *  Same discipline as the token itself — never on a command line, never on
+ *  disk, never logged. */
+export const ENGINE_MCP_HELPER_SECRET_ENV = 'PIPELINE_MESH_HELPER_SECRET';
+
 /** What responsibility 3 needs, once. Nothing else about the connection is
  *  the supervisor's business — how a module keeps it alive across token
  *  expiry is the module's own problem (for `claude-code`, D23's
- *  `headersHelper`). */
+ *  `headersHelper`, now buildable: see `ENGINE_MCP_HELPER_URL_ENV`). */
 export interface EngineMcpEnv {
   url: string;
   /** Short-lived, audience-restricted, and re-minted on every spawn. NEVER
    *  log it, and never put it on a command line. */
   token: string;
+}
+
+/** x21 — the loopback re-auth channel, read out of the same injected env, or
+ *  `null` when the supervisor offered none. Optional by construction: an
+ *  engine that gets `null` still has a working (if expiry-bound) connection,
+ *  which is precisely the pre-x21 behaviour. */
+export interface EngineMcpHelperChannel {
+  url: string;
+  /** SECRET — see `ENGINE_MCP_HELPER_SECRET_ENV`. */
+  secret: string;
+}
+
+/**
+ * x21 — read the loopback re-auth channel out of an invocation, or `null`.
+ *
+ * Deliberately NOT a refusal, unlike `requireEngineMcpEnv` below: a missing
+ * channel costs a long task its recovery, not its ability to run, and every
+ * shipped runtime worked without one before x21.
+ */
+export function readEngineMcpHelperChannel(invocation: InvocationEnvelope): EngineMcpHelperChannel | null {
+  const env = invocation.runtime.env ?? {};
+  const url = env[ENGINE_MCP_HELPER_URL_ENV];
+  const secret = env[ENGINE_MCP_HELPER_SECRET_ENV];
+  if (typeof url !== 'string' || url.length === 0) return null;
+  if (typeof secret !== 'string' || secret.length === 0) return null;
+  return { url, secret };
 }
 
 /**
