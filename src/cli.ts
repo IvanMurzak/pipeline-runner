@@ -615,6 +615,14 @@ function runStart(argv: string[] = []): void {
     },
     logger: consoleLogger,
   });
+  // simplified-onboarding b2 (D9, design 06 §6): this array is the
+  // COMPOSITION ROOT for engine modules — the one place outside
+  // `./department/engine.ts` that adding an engine touches, because an
+  // adapter instance needs a logger and this is where loggers exist.
+  // Everything else about an engine — its user-facing `engine:` name, its
+  // declared capabilities, whether it refuses to start without a department
+  // MCP connection, and the supported-engine list `validate` prints — lives
+  // in that one table.
   departmentManager = new DepartmentManager({
     adapters: [
       new JsonlProcessAdapter({ logger: consoleLogger }),

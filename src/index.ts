@@ -18,3 +18,10 @@ export * from './core/register-credential';
 export * from './core/heartbeat';
 export * from './core/transport';
 export * from './core/connection';
+// simplified-onboarding b2: the engine-module contract and the engine
+// registry. Exported from the package root because the supported-engine list
+// has a consumer OUTSIDE this package — `pipeline department validate`, which
+// must name every engine that exists without holding an adapter instance (or
+// a logger, or a process). `./department/engine.ts` imports only types from
+// `./department/adapter.ts`, so this adds no weight to the entry point.
+export * from './department/engine';

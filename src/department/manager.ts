@@ -170,6 +170,7 @@ import type {
 } from './adapter';
 import type { ArtifactFileSystem } from './artifact-upload';
 import { uploadDepartmentArtifact } from './artifact-upload';
+import { ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV } from './engine';
 import { buildDepartmentJournalEnvelope } from './events';
 import type { ExecutionTokenSource } from './execution-token-manager';
 
@@ -183,8 +184,14 @@ import type { ExecutionTokenSource } from './execution-token-manager';
 // it simply also receives these two variables and is free to ignore them;
 // a model-driven runtime that knows to read them becomes its own MCP client
 // against `https://…/mcp`, exactly as D14 intends.
-export const MESH_MCP_URL_ENV = 'PIPELINE_MESH_MCP_URL';
-export const MESH_EXECUTION_TOKEN_ENV = 'PIPELINE_MESH_EXECUTION_TOKEN';
+//
+// simplified-onboarding b2: the two names now live in `./engine.ts` and are
+// re-exported here under their shipped names. They are the supervisor↔engine
+// half of the contract an engine module's responsibilities 3/4 rest on
+// (`requireEngineMcpEnv`), and an engine module must not have to import the
+// whole supervisor to learn what they are called. Same strings, same values.
+export const MESH_MCP_URL_ENV = ENGINE_MCP_URL_ENV;
+export const MESH_EXECUTION_TOKEN_ENV = ENGINE_MCP_TOKEN_ENV;
 
 // ── The journal-writer seam (runner IS the journal writer here — unlike
 //    pipeline runs, where pipeline-cli writes events.jsonl, nothing external
