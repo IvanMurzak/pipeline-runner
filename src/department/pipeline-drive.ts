@@ -165,7 +165,6 @@ import {
 import type { JobExec, JobExecResult } from '../jobs/types';
 import { nodeJobExec } from '../jobs/types';
 import type {
-  AgentRuntimeAdapter,
   DeptMessage,
   DeptTaskSpec,
   InvocationEnvelope,
@@ -180,6 +179,9 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+// simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
+import type { EngineCapabilities, EngineModule, EngineName } from './engine';
+import { PIPELINE_ENGINE_CAPABILITIES } from './engine';
 
 /** 07 §2.1: fixed and declared, never negotiated (there is no handshake that
  *  could raise it — unlike `jsonl-process`'s `ready` frame). */
@@ -304,8 +306,21 @@ function asPipelineDriveHandle(handle: RuntimeHandle): PipelineDriveHandle {
 
 // ── The adapter ───────────────────────────────────────────────────────────
 
-export class PipelineDriveAdapter implements AgentRuntimeAdapter {
+export class PipelineDriveAdapter implements EngineModule {
   readonly id = 'pipeline-drive';
+  // ── Engine-module declarations (b2, 06 §3) ──────────────────────────────
+  /** `engine: pipeline` is what a user writes; `pipeline-drive` is what the
+   *  binding stores. The two differ precisely because the internal id names
+   *  the MECHANISM (`pipeline drive`) and the engine names the THING
+   *  (a pipeline) — 06 §7. */
+  readonly engine: EngineName = 'pipeline';
+  /** Fixed, never negotiated — this module has no handshake to raise them
+   *  with (see this file's "Declared capabilities" section). */
+  readonly engineCapabilities: EngineCapabilities = PIPELINE_ENGINE_CAPABILITIES;
+  /** `pipeline drive` reaches the cloud through the runner's own event
+   *  shipper, not through the department MCP server; it has never needed the
+   *  injected variables and does not refuse without them. */
+  readonly requiresMcpConnection = false;
 
   private readonly exec: JobExec;
   private readonly logger: Logger;

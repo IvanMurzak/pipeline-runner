@@ -50,7 +50,6 @@ import { nullLogger } from '../core/log';
 import type { JobSpawn, ProcessHandle } from '../jobs/types';
 import { nodeJobSpawn } from '../jobs/types';
 import type {
-  AgentRuntimeAdapter,
   DeptMessage,
   DeptTaskSpec,
   InvocationEnvelope,
@@ -64,6 +63,10 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+// simplified-onboarding b2: the engine-module declarations (`./engine.ts`) —
+// types + two consts, no behaviour.
+import type { EngineCapabilities, EngineModule, EngineName } from './engine';
+import { PROCESS_ENGINE_CAPABILITIES } from './engine';
 
 export const JSONL_PROTOCOL_VERSION = '1.0';
 export const DEFAULT_STARTUP_TIMEOUT_S = 30;
@@ -339,8 +342,19 @@ function asJsonlHandle(handle: RuntimeHandle): JsonlHandle {
 
 // ── The adapter ───────────────────────────────────────────────────────────
 
-export class JsonlProcessAdapter implements AgentRuntimeAdapter {
+export class JsonlProcessAdapter implements EngineModule {
   readonly id = 'jsonl-process';
+  // ── Engine-module declarations (b2, 06 §3) ──────────────────────────────
+  /** `engine: process` in a `department.yml`; `adapterId: 'jsonl-process'`
+   *  in a binding. `./engine.ts`'s `ENGINE_REGISTRY` is the only place that
+   *  pairing is written down. */
+  readonly engine: EngineName = 'process';
+  readonly engineCapabilities: EngineCapabilities = PROCESS_ENGINE_CAPABILITIES;
+  /** This contract has always worked with no MCP access whatsoever — the two
+   *  variables are handed to the child, which is free to ignore them (see
+   *  `./manager.ts`'s d6 note) — so refusing without them would break every
+   *  shipped JSONL runtime. Only a model-driven engine needs D24's refusal. */
+  readonly requiresMcpConnection = false;
 
   private readonly spawnSeam: JobSpawn;
   private readonly clock: Clock;

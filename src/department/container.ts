@@ -107,6 +107,9 @@ import type {
   RuntimeInput,
 } from './adapter';
 import { RuntimeAdapterError } from './adapter';
+// simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
+import type { EngineCapabilities, EngineModule, EngineName } from './engine';
+import { CONTAINER_ENGINE_CAPABILITIES } from './engine';
 import { JsonlProcessAdapter } from './jsonl-process';
 
 export const DEFAULT_CONTAINER_RUNTIME_BINARY: ContainerRuntimeBinary = 'docker';
@@ -412,8 +415,19 @@ type BuildOutcome =
   | { ok: true; config: RuntimeConfig; containerName: string; runtimeBinary: ContainerRuntimeBinary }
   | { ok: false; reason: string };
 
-export class ContainerAdapter implements AgentRuntimeAdapter {
+export class ContainerAdapter implements EngineModule {
   readonly id = 'container';
+  // ── Engine-module declarations (b2, 06 §3) ──────────────────────────────
+  /** The engine name and the adapter id coincide here; they do not for the
+   *  other two, which is why the mapping lives in a table rather than being
+   *  assumed to be the identity. */
+  readonly engine: EngineName = 'container';
+  /** Identical to `process` on purpose — this adapter adds isolation, not a
+   *  second protocol (`./engine.ts`'s `CONTAINER_ENGINE_CAPABILITIES`). */
+  readonly engineCapabilities: EngineCapabilities = CONTAINER_ENGINE_CAPABILITIES;
+  /** Same reasoning as the adapter it wraps: the JSONL contract runs fine
+   *  with no MCP access at all. */
+  readonly requiresMcpConnection = false;
 
   private readonly inner: AgentRuntimeAdapter;
   private readonly control: ContainerRuntimeControl;
