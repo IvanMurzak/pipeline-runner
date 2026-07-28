@@ -138,7 +138,8 @@
  *      DENIED and the session runs to its own end, silently. A watchdog alone
  *      never fires on that, so a terminal `completed` from an execution that
  *      emitted NOT ONE signal in its whole life is reported `stuck` instead of
- *      a hollow success (`judgeTerminalEvent`).
+ *      a hollow success (`judgeTerminalEvent`). A `status` announcement does
+ *      not count as one of those signals — see `handleRuntimeEvent` (x36).
  *
  * Both are gated on the engine DECLARING that it reports while it works
  * (`./engine.ts`'s `supportsStreaming: 'yes'`) — see `resolveStuckAfterMs`.
@@ -1184,7 +1185,18 @@ export class DepartmentManager {
     // these, and `checkStuck` re-reads `lastActivityAt` when it wakes, so one
     // timer per window is enough. Terminals are excluded — ending is not a
     // sign of life, and shape 2 asks whether anything came BEFORE the end.
-    if (event.type !== 'completed' && event.type !== 'failed') state.runtimeSignals += 1;
+    //
+    // x36: `status` is excluded too, and the exclusion is what keeps shape 2
+    // ALIVE. It is a lifecycle announcement — "this session has started" —
+    // emitted once, before the runtime has reported a single thing it did;
+    // `./claude-code.ts` now sends one at its `init` frame because it is the
+    // only event that moves a task off `SUBMITTED`. Counting it would make
+    // "emitted NOT ONE signal in its whole life" trivially false for every
+    // `claude-code` execution, and silently retire the detector on the very
+    // engine b3 observed the failure on. `lastActivityAt` above is a DIFFERENT
+    // question ("when did we last hear anything?") and is deliberately still
+    // refreshed: a session announcing itself is a live one.
+    if (event.type !== 'completed' && event.type !== 'failed' && event.type !== 'status') state.runtimeSignals += 1;
 
     // Crash recovery (per-context only, bounded to one silent respawn): the
     // process is gone but the task is not actually done — continue instead

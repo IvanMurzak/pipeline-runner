@@ -209,6 +209,54 @@
  *     still running, because it said its piece and a stray background process
  *     it no longer needs is not a lost report. Only a session that ended
  *     WITHOUT reporting, while its own work was still outstanding, is judged.
+ *
+ * ── Saying that the session STARTED (x36) ──────────────────────────────────
+ * Everything above judges how a session ENDED. x36 is the defect at the other
+ * end, and it made all of it unreachable on the real path: this module emitted
+ * no `{type:'status'}` event at all, ever. It was the only adapter that did
+ * not — `./jsonl-process.ts` produces one from a runtime's own `task.status`
+ * up-line, and that event is the ONLY thing in the entire system that moves a
+ * task out of `SUBMITTED`. The cloud's transition table admits `SUBMITTED ->
+ * WORKING | REJECTED | CANCELED`, and its scheduler says so in as many words:
+ * "`department.accept` does NOT move a task to WORKING (only the runner's own
+ * `status` event does)".
+ *
+ * So a `claude-code` task was admitted `SUBMITTED` and nothing could ever
+ * advance it. The P4 gate's fourth run — the first to drive the flagship path
+ * through the shipped `pipeline department serve` against a real cloud —
+ * caught the consequence: `task.request_input`, `task.complete` and
+ * `task.fail` ALL came back `task_conflict`, and the session said so on the
+ * wire ("the task never left SUBMITTED, so this execution cannot close it").
+ * It ran twelve minutes, published an artifact, wrote a full summary, and
+ * stayed `SUBMITTED` — rendered to its own sender as `queued`. That is the
+ * "goes quiet" failure 02 §5 forbids, on the happy path.
+ *
+ * The announcement therefore goes out at the `init` frame, once, the moment
+ * the handle is minted and before a single active line is routed — see
+ * {@link SESSION_STARTED_STATUS_MESSAGE} for why that instant and not a later
+ * one.
+ *
+ * ── A terminal report that was REFUSED (x37) ───────────────────────────────
+ * The fourth false-`completed` shape, and the one the flagship path actually
+ * hits. x16 disarms on ANY later successful receiver call — deliberately, so a
+ * `headersHelper` re-auth that recovers still completes. The live sequence was
+ *
+ *   task.fail(error) → task.complete(error) → task.get_current(ok) → task.send_message(ok)
+ *
+ * The two calls that would have ENDED the task were refused; two later
+ * non-terminal calls succeeded and disarmed x16. x31 already tracks
+ * {@link ClaudeCodeHandle.terminalReportLanded}, but its guard only fires when
+ * background tasks are outstanding — nothing looked at a missing terminal
+ * report on its own. So the session reported `completed`.
+ *
+ * The narrowing that keeps this out of [D34]/`x17`'s territory is the
+ * difference between ATTEMPTED-AND-REFUSED and NEVER-ATTEMPTED. A parked
+ * session makes no terminal call at all and must still end `completed`; this
+ * one made two and had both thrown back. That distinction needs its own bit of
+ * evidence — {@link ClaudeCodeHandle.terminalReportRefused} — because
+ * `!terminalReportLanded` alone describes every parked session too. A
+ * `result` claiming success with a refused terminal report and no landed one
+ * is reported {@link TERMINAL_REPORT_REFUSED_FAILURE_REASON}.
  */
 
 import { existsSync } from 'node:fs';
@@ -361,6 +409,76 @@ export const NO_REPORT_CHANNEL_FAILURE_REASON = 'no_report_channel';
  * follow-up.
  */
 export const BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON = 'background_work_outstanding';
+
+/**
+ * x37: the CODED terminal reason for a session whose report of HOW THE TASK
+ * ENDED was refused — `task.complete`, `task.fail` or both came back an error
+ * and neither ever landed — while the channel itself went on working.
+ *
+ * A fifth word, and an operator acts on it differently from all four. `stuck`
+ * means nothing was said; `unreported` means the channel was broken at the
+ * end; `no_report_channel` means there was never a channel; and
+ * `background_work_outstanding` means the session simply spoke too early. This
+ * one means the session said its piece, on a channel that was demonstrably
+ * fine before and after, and the GATEWAY THREW IT BACK — so the thing to look
+ * at is why that call was rejected (the task's state, its lease, its
+ * authorization), not the transport and not the session. Every other word
+ * would send someone to the wrong place: `unreported` in particular is the
+ * near miss, and it is not this, because here later calls worked.
+ *
+ * Same hardcoding rationale as `UNREPORTED_FAILURE_REASON`,
+ * `NO_REPORT_CHANNEL_FAILURE_REASON`, `BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON`,
+ * `./manager.ts`'s `STUCK_FAILURE_REASON` and its
+ * `ISOLATION_UNSUPPORTED_FAILURE_REASON`: this package exact-pins
+ * `@baizor/pipeline-protocol@0.4.0`, whose `DEPT_FAILURE_REASONS` is merged
+ * but unpublished. The value rides the existing `failed` event's `reason`
+ * (already `z.string().min(1)`), so no consumer needs a schema change and the
+ * cloud passes a reason it has never heard of through verbatim ([D35], proven
+ * live by the P4 gate). The STRING is the contract and is identical either
+ * way; adding it to that constant when it next ships is a protocol-side
+ * follow-up.
+ */
+export const TERMINAL_REPORT_REFUSED_FAILURE_REASON = 'terminal_report_refused';
+
+/**
+ * x36: the human half of the ONE `{type:'status', state:'WORKING'}` event this
+ * module emits, and the record of WHEN it is emitted — at the `init` frame,
+ * once per session, before any active line is routed.
+ *
+ * Three instants were available and only one of them is correct:
+ *
+ *  - **The `init` frame** — this one. Under `--input-format stream-json` the
+ *    prompt is written to stdin FIRST and the CLI emits nothing at all until
+ *    it has that first input message (verified empirically against v2.1.220;
+ *    see the ordering note in `runHandshakeThenStart`). So `init` does not
+ *    mean "a process exists" — it means the binary started, the department MCP
+ *    server finished connecting, and the session has ACCEPTED the prompt and
+ *    is beginning its turn. That is `WORKING`, stated at the earliest moment it
+ *    is true, and it precedes the model's first inference by seconds.
+ *  - The first assistant activity — too late by construction. A receiver tool
+ *    call IS a `tool_use` block on an `assistant` frame, and the CLI invokes
+ *    the tool immediately after emitting it. Announcing here would race the
+ *    very call the announcement exists to unblock: our event travels
+ *    runner → cloud while the call travels session → MCP gateway → cloud, and
+ *    "usually wins" is not a fix.
+ *  - The first receiver call — later still, and circular: that call is the one
+ *    that fails.
+ *
+ * The cost of the early instant is the one the alternatives were weighed
+ * against: a session that dies immediately after `init` has said it was
+ * working. It is not a real cost. The session genuinely had started, and a
+ * `failed` from a `SUBMITTED` task is what the cloud's `x18` has to route to
+ * `REJECTED` precisely because this event was missing; from `WORKING` it lands
+ * as the `FAILED` it actually is. Announcing early makes the failure path
+ * MORE accurate, not less.
+ *
+ * Emitted exactly once. The handshake branch that emits it runs once per
+ * session by construction (`settleHandshake`), and re-announcing later would
+ * be actively wrong: `INPUT_REQUIRED -> WORKING` is a legal transition, so a
+ * second announcement could yank a parked task back out of the state its
+ * sender is being asked to answer in.
+ */
+export const SESSION_STARTED_STATUS_MESSAGE = 'claude-code session started';
 
 /** Claude Code session startup (process spawn → `system`/`init` line) is a
  *  cold binary start plus MCP connect; 60s is generous rather than tight, and
@@ -1002,6 +1120,20 @@ class ClaudeCodeHandle implements RuntimeHandle {
    *  broken call is x16's to judge, and cannot make an earlier landed report
    *  un-happen. Used only to WITHHOLD the x31 judgement. */
   terminalReportLanded = false;
+  /** x37: `true` once `task.complete` or `task.fail` has come back WITH an
+   *  error — this session tried to say how the task ended and the gateway
+   *  refused it. Never un-set, and never consulted alone: paired with
+   *  {@link terminalReportLanded} it separates "attempted and refused" from
+   *  "never attempted", and only the first is judged. A session that was
+   *  refused once and then retried successfully has both flags set and is an
+   *  ordinary completion — the same forgiveness x16 extends to a channel that
+   *  recovers.
+   *
+   *  Deliberately a second flag rather than a re-reading of x16's
+   *  {@link unlandedReport}: that one is DISARMED by any later successful
+   *  receiver call, which is exactly what the captured failure did — two
+   *  refused terminal calls followed by two ordinary ones that worked. */
+  terminalReportRefused = false;
   /** x31: the session's outstanding background tasks as of the last
    *  `system`/`background_tasks_changed` snapshot — replaced wholesale, never
    *  accumulated ({@link backgroundTaskIds}). Empty on every session that
@@ -1347,6 +1479,17 @@ export class ClaudeCodeAdapter implements EngineModule {
             this.reportChannelUnconfirmedAtInit(parsed, task.taskId)
           );
           resolve(handle);
+          // x36: and the session says it is working — the one event that moves
+          // its task off `SUBMITTED`, without which every receiver call it is
+          // about to make comes back `task_conflict`. See
+          // {@link SESSION_STARTED_STATUS_MESSAGE} for why here.
+          //
+          // AFTER `resolve`, not before: `resolve` only schedules the caller's
+          // continuation, so this still reaches the supervisor before `start()`
+          // returns either way — but ordering it second means a sink that
+          // throws cannot leave a started session with an unsettled promise and
+          // a killed process.
+          sink({ type: 'status', state: 'WORKING', message: SESSION_STARTED_STATUS_MESSAGE });
           return;
         }
         if (handle !== null) this.routeActiveLine(handle, parsed, sink);
@@ -1583,9 +1726,15 @@ export class ClaudeCodeAdapter implements EngineModule {
       // `unlandedReport` above, this one is never un-set: a later failure is
       // x16's to judge, and cannot make an earlier landed call un-happen.
       if (!outcome.isError) handle.receiverCallLanded = true;
-      // x31: and whether the call that came back was the session SAYING how
-      // the task ended. Same never-un-set rule, same reason.
-      if (handle.pendingTerminalCalls.delete(outcome.toolUseId) && !outcome.isError) handle.terminalReportLanded = true;
+      // x31/x37: and whether the call that came back was the session SAYING
+      // how the task ended — and, if so, whether it was accepted or thrown
+      // back. Both flags follow the never-un-set rule for the same reason: a
+      // report that landed cannot un-happen, and neither can one that was
+      // refused. Read together they are the whole of x37's evidence.
+      if (handle.pendingTerminalCalls.delete(outcome.toolUseId)) {
+        if (outcome.isError) handle.terminalReportRefused = true;
+        else handle.terminalReportLanded = true;
+      }
     }
   }
 
@@ -1657,6 +1806,41 @@ export class ClaudeCodeAdapter implements EngineModule {
           // cwd: starting a second session on top of it would have two
           // writers in one department folder to fix one report.
           retrySafe: false,
+        };
+      }
+      // x37: and the shape where the channel worked, the session said how the
+      // task ended, and the GATEWAY refused it. Two flags, not one, because
+      // `!terminalReportLanded` on its own is also every parked session:
+      // `terminalReportRefused` is what separates "attempted and refused" from
+      // "never attempted", and only the first is a failure. `landed` still
+      // wins over `refused` — a call that was thrown back once and then
+      // accepted is a report, exactly as x16 forgives a channel that recovers.
+      //
+      // Checked LAST, after x31, and the order is load-bearing rather than
+      // stylistic: a session with outstanding background tasks AND a refused
+      // terminal report satisfies both, and x31's word is the one that must
+      // win. Its `retrySafe:false` exists to stop a respawn landing on top of
+      // a live background process in the same department folder, and taking
+      // this branch first would quietly trade that safety for a more precise
+      // noun.
+      if (handle.terminalReportRefused && !handle.terminalReportLanded) {
+        this.logger.warn(
+          `claude-code[${handle.taskId}]: the session ended claiming success, but every ` +
+            `${TERMINAL_RECEIVER_TOOLS.join('/')} call it made was refused and none ever landed, while its other ` +
+            `department tool calls went on working — reporting '${TERMINAL_REPORT_REFUSED_FAILURE_REASON}' rather than a ` +
+            'completion the gateway never accepted'
+        );
+        return {
+          type: 'failed',
+          reason: TERMINAL_REPORT_REFUSED_FAILURE_REASON,
+          // Retry-safe, with x16 and x27 rather than x31. The refusal is the
+          // gateway's answer to one call, not a statement about the work: a
+          // fresh spawn is minted a fresh execution token and a fresh lease,
+          // which is precisely what a rejected-because-authorization or
+          // rejected-because-state call needs. Nothing was left running that a
+          // second session could collide with — that is the case x31 keeps
+          // above, and it keeps it.
+          retrySafe: true,
         };
       }
       return { type: 'completed', ...(result.text === null ? {} : { summary: truncate(result.text, MAX_SUMMARY) }) };

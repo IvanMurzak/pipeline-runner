@@ -42,6 +42,8 @@ import {
   receiverToolUseIds,
   redactSensitive,
   sanitizeMcpToolName,
+  SESSION_STARTED_STATUS_MESSAGE,
+  TERMINAL_REPORT_REFUSED_FAILURE_REASON,
   TERMINAL_RECEIVER_TOOLS,
   terminalReceiverToolNames,
   toolResultOutcomes,
@@ -54,6 +56,9 @@ import {
   ENGINE_MCP_URL_ENV,
   EngineMcpUnavailableError,
 } from './engine';
+// x36: the one adapter that already produced a `status` event — its narrower is
+// the contract this module's announcement is checked against.
+import { narrowRuntimeEvent } from './jsonl-process';
 import { FakeJobSpawn, makeMessage, makeTaskSpec } from './_test-helpers';
 
 const MCP_URL = 'https://ai-pipeline.dev/mcp';
@@ -136,6 +141,11 @@ async function startSession(
   const started = adapter.start(options.invocation ?? makeMcpInvocation(), (event) => events.push(event));
   spawn.last.emitJson(initFrame(options.status ?? 'connected'));
   const handle = await started;
+  // x36: every session now announces `WORKING` as it starts (its own describe
+  // below owns that assertion, on a start this helper does not perform). The
+  // tests here are about what the session does NEXT, so the announcement is
+  // drained rather than prepended to twenty expectations that are not about it.
+  expect(events.shift()).toEqual({ type: 'status', state: 'WORKING', message: SESSION_STARTED_STATUS_MESSAGE });
   return { spawn, adapter, events, handle };
 }
 
@@ -915,6 +925,9 @@ async function startOnInit(
   const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
   spawn.last.emitJson(frame);
   await started;
+  // x36: drained for the same reason `startSession` drains it — these cases
+  // turn on what the `init` frame SAID, not on the announcement that follows.
+  expect(events.shift()).toEqual({ type: 'status', state: 'WORKING', message: SESSION_STARTED_STATUS_MESSAGE });
   return { spawn, adapter, events };
 }
 
@@ -1354,6 +1367,256 @@ describe('parking is out of x31 reach: a parked session emits no background task
     spawn.last.emitJson(toolAnswer('toolu_ask', { content: 'PARKED: the question was delivered to the sender.' }));
     spawn.last.emitJson({ type: 'result', is_error: false, result: 'asked while the check runs' });
     expect(events[events.length - 1]).toEqual({ type: 'failed', reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON, retrySafe: false });
+  });
+});
+
+// ── x36: saying the session STARTED ────────────────────────────────────────
+
+/** Start a session WITHOUT draining the announcement — these cases are about
+ *  the announcement itself, so they cannot go through `startSession`. */
+async function startRaw(
+  frame: Record<string, unknown> = initFrame('connected')
+): Promise<{ spawn: FakeJobSpawn; adapter: ClaudeCodeAdapter; events: RuntimeEvent[] }> {
+  const spawn = new FakeJobSpawn();
+  const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+  const events: RuntimeEvent[] = [];
+  const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+  spawn.last.emitJson(frame);
+  await started;
+  return { spawn, adapter, events };
+}
+
+const WORKING_ANNOUNCEMENT: RuntimeEvent = { type: 'status', state: 'WORKING', message: SESSION_STARTED_STATUS_MESSAGE };
+
+describe('x36: a task that never leaves SUBMITTED can never report anything', () => {
+  test('the P4 gate case: the session announces WORKING at its init frame', async () => {
+    // The defect this replaces was an ABSENCE: `grep -c "type: 'status'"` over
+    // this module returned 0, and the runner-emitted `status` event is the only
+    // thing in the system that moves a task off `SUBMITTED` (the cloud's
+    // transition table admits SUBMITTED -> WORKING|REJECTED|CANCELED, and its
+    // scheduler states outright that `department.accept` does not do it). So a
+    // twelve-minute session published an artifact, wrote a full summary, and had
+    // task.request_input, task.complete and task.fail ALL come back
+    // `task_conflict` — while its sender was shown `queued`.
+    const { events } = await startRaw();
+    expect(events).toEqual([WORKING_ANNOUNCEMENT]);
+  });
+
+  test('the announcement is the shape ./jsonl-process.ts already produces, not a new one', () => {
+    // The one adapter that got this right is the contract. Driving its narrower
+    // with the up-line a runtime would send yields the event this module now
+    // emits directly — same `type`, same single legal `state` literal, same
+    // optional `message`.
+    expect(narrowRuntimeEvent({ type: 'task.status', state: 'WORKING', message: SESSION_STARTED_STATUS_MESSAGE })).toEqual({
+      event: WORKING_ANNOUNCEMENT,
+    });
+  });
+
+  test('it precedes the first receiver tool call — anything later would race the call it exists to unblock', async () => {
+    // The requirement, stated as an ordering: a receiver call IS a `tool_use`
+    // block on an `assistant` frame, and the CLI invokes the tool the moment it
+    // emits one. The announcement must already be out by then, and at `init` it
+    // is out before the model has produced a single token.
+    const { spawn, events } = await startRaw();
+    expect(events).toEqual([WORKING_ANNOUNCEMENT]); // already, with no active line routed at all
+    spawn.last.emitJson(toolCall(receiver('task_update_progress'), 'toolu_first'));
+    expect(events).toEqual([WORKING_ANNOUNCEMENT, { type: 'progress', note: `using ${receiver('task_update_progress')}` }]);
+  });
+
+  test('exactly once — a second init frame mid-session does not re-announce', async () => {
+    // The CLI re-emits `system`/`init` on a new turn (x27 reads the refreshed
+    // mcp status off exactly that frame). Announcing again would be actively
+    // wrong: INPUT_REQUIRED -> WORKING is a legal transition, so a second
+    // announcement could yank a parked task back out of the state its sender is
+    // being asked to answer in.
+    const { spawn, events } = await startRaw(initFrameWithTools('pending'));
+    spawn.last.emitJson(initFrameWithTools('connected', { receiverTools: true }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events.filter((event) => event.type === 'status')).toEqual([WORKING_ANNOUNCEMENT]);
+  });
+
+  test('a session that dies straight after init has still started — and its failure now lands AS a failure', async () => {
+    // The cost of the early instant, priced. The session genuinely had started:
+    // under `--input-format stream-json` the CLI emits nothing until it has the
+    // prompt, so `init` means the binary ran, the department server connected
+    // and the turn began. Without the announcement this `failed` arrives on a
+    // SUBMITTED task, where WORKING -> FAILED is illegal and the cloud's x18
+    // has to divert it to REJECTED; with it, the terminal is the one that
+    // actually happened.
+    const { spawn, events } = await startRaw();
+    spawn.last.emitExit({ code: 1, signal: 'SIGKILL' });
+    expect(events).toEqual([
+      WORKING_ANNOUNCEMENT,
+      { type: 'failed', reason: 'claude-code: the session exited without reporting a result (code 1, signal SIGKILL)', retrySafe: true },
+    ]);
+  });
+
+  test('a session that is REFUSED at init announces nothing — it never started', async () => {
+    // D24's refusal happens before the handle exists, so there is no session to
+    // call working. The supervisor turns the rejection into its own terminal.
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock() });
+    const events: RuntimeEvent[] = [];
+    const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+    spawn.last.emitJson(initFrame('failed'));
+    await expect(started).rejects.toThrow(EngineMcpUnavailableError);
+    expect(events).toEqual([]);
+  });
+
+  test('the announcement carries no credential and no session detail', async () => {
+    // Same standing rule as every other event this module emits (10-security §6).
+    const { events } = await startRaw();
+    expect(events).toHaveLength(1); // non-vacuous: there IS something to inspect
+    expect(JSON.stringify(events)).not.toContain(TOKEN);
+    expect(JSON.stringify(events)).not.toContain(MCP_URL);
+  });
+});
+
+// ── x37: a terminal report the gateway refused ─────────────────────────────
+
+/** What the gateway actually said on the live path, before x36: the task never
+ *  left SUBMITTED, so the two calls that would have ended it were refused. */
+const TASK_CONFLICT = 'task_conflict: the task is in SUBMITTED state and cannot be closed by this execution';
+
+describe('x37: a session whose terminal report was REFUSED did not complete', () => {
+  test('the live sequence: fail and complete both refused, then two ordinary calls that WORK', async () => {
+    // Driven in the captured order. x16 arms on the refusals and then DISARMS
+    // on the two later successes — deliberately, so a headersHelper re-auth
+    // that recovers still completes — and x31 only looks at a missing terminal
+    // report when background tasks are outstanding, which here there are none.
+    // On today's `main` this session reports `completed` while the gateway
+    // refused every word it said about how the task ended.
+    const logger = capturingLogger();
+    const spawn = new FakeJobSpawn();
+    const adapter = new ClaudeCodeAdapter({ spawn, clock: fakeClock(), logger });
+    const events: RuntimeEvent[] = [];
+    const started = adapter.start(makeMcpInvocation(), (event) => events.push(event));
+    spawn.last.emitJson(initFrame('connected'));
+    await started;
+
+    spawn.last.emitJson(toolCall(receiver('task_fail'), 'toolu_fail'));
+    spawn.last.emitJson(toolAnswer('toolu_fail', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_get_current'), 'toolu_get'));
+    spawn.last.emitJson(toolAnswer('toolu_get', { content: 'state: SUBMITTED' }));
+    spawn.last.emitJson(toolCall(receiver('task_send_message'), 'toolu_say'));
+    spawn.last.emitJson(toolAnswer('toolu_say', { content: 'ACK: message appended.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, subtype: 'success', terminal_reason: 'completed', result: 'summary written' });
+
+    expect(events[events.length - 1]).toEqual({
+      type: 'failed',
+      reason: TERMINAL_REPORT_REFUSED_FAILURE_REASON,
+      // Retry-safe, with x16 and x27: a fresh spawn is minted a fresh execution
+      // token and a fresh lease, and nothing was left running to collide with.
+      retrySafe: true,
+    });
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).toBe('terminal_report_refused');
+    // The detail is in the log; the wire value stays a bare word.
+    expect(logger.lines.join('\n')).toContain('refused');
+  });
+
+  test('one refused terminal call and nothing after it is still x16 — `unreported` keeps its own case', async () => {
+    // The boundary with the shape already handled. Nothing disarmed x16 here,
+    // so the more specific "the channel was broken at the end" still applies
+    // and this branch must not steal it.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: EXPIRED }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'all done' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: UNREPORTED_FAILURE_REASON, retrySafe: true });
+  });
+
+  test('a refused terminal call that is RETRIED successfully is an ordinary completion', async () => {
+    // `landed` beats `refused`, exactly as x16 forgives a channel that
+    // recovers. A model that hit a transient conflict and tried again has
+    // reported, and failing it would be a regression.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_1'));
+    spawn.last.emitJson(toolAnswer('toolu_1', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_2'));
+    spawn.last.emitJson(toolAnswer('toolu_2', { content: 'ACK: task.complete recorded.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done' });
+  });
+
+  test('a PARKED session never attempts one, and is untouched — that is D34/x17, not this', async () => {
+    // The boundary that matters most. `!terminalReportLanded` on its own
+    // describes every parked session too; only `terminalReportRefused` marks
+    // the ones that tried. A park makes a request_input call and stops.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_request_input'), 'toolu_ask'));
+    spawn.last.emitJson(toolAnswer('toolu_ask', { content: 'PARKED: the question was delivered to the sender.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'asked the sender which branch to use' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'asked the sender which branch to use' });
+  });
+
+  test('a healthy session whose report landed is untouched', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { content: 'ACK: task.complete recorded.' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'shipped' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'shipped' });
+  });
+
+  test('an ORDINARY tool being refused is not a terminal report — a failed Read is session business', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall('Read', 'toolu_read'));
+    spawn.last.emitJson(toolAnswer('toolu_read', { isError: true, content: 'ENOENT' }));
+    spawn.last.emitJson(toolCall(receiver('task_get_current'), 'toolu_get'));
+    spawn.last.emitJson(toolAnswer('toolu_get', { content: 'state: WORKING' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'done anyway' });
+    expect(events[events.length - 1]).toEqual({ type: 'completed', summary: 'done anyway' });
+  });
+
+  test('x31 keeps precedence — a live background process must not be respawned onto', async () => {
+    // Both judgements fit this session, and the ORDER is the safety property:
+    // x31 is not retry-safe precisely so a second session does not land on top
+    // of a background command still writing in the same department folder.
+    // Taking the more precise noun here would trade that away.
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(backgroundTasksFrame('bg_one'));
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_get_current'), 'toolu_get'));
+    spawn.last.emitJson(toolAnswer('toolu_get', { content: 'state: SUBMITTED' }));
+    spawn.last.emitJson({ type: 'result', is_error: false, result: 'still going' });
+    expect(events[events.length - 1]).toEqual({ type: 'failed', reason: BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON, retrySafe: false });
+  });
+
+  test('a stated failure keeps its own reason — `terminal_report_refused` never overwrites one', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_get_current'), 'toolu_get'));
+    spawn.last.emitJson(toolAnswer('toolu_get', { content: 'state: SUBMITTED' }));
+    spawn.last.emitJson({ type: 'result', is_error: true, terminal_reason: 'api_error', result: 'Overloaded' });
+    const failure = events[events.length - 1] as Extract<RuntimeEvent, { type: 'failed' }>;
+    expect(failure.reason).toContain('api_error');
+    expect(failure.reason).not.toContain(TERMINAL_REPORT_REFUSED_FAILURE_REASON);
+  });
+
+  test('judging it emits no extra event — b4 times out on the same signals as before', async () => {
+    const { spawn, events } = await startSession();
+    spawn.last.emitJson(toolCall(receiver('task_complete'), 'toolu_done'));
+    spawn.last.emitJson(toolAnswer('toolu_done', { isError: true, content: TASK_CONFLICT }));
+    spawn.last.emitJson(toolCall(receiver('task_get_current'), 'toolu_get'));
+    spawn.last.emitJson(toolAnswer('toolu_get', { content: 'state: SUBMITTED' }));
+    expect(events).toEqual([
+      { type: 'progress', note: `using ${receiver('task_complete')}` },
+      { type: 'progress', note: `using ${receiver('task_get_current')}` },
+    ]);
+  });
+
+  test('five failures, five words — an operator is sent somewhere different by each', () => {
+    // `stuck` sends them to a hang, `unreported` to a token, `no_report_channel`
+    // to the gateway's connect, `background_work_outstanding` to a background
+    // command — and this one to why the gateway REJECTED a call that reached it.
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).not.toBe(UNREPORTED_FAILURE_REASON);
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).not.toBe(NO_REPORT_CHANNEL_FAILURE_REASON);
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).not.toBe(BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON);
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).not.toBe('stuck');
+    expect(TERMINAL_REPORT_REFUSED_FAILURE_REASON).not.toBe('isolation_unsupported');
   });
 });
 
