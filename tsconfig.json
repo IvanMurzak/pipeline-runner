@@ -6,6 +6,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": false,
     "esModuleInterop": true,
+    "resolveJsonModule": true,
     "skipLibCheck": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,

@@ -48,9 +48,24 @@ import { join } from 'node:path';
 import * as fs from 'node:fs';
 import type { RunnerCapabilities } from './capabilities';
 import { narrowRunnerCapabilities } from './capabilities';
+// A static JSON import (not `fs.readFileSync`/`require` against a runtime-
+// computed path) so the version is resolved by the SAME module resolver as
+// every other import here: correct with the package run from source
+// (`bun src/cli.ts`), from a global `bun add -g` install (npm/bun preserve
+// this package's own directory layout — `package.json` stays two levels
+// above this file either way), and it also survives a future bundled build,
+// since a bundler inlines a statically-imported JSON value at build time
+// instead of requiring the file to exist on disk at a relative path next to
+// the (possibly relocated) emitted output.
+import packageJson from '../../package.json' with { type: 'json' };
 
-/** Keep in sync with `package.json` `version`. */
-export const AGENT_VERSION = '0.1.0';
+/**
+ * This agent's own version — read from `package.json` so it can never go
+ * stale like a hand-maintained literal would (this WAS one: it shipped
+ * `'0.1.0'` for releases well past that, including on the wire as every
+ * registered runner's `agent_version`).
+ */
+export const AGENT_VERSION: string = packageJson.version;
 
 export const CONFIG_DIR_NAME = 'pipeline-runner';
 export const CONFIG_FILE_NAME = 'config.json';
