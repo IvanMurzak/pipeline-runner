@@ -126,6 +126,7 @@ import { ContainerAdapter, probeContainerRuntimeAvailable } from './department/c
 // (d5/c15) the DISTINCT `oauth_client_secret` when this runner has one, else
 // its legacy token. Wired into `DepartmentManager` below so every (re)spawn can
 // point a model-driven runtime at `<base_url>/mcp` with a live token (07 §4).
+import { ExecutionTokenEndpoint } from './department/execution-token-endpoint';
 import { ExecutionTokenManager } from './department/execution-token-manager';
 import { JsonlProcessAdapter } from './department/jsonl-process';
 import { DepartmentManager, nodeJournalWriter } from './department/manager';
@@ -621,6 +622,13 @@ function runStart(argv: string[] = []): void {
     },
     logger: consoleLogger,
   });
+  // simplified-onboarding x21 (owner decision D33): the loopback seam D23's
+  // `headersHelper` was specified to use and `b3` could not build. It holds a
+  // per-execution grant and hands a session's helper a FRESH execution token
+  // on demand; the durable client secret above never crosses it. Nothing is
+  // listening until the first department execution is admitted, and the
+  // listener closes again when the last one ends.
+  const executionHeaderChannel = new ExecutionTokenEndpoint({ tokens: executionTokens, logger: consoleLogger });
   // simplified-onboarding b2 (D9, design 06 §6): this array is the
   // COMPOSITION ROOT for engine modules — the one place outside
   // `./department/engine.ts` that adding an engine touches, because an
@@ -636,9 +644,10 @@ function runStart(argv: string[] = []): void {
       new PipelineDriveAdapter({ logger: consoleLogger }),
       // b3: constructed with defaults — its permission mode, setting scopes
       // and MCP server key are all module-level decisions (design 06 §4,
-      // 07 §8), not per-machine ones. `headersHelper` is deliberately left
-      // unset; see `ClaudeCodeAdapterOptions.headersHelper` for why the runner
-      // has nothing honest to point it at yet.
+      // 07 §8), not per-machine ones. `headersHelper` stays unset because
+      // since x21 the module builds its own from the loopback grant the
+      // supervisor injects; this option is now only the operator escape
+      // hatch it reads as.
       new ClaudeCodeAdapter({ logger: consoleLogger }),
     ],
     resolveRuntimeConfig: (departmentId) => departmentBindings.get(departmentId),
@@ -648,6 +657,7 @@ function runStart(argv: string[] = []): void {
     journalRoot: join(defaultDataDir(), 'department'),
     draining: () => client.draining || shuttingDown,
     executionTokens,
+    executionHeaderChannel,
     logger: consoleLogger,
   });
   departmentManager.attach(client.dispatcher);
@@ -686,6 +696,11 @@ function runStart(argv: string[] = []): void {
     // `persistent: false`, so this is tidiness rather than a hang fix.
     releaseLock: () => {
       stopBindingWatch();
+      // x21: close the loopback re-auth listener with everything else local.
+      // It is already `unref`'d and closes itself at zero grants, so this is
+      // tidiness rather than a hang fix — but the surface should not outlive
+      // the daemon by even a drain window.
+      executionHeaderChannel.stop();
       lock.release();
     },
     exit: (code) => process.exit(code),

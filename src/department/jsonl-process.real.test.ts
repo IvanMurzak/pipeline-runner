@@ -25,6 +25,7 @@ describe('JsonlProcessAdapter — real subprocess (nodeJobSpawn)', () => {
     const events: RuntimeEvent[] = [];
     const handle = await adapter.start(
       {
+        executionId: 'real-exec-1',
         runtime: { adapterId: 'jsonl-process', command: process.execPath, args: [FIXTURE], startupTimeoutSeconds: 15 },
         task: { taskId: 'real-t1', contextId: 'real-c1', messages: [makeMessage()] },
       },

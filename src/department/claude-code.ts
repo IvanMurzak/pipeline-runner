@@ -59,9 +59,25 @@
  * NEITHER the URL nor the bearer ever appears on a command line, in a log
  * line, or in an error message (10-security.md §6; `a6`'s precedent).
  *
- * `headersHelper` (D23's preferred mechanism) is supported but NOT the
- * default, and the reason is a real constraint rather than an omission — see
- * `ClaudeCodeAdapterOptions.headersHelper`.
+ * ── Surviving an execution token that expires mid-task (D23, built by x21) ──
+ * A static header is fixed at spawn, and `./manager.ts:511-521` states
+ * outright that a renewal "does not (cannot) push a new token into an
+ * already-running process". So a task that outlives its execution token's TTL
+ * loses every receiver tool it has — `task.complete` and `task.fail`
+ * included — and (pre-`x16`) exited claiming success anyway. That is the P4
+ * gate failure, and D23 named the cure: `headersHelper`, which Claude Code
+ * re-runs on connect and automatically on `401`/`403`.
+ *
+ * `b3` could not build it and said so: a helper is a CHILD of the session,
+ * and the token cache is in-process memory in the DAEMON. x21 (owner decision
+ * D33) built the missing seam — `./execution-token-endpoint.ts`, a loopback
+ * listener the daemon owns, scoped to one execution by a per-execution secret
+ * the supervisor injects into the session's environment. When those variables
+ * are present this module wires a helper that reads them; when they are not
+ * it falls back to the static header and behaves exactly as it did before.
+ * The bearer and the secret are on NEITHER path's command line: the static
+ * header carries `${VAR}`, and the helper command carries only two paths and
+ * a non-secret execution id.
  *
  * ── What this module does NOT do ──────────────────────────────────────────
  * It does not interpret the result. A department session reports through
@@ -96,6 +112,8 @@
  * ({@link ClaudeCodeHandle.unlandedReport}).
  */
 
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
@@ -118,7 +136,16 @@ import { RuntimeAdapterError } from './adapter';
 import type { IsolationTier } from '../core/capabilities';
 // simplified-onboarding b2: the engine-module declarations (`./engine.ts`).
 import type { EngineCapabilities, EngineModule, EngineName } from './engine';
-import { CLAUDE_CODE_ENGINE_CAPABILITIES, EngineMcpUnavailableError, ENGINE_MCP_TOKEN_ENV, ENGINE_MCP_URL_ENV, requireEngineMcpEnv } from './engine';
+import {
+  CLAUDE_CODE_ENGINE_CAPABILITIES,
+  EngineMcpUnavailableError,
+  ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_TOKEN_ENV,
+  ENGINE_MCP_URL_ENV,
+  readEngineMcpHelperChannel,
+  requireEngineMcpEnv,
+} from './engine';
 
 export const CLAUDE_CODE_ADAPTER_ID = 'claude-code';
 
@@ -226,33 +253,86 @@ export interface ClaudeCodeAdapterOptions {
   settingSources?: string | null;
   serverName?: string;
   /**
-   * D23's `headersHelper`: a shell command Claude Code runs on every MCP
-   * connect and, since v2.1.193, automatically on a `401`/`403` before
-   * retrying the call once — the only mechanism that survives an execution
-   * token expiring mid-task, because `./manager.ts:511-521` states outright
-   * that a renewal "does not (cannot) push a new token into an already-running
-   * process". Verified shape (from the shipped binary): a STRING, run with
-   * `shell:true` and a 10s timeout, which must print a JSON object of
-   * string→string headers on stdout.
+   * An OPERATOR-supplied `headersHelper`, wired verbatim and overriding the
+   * one this module builds for itself. Verified shape (from the shipped
+   * binary): a STRING, run with `shell:true` and a 10s timeout, which must
+   * print a JSON object of string→string headers on stdout.
    *
-   * It is not defaulted, and that is a deliberate, load-bearing choice rather
-   * than an unfinished one. A helper is a CHILD of the session, so the only
-   * things it can read are (a) the session's environment — fixed at spawn, so
-   * a helper reading it is exactly equivalent to the static header below, and
-   * (b) the runner's own on-disk state, which would mean putting the runner's
-   * long-lived OAuth client secret inside a model-driven session in order to
-   * re-mint. (b) trades a bounded failure (one long task loses its tools) for
-   * an unbounded one, and it would also break the invariant
-   * `./execution-token-manager.ts` states in its own module doc — the token is
-   * "held ONLY here, in memory — never written to disk". A helper that is
-   * genuinely fresher needs the SUPERVISOR to hand the current token to a
-   * child on demand (a per-execution loopback endpoint), which is supervisor
-   * work: an engine module cannot even name its own execution
-   * (`InvocationEnvelope` carries `taskId`, never `executionId`). Until that
-   * exists, an operator who has such an endpoint can point this at it and the
-   * module wires it verbatim.
+   * Left unset in the shipped composition root (`../cli.ts`), because since
+   * x21 the module has something honest of its own to point at — see
+   * `buildMcpHeadersHelperCommand`. This stays for the operator who fronts
+   * the gateway with something else entirely.
    */
   headersHelper?: string;
+  /**
+   * x21 seams, for the two absolute paths the built helper command names.
+   * Defaults are `process.execPath` (the Bun binary already running this
+   * daemon — D32 keeps Bun a prerequisite and `bin` pointing at raw source,
+   * so both of these exist on a real install) and this package's own
+   * `./mcp-headers-helper.ts`. Overridable so the argv tests assert a
+   * deterministic string rather than the test runner's own paths.
+   */
+  bunPath?: string;
+  helperScriptPath?: string;
+  /** Existence check for `helperScriptPath` — defaults to `fs.existsSync`.
+   *  A build that bundles this package away (the unused `--target=node`
+   *  script) would leave the file missing, and a helper command pointing at
+   *  nothing is worse than no helper at all: the connect itself would fail. */
+  helperScriptExists?: (path: string) => boolean;
+}
+
+// ── x21: the headers-helper command (D23 as amended by D33) ─────────────────
+
+/** The default `headersHelper` payload: this package's own program. Resolved
+ *  from `import.meta.dir`, so it follows the installed package wherever
+ *  `bun add -g` put it. */
+export const DEFAULT_HELPER_SCRIPT_PATH = join(import.meta.dir, 'mcp-headers-helper.ts');
+
+/**
+ * Characters that are still special INSIDE double quotes in at least one of
+ * the two shells `shell:true` selects — POSIX `sh -c` (`"`, `` ` ``, `$`,
+ * newline) and Windows `cmd.exe /d /s /c` (`"`, `%`, `!`). Their union, plus
+ * both newline forms.
+ *
+ * A component containing any of them is REFUSED rather than escaped. Escaping
+ * correctly for two shells at once is how command-injection bugs are written;
+ * refusing costs a long session its re-auth (it keeps the static header and
+ * behaves exactly as it did pre-x21) and costs an attacker everything.
+ */
+const SHELL_UNSAFE = /["`$%!\r\n]/;
+
+/**
+ * An execution id is safe to place on a command line — it is an identifier,
+ * not a credential. But it arrives from the CLOUD (`department.offer`'s
+ * `execution_id`), so it is remote input reaching a shell, and this is the
+ * check that makes putting it there defensible. Deliberately an ALLOW-list.
+ */
+export const EXECUTION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
+
+/**
+ * `"<bun>" "<script>" "<executionId>"`, or `null` when any component cannot
+ * be quoted safely for both shells.
+ *
+ * Note what is NOT in the returned string, and never can be: the execution
+ * token and the loopback secret. Both reach the helper through the session's
+ * ENVIRONMENT, which the helper inherits — `/proc/<pid>/environ` is
+ * owner-only (0400) while `/proc/<pid>/cmdline` is world-readable (0444).
+ * That is `x20`'s precedent applied to a second command line.
+ */
+export function buildMcpHeadersHelperCommand(options: {
+  executionId: string;
+  bunPath: string;
+  scriptPath: string;
+}): string | null {
+  if (!EXECUTION_ID_PATTERN.test(options.executionId)) return null;
+  const components = [options.bunPath, options.scriptPath, options.executionId];
+  for (const component of components) {
+    if (component.length === 0) return null;
+    if (SHELL_UNSAFE.test(component)) return null;
+    // A trailing backslash would escape the closing quote under `sh -c`.
+    if (component.endsWith('\\')) return null;
+  }
+  return components.map((component) => `"${component}"`).join(' ');
 }
 
 // ── argv + config construction (pure, exported for the argv tests) ──────────
@@ -702,6 +782,9 @@ export class ClaudeCodeAdapter implements EngineModule {
   private readonly settingSources: string | null;
   private readonly serverName: string;
   private readonly headersHelper: string | undefined;
+  private readonly bunPath: string;
+  private readonly helperScriptPath: string;
+  private readonly helperScriptExists: (path: string) => boolean;
   /** x16: the sanitized callables that count as REPORTING — computed once
    *  from the same `receiverToolNames()` the allow-list is built from. */
   private readonly receiverNames: ReadonlySet<string>;
@@ -715,7 +798,54 @@ export class ClaudeCodeAdapter implements EngineModule {
     this.settingSources = options.settingSources === undefined ? DEFAULT_SETTING_SOURCES : options.settingSources;
     this.serverName = options.serverName ?? DEPARTMENT_MCP_SERVER_NAME;
     this.headersHelper = options.headersHelper;
+    this.bunPath = options.bunPath ?? process.execPath;
+    this.helperScriptPath = options.helperScriptPath ?? DEFAULT_HELPER_SCRIPT_PATH;
+    this.helperScriptExists = options.helperScriptExists ?? existsSync;
     this.receiverNames = new Set(receiverToolNames(this.serverName));
+  }
+
+  /**
+   * x21 — the `headersHelper` string for THIS invocation, or `undefined` to
+   * keep the static `${VAR}` header.
+   *
+   * Three ordered answers, and the ordering is the policy:
+   *   1. an operator-configured helper always wins (they fronted the gateway
+   *      with something we know nothing about);
+   *   2. otherwise, if the supervisor injected a loopback re-auth channel for
+   *      this execution, build our own program's command;
+   *   3. otherwise `undefined` — the pre-x21 static header, which is a
+   *      working connection that simply cannot outlive its token.
+   *
+   * Every failure in (2) degrades to (3) with a warning rather than throwing.
+   * Refusing to start over a missing RECOVERY path would be a worse outcome
+   * than the expiry it protects against: D24's refusal is for a session that
+   * can report NOTHING, and this one can report until its token dies.
+   */
+  private resolveHeadersHelper(invocation: InvocationEnvelope): string | undefined {
+    if (this.headersHelper !== undefined) return this.headersHelper;
+    const channel = readEngineMcpHelperChannel(invocation);
+    if (channel === null) return undefined;
+    if (!this.helperScriptExists(this.helperScriptPath)) {
+      this.logger.warn(
+        `claude-code[${invocation.executionId}]: ${ENGINE_MCP_HELPER_URL_ENV}/${ENGINE_MCP_HELPER_SECRET_ENV} were injected but the ` +
+          'headers-helper program is not present in this install — falling back to a static header, so this session ' +
+          'cannot re-authorize if its execution token expires'
+      );
+      return undefined;
+    }
+    const command = buildMcpHeadersHelperCommand({
+      executionId: invocation.executionId,
+      bunPath: this.bunPath,
+      scriptPath: this.helperScriptPath,
+    });
+    if (command === null) {
+      this.logger.warn(
+        `claude-code[${invocation.executionId}]: refusing to build a headers-helper command — the execution id or an ` +
+          'install path contains a character that is not safe to place in a shell command; falling back to a static header'
+      );
+      return undefined;
+    }
+    return command;
   }
 
   /**
@@ -767,11 +897,14 @@ export class ClaudeCodeAdapter implements EngineModule {
       throw new RuntimeAdapterError('claude-code: the envelope carries no sender text to run a session on');
     }
 
+    // x21: the helper is per-INVOCATION, not per-adapter — it names this
+    // execution, which is why `InvocationEnvelope.executionId` had to exist.
+    const headersHelper = this.resolveHeadersHelper(invocation);
     const args = buildClaudeArgs({
       serverName: this.serverName,
       permissionMode: this.permissionMode,
       settingSources: this.settingSources,
-      ...(this.headersHelper !== undefined ? { headersHelper: this.headersHelper } : {}),
+      ...(headersHelper !== undefined ? { headersHelper } : {}),
       sessionContext: buildSessionContext(task, this.serverName),
       ...(runtime.args !== undefined ? { extraArgs: runtime.args } : {}),
     });

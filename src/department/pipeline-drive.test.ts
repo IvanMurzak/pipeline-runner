@@ -38,6 +38,7 @@ function makeInvocation(
   const pipelineDrive =
     overrides.pipelineDrive === null ? undefined : makeDriveSpec(overrides.pipelineDrive);
   return {
+    executionId: 'exec-1',
     runtime: {
       adapterId: 'pipeline-drive',
       command: 'pipeline',

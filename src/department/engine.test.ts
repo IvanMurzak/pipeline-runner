@@ -263,6 +263,7 @@ describe('adding an engine is the registry plus the enum (06 §6)', () => {
 
 describe('refusing rather than running blind (D24, responsibility 4)', () => {
   const invocationWithEnv = (env: Record<string, string | undefined>): InvocationEnvelope => ({
+    executionId: 'exec-1',
     runtime: { adapterId: 'claude-code', command: 'claude', env },
     task: { taskId: 't1', contextId: 'c1', messages: [] },
   });
@@ -294,6 +295,7 @@ describe('refusing rather than running blind (D24, responsibility 4)', () => {
       expect(() => requireEngineMcpEnv(invocationWithEnv(env), 'claude-code')).toThrow(EngineMcpUnavailableError);
     }
     const bare: InvocationEnvelope = {
+      executionId: 'exec-1',
       runtime: { adapterId: 'claude-code', command: 'claude' },
       task: { taskId: 't1', contextId: 'c1', messages: [] },
     };

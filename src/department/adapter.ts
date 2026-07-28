@@ -239,6 +239,27 @@ export interface DeptTaskSpec {
 }
 
 export interface InvocationEnvelope {
+  /**
+   * x21 (D33) — the execution this invocation IS. Required, not optional: an
+   * engine module that cannot name its own execution cannot be handed any
+   * supervisor seam keyed by one, and until this field existed it could not
+   * (`./claude-code.ts` said so in its own `headersHelper` doc, and `b3`
+   * reported the resulting DoD box unmet rather than claiming it).
+   *
+   * PURELY INTERNAL. This is the runner's own type, not a
+   * `@baizor/pipeline-protocol` one — the wire has carried `execution_id`
+   * since 0.4.0 (`department.offer`, `department.event`, `department.artifact`
+   * …) and `./manager.ts` has always held it as `ExecutionState.executionId`;
+   * it simply was never threaded down to the adapter. Adding it here needs no
+   * protocol change of any kind.
+   *
+   * NOT a secret and NOT a capability: it is already in journal paths, index
+   * lines and log messages. It is an IDENTIFIER, which is exactly why an
+   * engine may safely put it somewhere world-readable (`./claude-code.ts`
+   * places it on the headers-helper's argv) while the token and the loopback
+   * secret that go with it may not.
+   */
+  executionId: string;
   runtime: RuntimeConfig;
   task: DeptTaskSpec;
   /** Wall-clock deadline (ISO 8601); enforcement is the supervisor's job (07
