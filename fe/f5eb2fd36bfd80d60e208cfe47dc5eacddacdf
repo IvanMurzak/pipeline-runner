@@ -1,0 +1,79 @@
+README.md
+  s_2b6f9fe68bd5ae::t_4e069298437987 261-285,361
+src/core/capabilities.ts
+  s_2b6f9fe68bd5ae::t_790e8fa901214e 5,12-16
+src/core/department-oauth.test.ts
+  s_2b6f9fe68bd5ae::t_0e440cd3403c2f 5,15-16,42,44-46
+src/core/department-oauth.ts
+  s_2b6f9fe68bd5ae::t_a6f527a4296a66 48-59,62,148,150,157,240,288,302,309,316,337-338,366
+src/core/register-credential.ts
+  s_2b6f9fe68bd5ae::t_f0838e5b49ce9f 60-61,291
+src/department/adapter.ts
+  s_2b6f9fe68bd5ae::t_7c3cfa49ee6e87 5-9,14-15
+src/department/artifact-upload.test.ts
+  s_2b6f9fe68bd5ae::t_088e36a6960fde 9,90
+src/department/artifact-upload.ts
+  s_2b6f9fe68bd5ae::t_a426556f25236b 4,13,34,62,182
+src/department/claude-code.test.ts
+  s_2b6f9fe68bd5ae::t_f34fe13c37cff8 58,254-286
+src/department/claude-code.ts
+  s_2b6f9fe68bd5ae::t_caff034ece73cd 68-81
+src/department/container.test.ts
+  s_2b6f9fe68bd5ae::t_96f6fc8338346f 32,35,217,225-226,237,240-241,244
+src/department/container.ts
+  s_2b6f9fe68bd5ae::t_0040d0dd5966a4 201-203
+src/department/engine.test.ts
+  s_2b6f9fe68bd5ae::t_68281fa472dd79 23-27,29,31,41-42,45,48,284-285,339-419
+src/department/engine.ts
+  s_2b6f9fe68bd5ae::t_ecf0de9877c890 257,278-313,339,344-392,424-428,453-458
+src/department/execution-token-endpoint.test.ts
+  s_2b6f9fe68bd5ae::t_bf976bb9bbc568 10,23
+src/department/execution-token-endpoint.ts
+  s_2b6f9fe68bd5ae::t_f0e787355f1d35 40
+src/department/execution-token-manager.test.ts
+  s_2b6f9fe68bd5ae::t_6a675570d81d0d 5,11
+src/department/execution-token-manager.ts
+  s_2b6f9fe68bd5ae::t_6336da153ef92d 4,10,14,25-26,28,38,93,132
+src/department/fixtures/mcp-client-runtime.ts
+  s_2b6f9fe68bd5ae::t_88036bbd932a9f 5-7,27-43,45-59,64-68
+src/department/manager-oauth.real.test.ts
+  s_2b6f9fe68bd5ae::t_2d8afe0f2677b3 4-5,9-10,170-182,205
+src/department/manager-oauth.test.ts
+  s_2b6f9fe68bd5ae::t_dcabfb9fafc622 4-5,22,26,30-40,177,187-188,191-194,198-266,304,404-412,423-428,443-451,479
+src/department/manager.artifacts.test.ts
+  s_2b6f9fe68bd5ae::t_0ebdf866d65e68 5
+src/department/manager.ts
+  s_2b6f9fe68bd5ae::t_720fe9dbfccfec 50,62,68,95,109,114,218,220,222,224,227,255-256,260-269,335,342,349,754,758,817,1135-1137,1147-1148,1165,1168-1169,1171-1176
+src/department/mcp-headers-helper.test.ts
+  s_2b6f9fe68bd5ae::t_5cc0fbe368c3f5 15-20,44,97-107,114-151
+src/department/mcp-headers-helper.ts
+  s_2b6f9fe68bd5ae::t_0c30cfd9ce9602 20-23,45-52,87-91,97-100
+src/department/mcp-relay.test.ts
+  s_2b6f9fe68bd5ae::t_4a62481e5b8289 2,13-14,16,65,85,122,162,188,270,276-277
+src/department/mcp-relay.ts
+  s_2b6f9fe68bd5ae::t_dd2a76549c1d34 2,40,86,110,118,140,153,175,183,195,202,228
+src/department/pipeline-drive.ts
+  s_2b6f9fe68bd5ae::t_f849dbcfc0e7ba 79,580
+src/shipper/cursor.ts
+  s_2b6f9fe68bd5ae::t_074a118d1bbd74 26
+tests/connection.test.ts
+  s_2b6f9fe68bd5ae::t_bf925c04be2083 4
+tests/register-credential.test.ts
+  s_2b6f9fe68bd5ae::t_17d8f0663e214d 9,14-15,229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "fef5eb2fd36bfd80d60e208cfe47dc5eacddacdf",
+  "prompts": {},
+  "sessions": {
+    "s_2b6f9fe68bd5ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_2b6f9fe68bd5ae",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
