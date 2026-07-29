@@ -2,7 +2,7 @@
  * `requestExecutionToken` — the `client_credentials` execution-token
  * exchange (department-mesh d6, 13-mcp-authorization.md §12). Mocks the
  * cloud AS's `/oauth/token` endpoint at the `fetch` seam, matching
- * `cloud/apps/api/src/modules/mesh-oauth/routes.ts`'s
+ * `cloud/apps/api/src/modules/department-oauth/routes.ts`'s
  * `handleClientCredentialsGrant` contract exactly: HTTP Basic
  * `client_id:client_secret`, form body `grant_type=client_credentials
  * &resource=<mcp aud>&scope=mesh:execution&execution_id=<id>`, success body
@@ -12,8 +12,8 @@
 
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock } from '../../tests/_helpers';
-import type { FetchLike } from './mesh-oauth';
-import { meshMcpResource, requestExecutionToken } from './mesh-oauth';
+import type { FetchLike } from './department-oauth';
+import { departmentMcpResource, requestExecutionToken } from './department-oauth';
 
 const BASE_URL = 'https://api.ai-pipeline.dev';
 const CLIENT_ID = 'run_abc123';
@@ -39,11 +39,11 @@ function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-describe('meshMcpResource', () => {
+describe('departmentMcpResource', () => {
   test('appends /mcp and strips trailing slashes', () => {
-    expect(meshMcpResource('https://api.ai-pipeline.dev')).toBe('https://api.ai-pipeline.dev/mcp');
-    expect(meshMcpResource('https://api.ai-pipeline.dev/')).toBe('https://api.ai-pipeline.dev/mcp');
-    expect(meshMcpResource('https://api.ai-pipeline.dev///')).toBe('https://api.ai-pipeline.dev/mcp');
+    expect(departmentMcpResource('https://api.ai-pipeline.dev')).toBe('https://api.ai-pipeline.dev/mcp');
+    expect(departmentMcpResource('https://api.ai-pipeline.dev/')).toBe('https://api.ai-pipeline.dev/mcp');
+    expect(departmentMcpResource('https://api.ai-pipeline.dev///')).toBe('https://api.ai-pipeline.dev/mcp');
   });
 });
 

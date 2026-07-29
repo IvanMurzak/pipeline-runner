@@ -6,7 +6,7 @@
  *   - chunking at 256 KiB and byte-exact reassembly (verified two ways: every
  *     frame validates against the REAL `DeptArtifactMessageSchema` from
  *     `@baizor/pipeline-protocol` — the same schema the cloud gateway parses
- *     inbound frames with before `mesh-artifacts/reassembly.ts` ever sees
+ *     inbound frames with before `department-artifacts/reassembly.ts` ever sees
  *     them — and an independent local re-implementation of that reassembler's
  *     concatenation algorithm reproduces the ORIGINAL bytes exactly);
  *   - every cap (1 MiB/artifact, 8 MiB/task, 64 KiB inline) rejects BEFORE
@@ -87,7 +87,7 @@ class FakeArtifactFs implements ArtifactFileSystem {
 }
 
 /**
- * Independent re-implementation of `mesh-artifacts/reassembly.ts`'s
+ * Independent re-implementation of `department-artifacts/reassembly.ts`'s
  * concatenation step (cloud repo, task c9): decode each chunk's base64
  * `bytes` and concatenate them in `chunk_index` order. Deliberately
  * reimplemented here rather than imported — the two repos do not share code

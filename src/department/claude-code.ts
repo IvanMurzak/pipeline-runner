@@ -65,9 +65,20 @@
  * `--mcp-config` accepts an inline JSON STRING (`claude --help`: "Load MCP
  * servers from JSON files or strings"), and a remote entry's `url`/`headers`
  * values are `${VAR}`-expanded from the child's environment. So the entry this
- * module emits carries the LITERAL text `${PIPELINE_MESH_MCP_URL}` and
- * `Bearer ${PIPELINE_MESH_EXECUTION_TOKEN}` — the supervisor already put both
- * variables in `RuntimeConfig.env` (`./manager.ts`'s `resolveMcpEnv`), and
+ * module emits carries the LITERAL text `${PIPELINE_DEPARTMENT_MCP_URL}` and
+ * `Bearer ${PIPELINE_DEPARTMENT_EXECUTION_TOKEN}` — the supervisor already put
+ * both variables in `RuntimeConfig.env` (`./manager.ts`'s `resolveMcpEnv`), and
+ *
+ * b5 NOTE, and the reason this line is not a cosmetic rename: the `${…}` here
+ * is expanded by CLAUDE CODE, not by this process. Emitting a name is
+ * therefore a statement about what the VENDOR must find in the child's
+ * environment, and getting it wrong loses the MCP connection silently rather
+ * than loudly. It is safe only because `resolveMcpEnv` sets BOTH the new
+ * spelling and the pre-rename `PIPELINE_MESH_*` one on every spawn
+ * (`./engine.ts`'s `withLegacyEngineMcpEnvAliases`); the name is interpolated
+ * from `ENGINE_MCP_URL_ENV` rather than typed out, so the emitted text and the
+ * injected key cannot drift (`./claude-code.test.ts` asserts exactly that).
+ *
  * NEITHER the URL nor the bearer ever appears on a command line, in a log
  * line, or in an error message (10-security.md §6; `a6`'s precedent).
  *

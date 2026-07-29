@@ -6,13 +6,13 @@
  * deployed runner may break**. Every failure mode of the OAuth path gets its
  * own test asserting the runner still ends up with a usable credential, because
  * registration is a hard gate with no graceful degradation — a wrong answer
- * here does not degrade a runner, it removes it from the fleet.
+ * here does not degrade a runner, it takes that runner offline entirely.
  */
 
 import { describe, expect, test } from 'bun:test';
 import { ConfigStore, type AgentIdentity } from '../src/core/config';
-import type { ClientCredentialsResult, FetchLike, RequestRunnerRegistrationTokenOptions } from '../src/core/mesh-oauth';
-import { REGISTRATION_TOKEN_TIMEOUT_MS, requestRunnerRegistrationToken } from '../src/core/mesh-oauth';
+import type { ClientCredentialsResult, FetchLike, RequestRunnerRegistrationTokenOptions } from '../src/core/department-oauth';
+import { REGISTRATION_TOKEN_TIMEOUT_MS, requestRunnerRegistrationToken } from '../src/core/department-oauth';
 import {
   canMintRegistrationToken,
   carryForwardLegacyToken,
@@ -226,7 +226,7 @@ describe('a migrated runner (DoD: the plaintext token is no longer required)', (
 describe('R11 — every way the OAuth path can fail falls back to the legacy token', () => {
   const failures: Array<[string, ClientCredentialsResult]> = [
     ['the token endpoint is unreachable', { ok: false, error: { error: 'network_error', description: 'ECONNREFUSED' } }],
-    ['the mesh kill switch / OAUTH_TOKEN_SECRET makes /oauth/token 503', { ok: false, error: { error: 'unknown_error', status: 503 } }],
+    ['the cloud kill switch (`MESH_ENABLED`, an ops identifier `c11` kept) / OAUTH_TOKEN_SECRET makes /oauth/token 503', { ok: false, error: { error: 'unknown_error', status: 503 } }],
     ['the client secret is wrong or stale', { ok: false, error: { error: 'invalid_client', status: 401 } }],
     ['the deployment refuses the api audience', { ok: false, error: { error: 'invalid_target', status: 400 } }],
     ['the success body is malformed', { ok: false, error: { error: 'invalid_response', status: 200 } }],

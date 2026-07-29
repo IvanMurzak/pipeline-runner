@@ -7,7 +7,7 @@
  * response shape) but a FAKE `ExecutionTokenSource`, so nothing here touches
  * the network or an authorization server. The real `client_credentials`
  * exchange behind it already has its own suites
- * (`./execution-token-manager.test.ts`, `../core/mesh-oauth.test.ts`), and
+ * (`./execution-token-manager.test.ts`, `../core/department-oauth.test.ts`), and
  * the full chain — real AS, real subprocess, real shell — is
  * `./mcp-headers-helper.real.test.ts`.
  *
@@ -20,7 +20,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock } from '../../tests/_helpers';
-import type { ExecutionTokenResult } from '../core/mesh-oauth';
+import type { ExecutionTokenResult } from '../core/department-oauth';
 import { ExecutionTokenEndpoint, HELPER_ENDPOINT_PATH, readBearer, secretsMatch } from './execution-token-endpoint';
 import type { ExecutionTokenSource } from './execution-token-manager';
 

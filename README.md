@@ -258,6 +258,31 @@ Before this, `bind` stored whatever string it was given, so a wrong id produced
 a stored binding, a success line, and a `capability` reject on the first task
 that ever arrived. Callers can therefore stop mirroring this table and just ask.
 
+### What the runner puts in a department session's environment
+
+When the runner can mint an execution token for a task, it injects the
+department MCP connection into the spawned process's environment — that is the
+whole of "point a model-driven runtime at `/mcp`". A JSONL runtime is free to
+ignore these; an MCP-speaking one becomes its own client with nothing else.
+
+| Variable | Meaning |
+|---|---|
+| `PIPELINE_DEPARTMENT_MCP_URL` | The department MCP endpoint for this execution. |
+| `PIPELINE_DEPARTMENT_EXECUTION_TOKEN` | A short-lived, audience-restricted bearer for it. Never logged, never on a command line. |
+| `PIPELINE_DEPARTMENT_HELPER_URL` | Loopback endpoint that hands back a FRESH token, so a session outliving its token keeps its tools. |
+| `PIPELINE_DEPARTMENT_HELPER_SECRET` | Per-execution secret authorizing exactly that one call. Never logged, never on a command line. |
+
+All four are injected only when the runner actually has something to inject:
+no registration, no execution token, or a refused loopback grant each mean the
+corresponding variables are simply absent, and every shipped engine tolerates
+that.
+
+**These were named `PIPELINE_MESH_*` before.** For the duration of the rename
+window the runner sets **both** spellings on every spawn, pointing at the same
+values, and reads the new name first and the old one as a fallback. A runtime
+written against either generation keeps working, with no flag and no
+configuration. The old names will be dropped in a later release that says so.
+
 ### `PIPELINE_RUNNER_DEPARTMENTS` is deprecated
 
 The old environment variable still works, unchanged, **when no binding file
@@ -333,7 +358,7 @@ uploaded.
 **Disclosure (shown at runner registration):** on a machine registered as a
 runner, this covers *cloud-dispatched* runs **and** pipeline runs you start
 *locally* on that machine — local-run metric sync is **on by default** so
-your dashboards see your whole fleet's activity. Records are tagged
+your dashboards see every runner you have in one place. Records are tagged
 `origin: "dispatched" | "local"` so analytics can tell them apart. Late token
 enrichment is picked up by a periodic rescan (14-day window per record) and
 re-synced as a superseding revision of the same record.

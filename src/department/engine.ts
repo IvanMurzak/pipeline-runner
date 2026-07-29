@@ -254,7 +254,7 @@ export interface EngineModule extends AgentRuntimeAdapter {
   /**
    * x20 — the isolation tier this module ACTUALLY provides
    * (`../core/capabilities.ts`'s `IsolationTier`, the same vocabulary
-   * `register --container` advertises and the mesh scheduler matches a
+   * `register --container` advertises and the cloud scheduler matches a
    * department's `requiredIsolation` against).
    *
    * Exactly one shipped module answers `'container'`, and that asymmetry is
@@ -275,9 +275,42 @@ export interface EngineModule extends AgentRuntimeAdapter {
 
 // ── Responsibility 4: refusing, rather than running blind (D24) ─────────────
 
-/** The URL + token the supervisor injects for a spawn (`./manager.ts`). */
-export const ENGINE_MCP_URL_ENV = 'PIPELINE_MESH_MCP_URL';
-export const ENGINE_MCP_TOKEN_ENV = 'PIPELINE_MESH_EXECUTION_TOKEN';
+/**
+ * The URL + token the supervisor injects for a spawn (`./manager.ts`).
+ *
+ * ── The dual-name window (simplified-onboarding b5, 08-terminology.md §3) ──
+ * These four names were `PIPELINE_MESH_*` up to and including the P4 gate.
+ * Renaming them is not a rename of a symbol this repo owns end to end: the
+ * VALUES cross a process boundary in three directions at once, and each one
+ * fails differently.
+ *
+ *   1. The supervisor SETS them on a child (`./manager.ts`'s `resolveMcpEnv`).
+ *   2. Engine modules in THIS build READ them back off the invocation
+ *      (`requireEngineMcpEnv` below).
+ *   3. Things this build does NOT control read them out of a real process
+ *      environment: `./claude-code.ts` hands Claude Code the LITERAL text
+ *      `${…}` for the VENDOR to expand, `./mcp-headers-helper.ts` runs as a
+ *      grandchild of the session, and a user's own JSONL runtime may read
+ *      whichever name it was written against.
+ *
+ * So the window is not belt-and-braces: a runtime built against the old names
+ * and a runtime built against the new ones must BOTH work, in the same build,
+ * with no flag. The rule is therefore symmetric and stated once here:
+ *
+ *   - **Every setter sets both** — `withLegacyEngineMcpEnvAliases()` below is
+ *     the only sanctioned way to build the map, and `./manager.ts` uses it.
+ *   - **Every reader reads the new name first, then the old** —
+ *     `readEngineEnv()` below is the only sanctioned way to read one.
+ *
+ * The old names are dropped by `c13`, on evidence, not on a calendar.
+ */
+export const ENGINE_MCP_URL_ENV = 'PIPELINE_DEPARTMENT_MCP_URL';
+export const ENGINE_MCP_TOKEN_ENV = 'PIPELINE_DEPARTMENT_EXECUTION_TOKEN';
+
+/** The pre-`b5` spellings. Still SET on every spawn and still READ as a
+ *  fallback — see the window note above. */
+export const ENGINE_MCP_URL_ENV_LEGACY = 'PIPELINE_MESH_MCP_URL';
+export const ENGINE_MCP_TOKEN_ENV_LEGACY = 'PIPELINE_MESH_EXECUTION_TOKEN';
 
 /**
  * x21 (D33) — the OTHER half of responsibility 3, the half D23 specified and
@@ -303,12 +336,60 @@ export const ENGINE_MCP_TOKEN_ENV = 'PIPELINE_MESH_EXECUTION_TOKEN';
  * absent is the normal, working, pre-x21 state and every engine must tolerate
  * it (`./claude-code.ts` falls back to the static header).
  */
-export const ENGINE_MCP_HELPER_URL_ENV = 'PIPELINE_MESH_HELPER_URL';
+export const ENGINE_MCP_HELPER_URL_ENV = 'PIPELINE_DEPARTMENT_HELPER_URL';
 /** SECRET. Per-execution, loopback-only, in-memory, revoked at terminal. It
  *  authorizes exactly one thing: "hand me a fresh token for MY execution".
  *  Same discipline as the token itself — never on a command line, never on
  *  disk, never logged. */
-export const ENGINE_MCP_HELPER_SECRET_ENV = 'PIPELINE_MESH_HELPER_SECRET';
+export const ENGINE_MCP_HELPER_SECRET_ENV = 'PIPELINE_DEPARTMENT_HELPER_SECRET';
+
+/** The pre-`b5` spellings of the two above — same dual-name window. */
+export const ENGINE_MCP_HELPER_URL_ENV_LEGACY = 'PIPELINE_MESH_HELPER_URL';
+export const ENGINE_MCP_HELPER_SECRET_ENV_LEGACY = 'PIPELINE_MESH_HELPER_SECRET';
+
+/** Every renamed variable, new name → the name it used to have. THE table:
+ *  `withLegacyEngineMcpEnvAliases` and `readEngineEnv` are both derived from
+ *  it, so a fifth variable cannot be half-added. */
+export const ENGINE_ENV_LEGACY_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  [ENGINE_MCP_URL_ENV]: ENGINE_MCP_URL_ENV_LEGACY,
+  [ENGINE_MCP_TOKEN_ENV]: ENGINE_MCP_TOKEN_ENV_LEGACY,
+  [ENGINE_MCP_HELPER_URL_ENV]: ENGINE_MCP_HELPER_URL_ENV_LEGACY,
+  [ENGINE_MCP_HELPER_SECRET_ENV]: ENGINE_MCP_HELPER_SECRET_ENV_LEGACY,
+});
+
+/**
+ * The SETTER half of the window: given a map keyed by the NEW names, return
+ * one that also carries every legacy spelling, pointing at the same value.
+ *
+ * Pure and total — a key with no legacy alias (there are none today, but the
+ * supervisor is free to inject others) passes through untouched, and an
+ * already-aliased map is idempotent under a second application.
+ */
+export function withLegacyEngineMcpEnvAliases(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { ...env };
+  for (const [current, legacy] of Object.entries(ENGINE_ENV_LEGACY_ALIASES)) {
+    const value = env[current];
+    if (typeof value === 'string') out[legacy] = value;
+  }
+  return out;
+}
+
+/**
+ * The READER half of the window: the new name if it is set to a non-empty
+ * string, else the legacy spelling, else `undefined`.
+ *
+ * Deliberately takes a plain record rather than an `InvocationEnvelope` — the
+ * same function has to serve `process.env` in `./mcp-headers-helper.ts`, which
+ * runs in a different process entirely and never sees an invocation.
+ */
+export function readEngineEnv(env: Record<string, string | undefined>, name: string): string | undefined {
+  const current = env[name];
+  if (typeof current === 'string' && current.length > 0) return current;
+  const legacy = ENGINE_ENV_LEGACY_ALIASES[name];
+  if (legacy === undefined) return undefined;
+  const fallback = env[legacy];
+  return typeof fallback === 'string' && fallback.length > 0 ? fallback : undefined;
+}
 
 /** What responsibility 3 needs, once. Nothing else about the connection is
  *  the supervisor's business — how a module keeps it alive across token
@@ -340,10 +421,11 @@ export interface EngineMcpHelperChannel {
  */
 export function readEngineMcpHelperChannel(invocation: InvocationEnvelope): EngineMcpHelperChannel | null {
   const env = invocation.runtime.env ?? {};
-  const url = env[ENGINE_MCP_HELPER_URL_ENV];
-  const secret = env[ENGINE_MCP_HELPER_SECRET_ENV];
-  if (typeof url !== 'string' || url.length === 0) return null;
-  if (typeof secret !== 'string' || secret.length === 0) return null;
+  // b5: new name first, legacy second — a session spawned by a pre-b5
+  // supervisor still gets its re-auth channel.
+  const url = readEngineEnv(env, ENGINE_MCP_HELPER_URL_ENV);
+  const secret = readEngineEnv(env, ENGINE_MCP_HELPER_SECRET_ENV);
+  if (url === undefined || secret === undefined) return null;
   return { url, secret };
 }
 
@@ -368,9 +450,12 @@ export class EngineMcpUnavailableError extends RuntimeAdapterError {}
  */
 export function requireEngineMcpEnv(invocation: InvocationEnvelope, engine: string): EngineMcpEnv {
   const env = invocation.runtime.env ?? {};
-  const url = env[ENGINE_MCP_URL_ENV];
-  const token = env[ENGINE_MCP_TOKEN_ENV];
-  if (typeof url !== 'string' || url.length === 0 || typeof token !== 'string' || token.length === 0) {
+  // b5: new name first, legacy second. A `PIPELINE_MESH_*`-only invocation —
+  // one built by a supervisor from before this rename — must still connect,
+  // not be refused with "no MCP connection is available".
+  const url = readEngineEnv(env, ENGINE_MCP_URL_ENV);
+  const token = readEngineEnv(env, ENGINE_MCP_TOKEN_ENV);
+  if (url === undefined || token === undefined) {
     throw new EngineMcpUnavailableError(
       `${engine}: refusing to start — no department MCP connection is available for this execution ` +
         `(${ENGINE_MCP_URL_ENV}/${ENGINE_MCP_TOKEN_ENV} not injected: the runner is unregistered, ` +

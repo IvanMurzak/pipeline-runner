@@ -1,17 +1,17 @@
 /**
  * `ExecutionTokenManager` — the in-memory holder for execution-scoped OAuth
  * tokens (department-mesh task d6; `13-mcp-authorization.md` §12). Sits
- * between `../core/mesh-oauth.ts` (the stateless `client_credentials`
+ * between `../core/department-oauth.ts` (the stateless `client_credentials`
  * exchange) and `./manager.ts` (the supervisor): caches one live token per
  * execution, dedupes concurrent requests for the same execution, and
  * exposes the "re-REQUEST, not refresh" operation lease renewal needs.
  *
  * The token is held ONLY here, in memory — never written to disk, never
- * placed on a wire frame, never logged (see `../core/mesh-oauth.ts`'s
+ * placed on a wire frame, never logged (see `../core/department-oauth.ts`'s
  * secrets-discipline note; this module inherits the same rule and adds none
  * of its own logging that could regress it).
  *
- * `./mesh-relay.ts`'s durability relay reads through this same cache at
+ * `./mcp-relay.ts`'s durability relay reads through this same cache at
  * drain time (13 §12.1: "re-attaches a current execution token from memory
  * at drain … if the token has expired by then, the relay re-requests one")
  * — `getToken()` already does exactly that (expired ⇒ transparent
@@ -22,10 +22,10 @@ import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
-import type { ExecutionTokenResult, FetchLike, RequestExecutionTokenOptions } from '../core/mesh-oauth';
-import { meshMcpResource, requestExecutionToken } from '../core/mesh-oauth';
+import type { ExecutionTokenResult, FetchLike, RequestExecutionTokenOptions } from '../core/department-oauth';
+import { departmentMcpResource, requestExecutionToken } from '../core/department-oauth';
 
-/** Narrowed to exactly the shape `./manager.ts` and `./mesh-relay.ts` need —
+/** Narrowed to exactly the shape `./manager.ts` and `./mcp-relay.ts` need —
  *  real callers get `ExecutionTokenManager`; tests substitute a fake this
  *  interface, never a full manager. */
 export interface ExecutionTokenSource {
@@ -35,7 +35,7 @@ export interface ExecutionTokenSource {
   /** `${base_url}/mcp`, or null before this runner has a `base_url` / any
    *  identity configured at all. Lets callers (the manager, when injecting
    *  the runtime's env) build the direct-call URL without duplicating the
-   *  `../core/mesh-oauth.ts` normalization. */
+   *  `../core/department-oauth.ts` normalization. */
   resourceUrl(): string | null;
 }
 
@@ -90,7 +90,7 @@ export class ExecutionTokenManager implements ExecutionTokenSource {
 
   resourceUrl(): string | null {
     const baseUrl = this.options.baseUrl();
-    return baseUrl === null ? null : meshMcpResource(baseUrl);
+    return baseUrl === null ? null : departmentMcpResource(baseUrl);
   }
 
   /** A live, cached token for `executionId` — requests fresh only when
@@ -129,7 +129,7 @@ export class ExecutionTokenManager implements ExecutionTokenSource {
     const clientId = this.options.clientId();
     const clientSecret = this.options.clientSecret();
     if (baseUrl === null || clientId === null || clientSecret === null) {
-      this.logger.warn(`mesh-oauth: cannot request an execution token for ${executionId} — runner is not registered yet`);
+      this.logger.warn(`department-oauth: cannot request an execution token for ${executionId} — runner is not registered yet`);
       return Promise.resolve(NOT_REGISTERED);
     }
 

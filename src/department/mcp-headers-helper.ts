@@ -17,7 +17,10 @@
  *
  * ## What it reads, and from where — this is the whole security argument
  *
- *   - `PIPELINE_MESH_HELPER_URL` / `PIPELINE_MESH_HELPER_SECRET` from its own
+ *   - `PIPELINE_DEPARTMENT_HELPER_URL` / `PIPELINE_DEPARTMENT_HELPER_SECRET`
+ *     (b5: falling back to the pre-rename `PIPELINE_MESH_HELPER_*` spellings,
+ *     because this program runs as a GRANDCHILD of the supervisor and may be
+ *     a newer build than the session that spawned it) from its own
  *     **environment**, inherited from the Claude Code session the supervisor
  *     spawned. Never from argv: `/proc/<pid>/cmdline` is world-readable
  *     (0444) while `/proc/<pid>/environ` is owner-only (0400) — the same
@@ -38,6 +41,14 @@
  * `process.env` is identical on both, needs no `curl` on the box, and is
  * testable.
  */
+
+// b5: the ONLY import this program has, and deliberately a cheap one —
+// `./engine.ts` pulls in `./adapter.ts` (which imports nothing at all) and two
+// type-only references. It buys the single source of truth for the variable
+// names and the new-then-legacy read order, which is worth more here than
+// independence: a helper that disagreed with the supervisor about a name is
+// exactly the silent 401 loop x21 was built to end.
+import { ENGINE_MCP_HELPER_SECRET_ENV, ENGINE_MCP_HELPER_URL_ENV, readEngineEnv } from './engine';
 
 /** Claude Code allows the helper 10s; fail inside that window so the CLI sees
  *  a clean non-zero exit and its own message rather than a kill. */
@@ -73,15 +84,20 @@ function isHeaderMap(value: unknown): value is Record<string, string> {
 export async function runHeadersHelper(io: HelperIo): Promise<number> {
   // `bun <script> <executionId>` ⇒ [bunPath, scriptPath, executionId].
   const executionId = io.argv[2];
-  const url = io.env.PIPELINE_MESH_HELPER_URL;
-  const secret = io.env.PIPELINE_MESH_HELPER_SECRET;
+  // b5: new names first, pre-rename spellings as a fallback — the same
+  // `readEngineEnv` the in-process engines use, so there is exactly ONE
+  // definition of "which name wins" in the build.
+  const url = readEngineEnv(io.env, ENGINE_MCP_HELPER_URL_ENV);
+  const secret = readEngineEnv(io.env, ENGINE_MCP_HELPER_SECRET_ENV);
 
   if (typeof executionId !== 'string' || executionId.length === 0) {
     io.stderr('pipeline mcp-headers-helper: no execution id argument\n');
     return 2;
   }
-  if (typeof url !== 'string' || url.length === 0 || typeof secret !== 'string' || secret.length === 0) {
-    io.stderr('pipeline mcp-headers-helper: PIPELINE_MESH_HELPER_URL/PIPELINE_MESH_HELPER_SECRET are not set in this environment\n');
+  if (url === undefined || secret === undefined) {
+    io.stderr(
+      `pipeline mcp-headers-helper: ${ENGINE_MCP_HELPER_URL_ENV}/${ENGINE_MCP_HELPER_SECRET_ENV} are not set in this environment\n`
+    );
     return 2;
   }
 

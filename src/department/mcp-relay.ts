@@ -1,5 +1,5 @@
 /**
- * `MeshRelay` — the OPTIONAL durability relay (department-mesh task d6;
+ * `McpRelay` — the OPTIONAL durability relay (department-mesh task d6;
  * `13-mcp-authorization.md` §12.1, threat T26). A department runtime MAY
  * call `/mcp` directly; it MAY instead be configured to route through this
  * relay, which forwards upstream live and — the property a direct HTTPS
@@ -37,7 +37,7 @@ import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
-import type { FetchLike } from '../core/mesh-oauth';
+import type { FetchLike } from '../core/department-oauth';
 import type { ShipperFileSystem } from '../shipper/fs';
 import { Spool } from '../shipper/spool';
 import type { IngestBatchRequest } from '../shipper/wire-ingest';
@@ -83,7 +83,7 @@ export interface RelayDrainSummary {
   remaining: number;
 }
 
-export interface MeshRelayOptions {
+export interface McpRelayOptions {
   tokenSource: Pick<ExecutionTokenSource, 'getToken' | 'resourceUrl'>;
   /** Directory the spool's numbered chunks live under — MUST be distinct
    *  from the shipper's own spool dir (`../shipper/shipper.ts`'s wiring);
@@ -107,7 +107,7 @@ function stripAuthorization(headers: Record<string, string>): Record<string, str
   return out;
 }
 
-export class MeshRelay {
+export class McpRelay {
   private readonly tokenSource: Pick<ExecutionTokenSource, 'getToken' | 'resourceUrl'>;
   private readonly spool: Spool;
   private readonly fetchImpl: FetchLike;
@@ -115,7 +115,7 @@ export class MeshRelay {
   private readonly logger: Logger;
   private seqCounter = 0;
 
-  constructor(options: MeshRelayOptions) {
+  constructor(options: McpRelayOptions) {
     this.tokenSource = options.tokenSource;
     this.spool = new Spool(options.fs, options.spoolDir, options.maxEvents);
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -137,7 +137,7 @@ export class MeshRelay {
     const tokenResult = await this.tokenSource.getToken(request.executionId);
     if (!tokenResult.ok) {
       this.logger.warn(
-        `mesh-relay: forward for execution ${request.executionId} refused — no execution token (${tokenResult.error.error})`
+        `mcp-relay: forward for execution ${request.executionId} refused — no execution token (${tokenResult.error.error})`
       );
       return { ok: false, error: tokenResult.error.error };
     }
@@ -150,7 +150,7 @@ export class MeshRelay {
     // Network-level failure only — a real HTTP response (even 4xx/5xx) is
     // "delivered" above and passed through verbatim; it is never spooled.
     this.spoolCall({ ...request, headers: strippedHeaders });
-    this.logger.warn(`mesh-relay: execution ${request.executionId} call ${request.callId} spooled — network unreachable (${attempt.error})`);
+    this.logger.warn(`mcp-relay: execution ${request.executionId} call ${request.callId} spooled — network unreachable (${attempt.error})`);
     return { ok: true, delivered: false, spooled: true };
   }
 
@@ -172,7 +172,7 @@ export class MeshRelay {
       if (chunk === null) break;
       const record = extractRecord(chunk.batch);
       if (record === null) {
-        this.logger.warn(`mesh-relay: spool chunk ${chunk.name} is corrupt — discarding`);
+        this.logger.warn(`mcp-relay: spool chunk ${chunk.name} is corrupt — discarding`);
         this.spool.remove(chunk.name);
         continue;
       }
@@ -180,7 +180,7 @@ export class MeshRelay {
       const tokenResult = await this.tokenSource.getToken(record.executionId);
       if (!tokenResult.ok) {
         this.logger.warn(
-          `mesh-relay: drain paused at execution ${record.executionId} call ${record.callId} — no execution token (${tokenResult.error.error})`
+          `mcp-relay: drain paused at execution ${record.executionId} call ${record.callId} — no execution token (${tokenResult.error.error})`
         );
         break; // preserve order — retry from here on the next drain()
       }
@@ -192,14 +192,14 @@ export class MeshRelay {
         continue;
       }
       if (attempt.kind === 'delivered' && attempt.status >= 400 && attempt.status < 500) {
-        this.logger.warn(`mesh-relay: execution ${record.executionId} call ${record.callId} rejected (HTTP ${attempt.status}) — set aside`);
+        this.logger.warn(`mcp-relay: execution ${record.executionId} call ${record.callId} rejected (HTTP ${attempt.status}) — set aside`);
         this.spool.reject(chunk.name);
         rejected += 1;
         continue;
       }
       // 5xx or a network-level failure — stop; preserve order for retry.
       this.logger.warn(
-        `mesh-relay: drain paused at execution ${record.executionId} call ${record.callId} — ${
+        `mcp-relay: drain paused at execution ${record.executionId} call ${record.callId} — ${
           attempt.kind === 'delivered' ? `upstream HTTP ${attempt.status}` : attempt.error
         }`
       );
@@ -225,7 +225,7 @@ export class MeshRelay {
     const { dropped } = this.spool.append(batch);
     for (const drop of dropped) {
       this.logger.error(
-        `mesh-relay: spool cap exceeded — dropped ${drop.eventCount} queued call(s) for execution ${drop.runId} (chunk ${drop.name})`
+        `mcp-relay: spool cap exceeded — dropped ${drop.eventCount} queued call(s) for execution ${drop.runId} (chunk ${drop.name})`
       );
     }
   }

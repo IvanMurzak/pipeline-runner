@@ -2,7 +2,7 @@
  * `DepartmentManager` × artifact upload wiring (department-mesh task d3, 08
  * §6 / 09 §3.1). Uses the SAME `FakeAdapter`/`makeMessage`/`makeOffer` shape
  * as `./manager.test.ts` but is its own file — mirrors the split
- * `./manager-mesh-oauth.test.ts` already uses for the same reason: this
+ * `./manager-oauth.test.ts` already uses for the same reason: this
  * task's wiring is additive and orthogonal to that suite's existing coverage.
  *
  * Covers the manager-level half of the DoD that `./artifact-upload.test.ts`

@@ -57,8 +57,8 @@ import { systemClock } from './clock';
 import type { AgentIdentity, ConfigStore } from './config';
 import type { Logger } from './log';
 import { nullLogger } from './log';
-import type { ClientCredentialsResult, FetchLike, RequestRunnerRegistrationTokenOptions } from './mesh-oauth';
-import { requestRunnerRegistrationToken } from './mesh-oauth';
+import type { ClientCredentialsResult, FetchLike, RequestRunnerRegistrationTokenOptions } from './department-oauth';
+import { requestRunnerRegistrationToken } from './department-oauth';
 
 /** Mirrors the cloud's `RunnerCredentialClass` (`runners/credential-window.ts`)
  *  — the two classes the gateway's dual-accept window distinguishes. */
@@ -288,7 +288,7 @@ export class RegisterCredentialProvider {
     }
 
     // Every refusal, every network failure, every malformed body lands here.
-    // `mesh-oauth.ts` has already logged the OAuth error code; this line says
+    // `department-oauth.ts` has already logged the OAuth error code; this line says
     // what the runner is going to DO about it, which is the operator-facing
     // half. Neither line carries a credential.
     const reason = `could not obtain a runner:register token (${result.error.error})`;

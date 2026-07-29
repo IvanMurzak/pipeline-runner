@@ -2,17 +2,17 @@
  * The `AgentRuntimeAdapter` abstraction (department-mesh, task d1;
  * `07-runtime-contract.md` §2). Today the runner has exactly one runtime
  * (`pipeline drive`), reached by one hard-coded subprocess contract, with no
- * way to talk to a running child. This is the seam that lets the mesh treat
- * ANY external process, container, or MCP-speaking agent as a "department" —
- * a normalized start/send/cancel/dispose surface plus a normalized upward
- * event stream, with the wire framing, CLI flags, session ids, and provider
- * auth hidden inside the adapter.
+ * way to talk to a running child. This is the seam that lets the supervisor
+ * treat ANY external process, container, or MCP-speaking agent as a
+ * "department" — a normalized start/send/cancel/dispose surface plus a
+ * normalized upward event stream, with the wire framing, CLI flags, session
+ * ids, and provider auth hidden inside the adapter.
  *
  * The adapter is explicitly NOT responsible for routing, lease management, or
  * protocol framing — those stay in the supervisor (`./manager.ts`). It is
  * also explicitly NOT the wire protocol: these are runner-LOCAL domain types.
- * `@baizor/pipeline-protocol` does not carry the mesh schemas yet (that lands
- * at the `e1` gate, 0.4.0) — nothing here imports it, and nothing here is a
+ * `@baizor/pipeline-protocol` does not carry the department schemas yet (that
+ * lands at the `e1` gate, 0.4.0) — nothing here imports it, and nothing here is a
  * zod schema. Field names are snake_case where they mirror a wire concept
  * (`08-protocol-delta.md`) purely so a future swap to the real protocol types
  * is a near drop-in, not because these types ARE the wire.
