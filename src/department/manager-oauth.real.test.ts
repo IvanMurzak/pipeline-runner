@@ -1,13 +1,13 @@
 /**
  * End-to-end integration over REAL HTTP + a REAL OS subprocess (department-
  * mesh d6). The rest of the d6 suite (`./execution-token-manager.test.ts`,
- * `../core/mesh-oauth.test.ts`, `./manager-mesh-oauth.test.ts`,
- * `./mesh-relay.test.ts`) exercises every branch against injected
+ * `../core/department-oauth.test.ts`, `./manager-oauth.test.ts`,
+ * `./mcp-relay.test.ts`) exercises every branch against injected
  * fakes/fetch stubs for speed and determinism; this file proves the
  * PRODUCTION wiring actually works: a real `fetch()` `client_credentials`
  * exchange against a `Bun.serve` mock of c12's `/oauth/token` contract, and
- * a real spawned process reading `PIPELINE_MESH_MCP_URL`/
- * `PIPELINE_MESH_EXECUTION_TOKEN` from its OWN environment and making a real
+ * a real spawned process reading `PIPELINE_DEPARTMENT_MCP_URL`/
+ * `PIPELINE_DEPARTMENT_EXECUTION_TOKEN` from its OWN environment and making a real
  * HTTP call to a mock `/mcp` — the DoD's "runner obtains an execution token
  * … a token for an execution it does not hold is refused" and "runtimes
  * reach /mcp with the execution token and can call the task.* surface",
@@ -167,8 +167,19 @@ describe('d6 real end-to-end: client_credentials exchange + spawned runtime reac
       const terminal = frames.find(isTerminal);
       expect(asDepartmentEvent(terminal!)?.event.type).toBe('completed');
 
-      const messageFrame = frames.map(asDepartmentEvent).find((f) => f?.event.type === 'message');
-      expect(messageFrame?.event.parts?.[0]?.text).toContain('mcp-call-ok status=200');
+      const messages = frames
+        .map(asDepartmentEvent)
+        .filter((f) => f?.event.type === 'message')
+        .map((f) => f?.event.parts?.[0]?.text ?? '');
+
+      // b5 — the dual-name window, PROVEN rather than asserted about a map
+      // this test built itself. `both` is emitted by the fixture only when the
+      // new spelling AND the pre-rename one are present in the REAL spawned
+      // process's environment and carry byte-identical values
+      // (`./fixtures/mcp-client-runtime.ts`'s `dualNameState`).
+      expect(messages).toContain('dual-name url=both token=both');
+      // And the call that used them actually landed.
+      expect(messages.some((text) => text.includes('mcp-call-ok status=200'))).toBe(true);
 
       // The AS actually minted a client_credentials token naming THIS execution.
       expect(cloud.issuedTokens.has('dexec-leased')).toBe(true);
@@ -191,7 +202,7 @@ describe('d6 real end-to-end: client_credentials exchange + spawned runtime reac
       await waitForTerminal(frames);
       const terminal = asDepartmentEvent(frames.find(isTerminal)!);
       expect(terminal?.event.type).toBe('failed');
-      expect(terminal?.event.reason).toContain('no PIPELINE_MESH_MCP_URL');
+      expect(terminal?.event.reason).toContain('no PIPELINE_DEPARTMENT_MCP_URL');
 
       expect(cloud.issuedTokens.has('dexec-not-mine')).toBe(false);
       expect(cloud.mcpCalls).toBe(0);

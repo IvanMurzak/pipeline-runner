@@ -2,13 +2,13 @@
  * `ExecutionTokenManager` — the in-memory execution-token cache
  * (department-mesh d6). Tests the CACHE's behaviour (reuse/expiry/dedup/
  * renew/discard) against an injected `requestToken` fake — the wire shape
- * itself is `../core/mesh-oauth.test.ts`'s job.
+ * itself is `../core/department-oauth.test.ts`'s job.
  */
 
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock } from '../../tests/_helpers';
 import { ExecutionTokenManager } from './execution-token-manager';
-import type { ExecutionTokenResult } from '../core/mesh-oauth';
+import type { ExecutionTokenResult } from '../core/department-oauth';
 
 const BASE_URL = 'https://api.ai-pipeline.dev';
 

@@ -198,7 +198,9 @@ export interface BuiltContainerInvocation {
    * Manager's "Command line" column), whereas a process's environment block
    * is not: `/proc/<pid>/environ` is 0400 owner-only, and reading another
    * process's environment on Windows needs `PROCESS_VM_READ`. The department
-   * execution token (`PIPELINE_MESH_EXECUTION_TOKEN`) flows through `env`, so
+   * execution token (`PIPELINE_DEPARTMENT_EXECUTION_TOKEN`, and the pre-rename
+   * `PIPELINE_MESH_EXECUTION_TOKEN` alias b5 keeps alongside it) flows through
+   * `env`, so
    * putting it on the argv leaked it to every local user — see
    * `./execution-token-manager.ts`'s never-on-disk invariant, which this is
    * the process-table half of.

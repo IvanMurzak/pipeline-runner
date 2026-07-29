@@ -1,7 +1,8 @@
 /**
  * `DepartmentManager` × `ExecutionTokenSource` wiring (department-mesh d6):
  * every (re)spawn requests an execution token and injects
- * `PIPELINE_MESH_MCP_URL`/`PIPELINE_MESH_EXECUTION_TOKEN` into the runtime's
+ * `PIPELINE_DEPARTMENT_MCP_URL`/`PIPELINE_DEPARTMENT_EXECUTION_TOKEN` (and,
+ * for b5's window, their pre-rename `PIPELINE_MESH_*` spellings) into the runtime's
  * env (07 §4 — "no adapter work at all", the URL+token are just env); a
  * refused/unavailable token degrades admission gracefully (existing JSONL
  * behaviour is unaffected, DoD: "existing behaviour unchanged"); a
@@ -18,14 +19,25 @@ import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import { Dispatcher } from '../core/dispatcher';
-import type { ExecutionTokenResult } from '../core/mesh-oauth';
+import type { ExecutionTokenResult } from '../core/department-oauth';
 import type { WireFrame } from '../core/wire';
 import type { RuntimeConfig } from './adapter';
 import { FakeAdapter, makeMessage } from './_test-helpers';
+import { readEngineMcpHelperChannel, requireEngineMcpEnv } from './engine';
 import type { ExecutionHeaderChannel, ExecutionHeaderChannelSource } from './execution-token-endpoint';
 import type { ExecutionTokenSource } from './execution-token-manager';
 import type { DepartmentOfferInput, JournalWriter } from './manager';
-import { DepartmentManager, MESH_EXECUTION_TOKEN_ENV, MESH_HELPER_SECRET_ENV, MESH_HELPER_URL_ENV, MESH_MCP_URL_ENV } from './manager';
+import {
+  DepartmentManager,
+  DEPARTMENT_EXECUTION_TOKEN_ENV,
+  DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY,
+  DEPARTMENT_HELPER_SECRET_ENV,
+  DEPARTMENT_HELPER_SECRET_ENV_LEGACY,
+  DEPARTMENT_HELPER_URL_ENV,
+  DEPARTMENT_HELPER_URL_ENV_LEGACY,
+  DEPARTMENT_MCP_URL_ENV,
+  DEPARTMENT_MCP_URL_ENV_LEGACY,
+} from './manager';
 
 const RESOURCE_URL = 'https://api.ai-pipeline.dev/mcp';
 
@@ -162,7 +174,7 @@ function makeOffer(overrides: Partial<DepartmentOfferInput> = {}): DepartmentOff
 }
 
 describe('DepartmentManager — execution-token env injection (d6, 13 §12 / 07 §4)', () => {
-  test('a successful token request injects PIPELINE_MESH_MCP_URL/PIPELINE_MESH_EXECUTION_TOKEN into the spawned runtime env', async () => {
+  test('a successful token request injects PIPELINE_DEPARTMENT_MCP_URL/PIPELINE_DEPARTMENT_EXECUTION_TOKEN into the spawned runtime env — AND the pre-b5 spellings, same values', async () => {
     const tokenSource = new FakeTokenSource();
     const { manager, adapter, runtimes } = makeManager({ executionTokens: tokenSource });
     runtimes.set('unity-department', { adapterId: 'fake', command: 'unity-department', env: { EXISTING: '1' } });
@@ -172,11 +184,84 @@ describe('DepartmentManager — execution-token env injection (d6, 13 §12 / 07 
     expect(tokenSource.getTokenCalls).toEqual(['dexec-1']);
 
     const invocation = adapter.startCalls()[0]!;
+    // b5's dual-name window, stated exhaustively rather than by containment:
+    // an EXACT map, so a future change that drops either spelling fails here.
     expect(invocation.runtime.env).toEqual({
       EXISTING: '1',
-      [MESH_MCP_URL_ENV]: RESOURCE_URL,
-      [MESH_EXECUTION_TOKEN_ENV]: 'tok-1',
+      [DEPARTMENT_MCP_URL_ENV]: RESOURCE_URL,
+      [DEPARTMENT_EXECUTION_TOKEN_ENV]: 'tok-1',
+      [DEPARTMENT_MCP_URL_ENV_LEGACY]: RESOURCE_URL,
+      [DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]: 'tok-1',
     });
+  });
+
+  test('b5 — the four names are the two the design named, and old and new are distinct keys carrying identical values', async () => {
+    // The names themselves, so a typo in either spelling is caught here and
+    // not by a session that silently loses its MCP connection.
+    expect(DEPARTMENT_MCP_URL_ENV).toBe('PIPELINE_DEPARTMENT_MCP_URL');
+    expect(DEPARTMENT_EXECUTION_TOKEN_ENV).toBe('PIPELINE_DEPARTMENT_EXECUTION_TOKEN');
+    expect(DEPARTMENT_MCP_URL_ENV_LEGACY).toBe('PIPELINE_MESH_MCP_URL');
+    expect(DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY).toBe('PIPELINE_MESH_EXECUTION_TOKEN');
+    expect(DEPARTMENT_HELPER_URL_ENV).toBe('PIPELINE_DEPARTMENT_HELPER_URL');
+    expect(DEPARTMENT_HELPER_SECRET_ENV).toBe('PIPELINE_DEPARTMENT_HELPER_SECRET');
+    expect(DEPARTMENT_HELPER_URL_ENV_LEGACY).toBe('PIPELINE_MESH_HELPER_URL');
+    expect(DEPARTMENT_HELPER_SECRET_ENV_LEGACY).toBe('PIPELINE_MESH_HELPER_SECRET');
+
+    const channel = new FakeHeaderChannel();
+    const { manager, adapter, runtimes } = makeManager({ executionTokens: new FakeTokenSource(), executionHeaderChannel: channel });
+    runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
+    await manager.admitTask(makeOffer());
+    const env = adapter.startCalls()[0]!.runtime.env ?? {};
+
+    // A consumer reading EITHER generation of names gets the same thing —
+    // which is the whole claim the window rests on.
+    for (const [current, legacy] of [
+      [DEPARTMENT_MCP_URL_ENV, DEPARTMENT_MCP_URL_ENV_LEGACY],
+      [DEPARTMENT_EXECUTION_TOKEN_ENV, DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY],
+      [DEPARTMENT_HELPER_URL_ENV, DEPARTMENT_HELPER_URL_ENV_LEGACY],
+      [DEPARTMENT_HELPER_SECRET_ENV, DEPARTMENT_HELPER_SECRET_ENV_LEGACY],
+    ] as const) {
+      expect(current).not.toBe(legacy);
+      expect(env[current]).toBeDefined();
+      expect(env[legacy]).toBe(env[current]!);
+    }
+  });
+
+  test('b5 — an engine reading a LEGACY-ONLY invocation still connects; the fallback path is exercised, not assumed', () => {
+    // The case the window exists for: a session whose env was built by a
+    // supervisor from before this rename. `requireEngineMcpEnv` must resolve
+    // it rather than refuse to start.
+    const legacyOnly = {
+      runtime: { env: { [DEPARTMENT_MCP_URL_ENV_LEGACY]: RESOURCE_URL, [DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]: 'tok-legacy' } },
+    } as unknown as Parameters<typeof requireEngineMcpEnv>[0];
+    expect(requireEngineMcpEnv(legacyOnly, 'claude-code')).toEqual({ url: RESOURCE_URL, token: 'tok-legacy' });
+    expect(readEngineMcpHelperChannel(legacyOnly)).toBeNull();
+
+    const legacyHelper = {
+      runtime: {
+        env: {
+          [DEPARTMENT_MCP_URL_ENV_LEGACY]: RESOURCE_URL,
+          [DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]: 'tok-legacy',
+          [DEPARTMENT_HELPER_URL_ENV_LEGACY]: 'http://127.0.0.1:1/mcp-headers',
+          [DEPARTMENT_HELPER_SECRET_ENV_LEGACY]: 'legacy-secret',
+        },
+      },
+    } as unknown as Parameters<typeof requireEngineMcpEnv>[0];
+    expect(readEngineMcpHelperChannel(legacyHelper)).toEqual({ url: 'http://127.0.0.1:1/mcp-headers', secret: 'legacy-secret' });
+
+    // And the new name WINS when both are present, so a supervisor mid-upgrade
+    // is never ambiguous.
+    const both = {
+      runtime: {
+        env: {
+          [DEPARTMENT_MCP_URL_ENV]: RESOURCE_URL,
+          [DEPARTMENT_EXECUTION_TOKEN_ENV]: 'tok-new',
+          [DEPARTMENT_MCP_URL_ENV_LEGACY]: 'https://stale.example/mcp',
+          [DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]: 'tok-stale',
+        },
+      },
+    } as unknown as Parameters<typeof requireEngineMcpEnv>[0];
+    expect(requireEngineMcpEnv(both, 'claude-code')).toEqual({ url: RESOURCE_URL, token: 'tok-new' });
   });
 
   test('with no executionTokens configured, admission is byte-for-byte the pre-d6 path — no env injected, no token call', async () => {
@@ -216,7 +301,7 @@ describe('DepartmentManager — execution-token env injection (d6, 13 §12 / 07 
     await tick();
     expect(tokenSource.getTokenCalls).toEqual(['dexec-1', 'dexec-1']);
     expect(adapter.startCalls()).toHaveLength(2);
-    expect(adapter.startCalls()[1]!.runtime.env?.[MESH_EXECUTION_TOKEN_ENV]).toBe('tok-2');
+    expect(adapter.startCalls()[1]!.runtime.env?.[DEPARTMENT_EXECUTION_TOKEN_ENV]).toBe('tok-2');
   });
 });
 
@@ -316,10 +401,15 @@ describe('DepartmentManager — the loopback re-auth channel (x21, D33)', () => 
     const invocation = adapter.startCalls()[0]!;
     expect(invocation.runtime.env).toEqual({
       EXISTING: '1',
-      [MESH_MCP_URL_ENV]: RESOURCE_URL,
-      [MESH_EXECUTION_TOKEN_ENV]: 'tok-1',
-      [MESH_HELPER_URL_ENV]: 'http://127.0.0.1:51234/mcp-headers',
-      [MESH_HELPER_SECRET_ENV]: 'grant-secret-1',
+      [DEPARTMENT_MCP_URL_ENV]: RESOURCE_URL,
+      [DEPARTMENT_EXECUTION_TOKEN_ENV]: 'tok-1',
+      [DEPARTMENT_HELPER_URL_ENV]: 'http://127.0.0.1:51234/mcp-headers',
+      [DEPARTMENT_HELPER_SECRET_ENV]: 'grant-secret-1',
+      // b5 dual-name window — the helper pair aliases too, not just the token.
+      [DEPARTMENT_MCP_URL_ENV_LEGACY]: RESOURCE_URL,
+      [DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]: 'tok-1',
+      [DEPARTMENT_HELPER_URL_ENV_LEGACY]: 'http://127.0.0.1:51234/mcp-headers',
+      [DEPARTMENT_HELPER_SECRET_ENV_LEGACY]: 'grant-secret-1',
     });
     // The half of D33 that is not about tokens at all: an engine module can
     // now name its own execution.
@@ -330,7 +420,12 @@ describe('DepartmentManager — the loopback re-auth channel (x21, D33)', () => 
     const { manager, adapter, runtimes } = makeManager({ executionTokens: new FakeTokenSource() });
     runtimes.set('unity-department', { adapterId: 'fake', command: 'x' });
     await manager.admitTask(makeOffer());
-    expect(Object.keys(adapter.startCalls()[0]!.runtime.env ?? {}).sort()).toEqual([MESH_EXECUTION_TOKEN_ENV, MESH_MCP_URL_ENV].sort());
+    // Still exactly the token pair and nothing else — now in both spellings
+    // (b5), which is what "the helper vars are absent" has to mean after the
+    // aliasing pass runs over the whole map.
+    expect(Object.keys(adapter.startCalls()[0]!.runtime.env ?? {}).sort()).toEqual(
+      [DEPARTMENT_EXECUTION_TOKEN_ENV, DEPARTMENT_MCP_URL_ENV, DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY, DEPARTMENT_MCP_URL_ENV_LEGACY].sort()
+    );
   });
 
   test('a channel that cannot be granted degrades — admission still succeeds, the session still runs', async () => {
@@ -345,9 +440,15 @@ describe('DepartmentManager — the loopback re-auth channel (x21, D33)', () => 
       // a task, exactly as a refused token is not (`resolveMcpEnv`).
       expect(await manager.admitTask(makeOffer())).toEqual({ accepted: true });
       const env = adapter.startCalls()[0]!.runtime.env ?? {};
-      expect(env[MESH_EXECUTION_TOKEN_ENV]).toBe('tok-1');
-      expect(env[MESH_HELPER_URL_ENV]).toBeUndefined();
-      expect(env[MESH_HELPER_SECRET_ENV]).toBeUndefined();
+      expect(env[DEPARTMENT_EXECUTION_TOKEN_ENV]).toBe('tok-1');
+      expect(env[DEPARTMENT_HELPER_URL_ENV]).toBeUndefined();
+      expect(env[DEPARTMENT_HELPER_SECRET_ENV]).toBeUndefined();
+      // b5: and the aliasing pass must not conjure a legacy spelling of a
+      // variable that was never set — "no grant" has to mean no grant in
+      // BOTH generations of names, or a pre-b5 engine sees a half-channel.
+      expect(env[DEPARTMENT_HELPER_URL_ENV_LEGACY]).toBeUndefined();
+      expect(env[DEPARTMENT_HELPER_SECRET_ENV_LEGACY]).toBeUndefined();
+      expect(env[DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY]).toBe('tok-1');
     }
   });
 
@@ -375,7 +476,7 @@ describe('DepartmentManager — the loopback re-auth channel (x21, D33)', () => 
     await tick();
 
     expect(channel.grantCalls).toEqual(['dexec-1', 'dexec-1']);
-    expect(adapter.startCalls()[1]!.runtime.env?.[MESH_HELPER_SECRET_ENV]).toBe('grant-secret-2');
+    expect(adapter.startCalls()[1]!.runtime.env?.[DEPARTMENT_HELPER_SECRET_ENV]).toBe('grant-secret-2');
   });
 
   test('a terminal execution revokes the grant — the window closes with the task', async () => {

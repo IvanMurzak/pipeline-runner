@@ -76,7 +76,7 @@
  * instead of restarting from `pipelineDrive.startIteration` — using the
  * SAME, unmodified `buildDriveArgs` the fresh-start path uses, just a
  * different (already-existing) mode literal. The answer TEXT is read off the
- * last message in the replayed history (the mesh always appends it there,
+ * last message in the replayed history (the cloud always appends it there,
  * `./manager.ts`'s `deliverMessage`); a park whose next `start()` carries no
  * usable text fails the task rather than silently resending nothing.
  * `iteration_path` is deliberately NOT consumed by `buildDriveArgs`'s
@@ -577,7 +577,7 @@ export class PipelineDriveAdapter implements EngineModule {
     handle.disposed = true;
     // Real termination — no future respawn will ever consume this park.
     // (The OTHER caller of `dispose()`, evicting a handle right after
-    // `input_required` so the mesh can respawn with the answer, never calls
+    // `input_required` so the supervisor can respawn with the answer, never calls
     // `cancel()` first — see the module doc — so this never fires for that
     // case.)
     this.parked.delete(handle.taskId);

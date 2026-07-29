@@ -47,7 +47,7 @@
  * doc.
  *
  * ── Wire frame shapes (e1 repin) ─────────────────────────────────────────────
- * `@baizor/pipeline-protocol` 0.4.0 carries the real mesh schemas (08-
+ * `@baizor/pipeline-protocol` 0.4.0 carries the real department schemas (08-
  * protocol-delta.md) as of the e1 gate. `department.offer` is parsed with
  * `DeptOfferMessageSchema`; `department.message` is validated against
  * `DeptMessageSchema`; outgoing `department.accept` / `department.reject` /
@@ -59,13 +59,13 @@
  * ── Event delivery (e1 fix — see the e1 gate report) ─────────────────────────
  * d1 originally shipped `RuntimeEvent`s through the EXISTING pipeline shipper
  * (tail -> filter -> seq -> batch -> spool -> drain -> `upload` frame ->
- * `ingestBatch`), reading 07 §8 ("mesh runtime events reach the cloud through
+ * `ingestBatch`), reading 07 §8 ("department runtime events reach the cloud through
  * the existing shipper") as "reuse the exact `upload` wire frame". That is a
  * genuine integration bug, not a protocol schema bug: `ingestBatch`
  * (`cloud/apps/api/src/modules/runs/ingest.ts`) resolves an unknown `run_id`
  * by CREATING a new `runs` row (`findRunByReportedId(...) ?? createRun(...)`)
  * — a department execution id has no `dept_executions` counterpart there, so
- * every mesh event would silently fabricate a phantom pipeline `runs` row and
+ * every department event would silently fabricate a phantom pipeline `runs` row and
  * NEVER reach `dept_task_events` / `transitionTask` / `appendMessage`. The
  * cloud's `department.event` handler (08 §5) was always the intended
  * destination. Fixed here: `RuntimeEvent`s are shipped as real
@@ -92,7 +92,7 @@
  * `taskArtifactBytesSent` tracks the running per-task total across this
  * manager's lifetime (keyed by `taskId`, so it survives a `per-context`
  * respawn's fresh `executionId` but resets on runner restart — a
- * best-effort local gate; the cloud's own check, `mesh-artifacts/service.ts`,
+ * best-effort local gate; the cloud's own check, `department-artifacts/service.ts`,
  * is the authoritative one). Every entry is reclaimed once no execution of
  * that `taskId` is still live — `releaseTaskArtifactBudgetIfIdle`, called
  * from both terminal funnels (`reportTerminal` AND `handleLeaseRevoked`,
@@ -106,12 +106,12 @@
  * to it too — "surfaced, not swallowed" is a DoD line, not a suggestion.
  * **This handler is dormant today**: as of task d3, the cloud's `c9`
  * scheduler (`handleDepartmentArtifact` in
- * `cloud/apps/api/src/modules/mesh/scheduler.ts`) records
+ * `cloud/apps/api/src/modules/department/scheduler.ts`) records
  * `task.artifact_stored`/`task.artifact_rejected` TASK EVENTS but does not
  * yet SEND a `department.artifact_ack` WIRE FRAME anywhere — this handler is
  * fully wired and tested against the real schema for when that frame starts
  * arriving, but no runner will actually receive one until the cloud side is
- * closed (tracked as a `c9`/mesh follow-up, not a defect in this file).
+ * closed (tracked as a `c9`/departments follow-up, not a defect in this file).
  *
  * ── Stuck detection (b4, D25 / 06 §5) ───────────────────────────────────────
  * "A task never goes quiet" ([05](05-department-project.md) §7.5) shipped with
@@ -215,11 +215,16 @@ import { uploadDepartmentArtifact } from './artifact-upload';
 import {
   adapterIdToEngine,
   ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_SECRET_ENV_LEGACY,
   ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_HELPER_URL_ENV_LEGACY,
   ENGINE_MCP_TOKEN_ENV,
+  ENGINE_MCP_TOKEN_ENV_LEGACY,
   ENGINE_MCP_URL_ENV,
+  ENGINE_MCP_URL_ENV_LEGACY,
   isolationForAdapterId,
   lookupEngine,
+  withLegacyEngineMcpEnvAliases,
 } from './engine';
 import {
   buildDepartmentIndexEntry,
@@ -247,13 +252,21 @@ import type { ExecutionTokenSource } from './execution-token-manager';
 // half of the contract an engine module's responsibilities 3/4 rest on
 // (`requireEngineMcpEnv`), and an engine module must not have to import the
 // whole supervisor to learn what they are called. Same strings, same values.
-export const MESH_MCP_URL_ENV = ENGINE_MCP_URL_ENV;
-export const MESH_EXECUTION_TOKEN_ENV = ENGINE_MCP_TOKEN_ENV;
+export const DEPARTMENT_MCP_URL_ENV = ENGINE_MCP_URL_ENV;
+export const DEPARTMENT_EXECUTION_TOKEN_ENV = ENGINE_MCP_TOKEN_ENV;
 // x21 (D33): the same supervisor↔engine contract, for the half that survives
 // the token above expiring. Injected only when `executionHeaderChannel` is
 // wired AND it could mint a grant — three states, exactly like the pair above.
-export const MESH_HELPER_URL_ENV = ENGINE_MCP_HELPER_URL_ENV;
-export const MESH_HELPER_SECRET_ENV = ENGINE_MCP_HELPER_SECRET_ENV;
+export const DEPARTMENT_HELPER_URL_ENV = ENGINE_MCP_HELPER_URL_ENV;
+export const DEPARTMENT_HELPER_SECRET_ENV = ENGINE_MCP_HELPER_SECRET_ENV;
+// b5: the pre-rename spellings, re-exported for the same reason as the four
+// above. `resolveMcpEnv` SETS these alongside the new names for the whole
+// window (`./engine.ts`'s `withLegacyEngineMcpEnvAliases`), so a runtime
+// written against either generation of names finds what it is looking for.
+export const DEPARTMENT_MCP_URL_ENV_LEGACY = ENGINE_MCP_URL_ENV_LEGACY;
+export const DEPARTMENT_EXECUTION_TOKEN_ENV_LEGACY = ENGINE_MCP_TOKEN_ENV_LEGACY;
+export const DEPARTMENT_HELPER_URL_ENV_LEGACY = ENGINE_MCP_HELPER_URL_ENV_LEGACY;
+export const DEPARTMENT_HELPER_SECRET_ENV_LEGACY = ENGINE_MCP_HELPER_SECRET_ENV_LEGACY;
 
 // ── The journal-writer seam (runner IS the journal writer here — unlike
 //    pipeline runs, where pipeline-cli writes events.jsonl, nothing external
@@ -319,21 +332,21 @@ export interface DepartmentManagerOptions {
   journalRoot?: string;
   journal?: JournalWriter;
   /** d6 (13 §12): obtains/caches execution-scoped OAuth tokens via
-   *  `client_credentials`. Absent ⇒ no `PIPELINE_MESH_*` env is injected at
+   *  `client_credentials`. Absent ⇒ no `PIPELINE_DEPARTMENT_*` env is injected at
    *  spawn and lease renewal skips the re-request — existing (pre-d6)
    *  behaviour, unchanged, for any caller that does not wire this. */
   executionTokens?: ExecutionTokenSource;
   /**
    * x21 (D33): the loopback re-auth channel a session's `headersHelper` calls
    * back into (`./execution-token-endpoint.ts`). Absent ⇒ no
-   * `PIPELINE_MESH_HELPER_*` env is injected and every engine keeps its
+   * `PIPELINE_DEPARTMENT_HELPER_*` env is injected and every engine keeps its
    * pre-x21 behaviour — for `claude-code`, a static header that works until
    * the execution token's TTL runs out.
    *
    * Separate from `executionTokens` rather than folded into it on purpose:
    * that one is a CACHE (it holds tokens), this one is a LISTENER (it holds a
    * socket and per-execution grants). A caller may reasonably want the first
-   * without the second — `./mesh-relay.ts` and lease renewal both need the
+   * without the second — `./mcp-relay.ts` and lease renewal both need the
    * cache and neither needs a socket.
    */
   executionHeaderChannel?: ExecutionHeaderChannelSource;
@@ -738,11 +751,11 @@ export class DepartmentManager {
    *      still carries the URL + token, while keeping the values off the argv
    *      the way `BuiltContainerInvocation.clientEnv` now does.
    *   3. **A `claude-code` container department cannot use the default
-   *      network.** This module's whole contract is the mesh MCP connection,
+   *      network.** This module's whole contract is the department MCP connection,
    *      but no `egressAllowlist` means `--network none` (airtight), and a
    *      non-empty one requires operator-provisioned egress enforcement that
    *      `container.ts` documents as NOT implemented. So the combination also
-   *      needs the allowlist to name the mesh host AND that enforcement to be
+   *      needs the allowlist to name the cloud MCP host AND that enforcement to be
    *      real — otherwise it is a session that cannot report, which is the
    *      exact failure D24 exists to prevent.
    *   4. **The image and the mounts become part of the contract.** `claude`
@@ -801,7 +814,7 @@ export class DepartmentManager {
         // process. Fire-and-forget: never let this block the heartbeat
         // cadence `renewLeases()` itself rides. `ExecutionTokenManager.renew`
         // never rejects (failures resolve to `{ ok: false }` and are already
-        // logged by `../core/mesh-oauth.ts`) — the `.catch` is defence in
+        // logged by `../core/department-oauth.ts`) — the `.catch` is defence in
         // depth against a differently-behaved `ExecutionTokenSource`.
         void this.options.executionTokens?.renew(state.executionId).catch(() => {});
       } else {
@@ -1119,7 +1132,9 @@ export class DepartmentManager {
   }
 
   /**
-   * d6 (13 §12): resolve `{ PIPELINE_MESH_MCP_URL, PIPELINE_MESH_EXECUTION_TOKEN }`
+   * d6 (13 §12): resolve `{ PIPELINE_DEPARTMENT_MCP_URL,
+   * PIPELINE_DEPARTMENT_EXECUTION_TOKEN }` (plus, for b5's dual-name window,
+   * the pre-rename `PIPELINE_MESH_*` spelling of each)
    * for this spawn, or `null` when there is nothing to inject —
    * `executionTokens` not configured, the runner is not registered yet, or
    * the AS refused the request (e.g. `invalid_grant`: this execution is not
@@ -1129,8 +1144,8 @@ export class DepartmentManager {
    * token itself — only the OAuth error code on failure.
    *
    * x21 (D33): when an `executionHeaderChannel` is wired, this ALSO mints the
-   * spawn's loopback re-auth grant and injects `PIPELINE_MESH_HELPER_URL` /
-   * `PIPELINE_MESH_HELPER_SECRET` alongside. A failed grant degrades to "no
+   * spawn's loopback re-auth grant and injects `PIPELINE_DEPARTMENT_HELPER_URL`
+   * / `PIPELINE_DEPARTMENT_HELPER_SECRET` alongside. A failed grant degrades to "no
    * re-auth channel this spawn" for exactly the reason a failed token
    * degrades to "no MCP env this spawn": admission is not allowed to depend
    * on it, and a session with a static header is a session that works until
@@ -1147,13 +1162,18 @@ export class DepartmentManager {
       );
       return null;
     }
-    const env: Record<string, string> = { [MESH_MCP_URL_ENV]: resourceUrl, [MESH_EXECUTION_TOKEN_ENV]: result.token.accessToken };
+    const env: Record<string, string> = { [DEPARTMENT_MCP_URL_ENV]: resourceUrl, [DEPARTMENT_EXECUTION_TOKEN_ENV]: result.token.accessToken };
     const channel = await this.resolveHeaderChannel(state);
     if (channel !== null) {
-      env[MESH_HELPER_URL_ENV] = channel.url;
-      env[MESH_HELPER_SECRET_ENV] = channel.secret;
+      env[DEPARTMENT_HELPER_URL_ENV] = channel.url;
+      env[DEPARTMENT_HELPER_SECRET_ENV] = channel.secret;
     }
-    return env;
+    // b5: and the pre-rename spellings of whichever of those four are present,
+    // pointing at the SAME values. This is the setter half of the dual-name
+    // window — see `./engine.ts`'s note. It is applied LAST and to the whole
+    // map at once, so the "helper vars are injected only when a grant existed"
+    // three-state above is preserved exactly: no grant ⇒ neither spelling.
+    return withLegacyEngineMcpEnvAliases(env);
   }
 
   /** x21: this spawn's loopback re-auth grant, or null. Swallows a rejected

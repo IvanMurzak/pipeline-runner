@@ -1,7 +1,7 @@
 /**
  * `department.artifact` chunked, capped upload (department-mesh task d3;
  * `08-protocol-delta.md` §6, `09-infra-and-artifacts.md` §3.1, task c9's
- * cloud-side counterpart: `cloud/apps/api/src/modules/mesh-artifacts/`).
+ * cloud-side counterpart: `cloud/apps/api/src/modules/department-artifacts/`).
  *
  * Artifacts do NOT ride the event-ingest/shipper path (07 §8 — that path is
  * tier-filtered telemetry; artifacts are first-class task data). They get
@@ -10,7 +10,7 @@
  *
  *   - a declared `path` is STAT'd first and refused if it is already over
  *     the per-artifact cap (mirrors the cloud assembler's own "refuse before
- *     buffering anything", `mesh-artifacts/reassembly.ts`'s module doc); the
+ *     buffering anything", `department-artifacts/reassembly.ts`'s module doc); the
  *     REAL filesystem (`nodeArtifactFs`, below) additionally bounds the
  *     subsequent read itself to `MAX_ARTIFACT_BYTES + 1` bytes, so even a
  *     file that GROWS in the window between `statSize` and `readFile` (a
@@ -31,7 +31,7 @@
  *     process only knows what IT has sent since it last started;
  *   - chunking at {@link ARTIFACT_WIRE_CHUNK_BYTES} (256 KiB) per frame,
  *     `checksum` = sha256 hex of the WHOLE artifact — exactly what
- *     `mesh-artifacts/reassembly.ts`'s `ArtifactAssembler` expects.
+ *     `department-artifacts/reassembly.ts`'s `ArtifactAssembler` expects.
  *
  * REJECTION IS ALWAYS EXPLICIT; SILENT TRUNCATION IS FORBIDDEN. There is
  * deliberately no branch anywhere below that sends a prefix of an over-cap
@@ -59,7 +59,7 @@ export const MAX_ARTIFACT_BYTES = 1024 * 1024;
  *  passed in as `bytesAlreadySentForTask`; resets on runner restart and does
  *  not see bytes another runner (or a prior attempt) already sent — a
  *  best-effort, runner-first gate. The cloud's own check
- *  (`mesh-artifacts/service.ts`) is the AUTHORITATIVE one: it sums every row
+ *  (`department-artifacts/service.ts`) is the AUTHORITATIVE one: it sums every row
  *  actually stored for the task, regardless of which runner or execution
  *  wrote it. */
 export const MAX_TASK_ARTIFACT_BYTES = 8 * 1024 * 1024;
@@ -179,7 +179,7 @@ function sha256Hex(content: Uint8Array): string {
 }
 
 /** Human-readable byte size for rejection messages — mirrors the cloud's own
- *  `mesh-artifacts/service.ts#formatBytes` (independently, not imported: a
+ *  `department-artifacts/service.ts#formatBytes` (independently, not imported: a
  *  cosmetic helper, not a normative constant). */
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

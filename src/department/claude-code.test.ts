@@ -55,6 +55,7 @@ import {
   ENGINE_MCP_TOKEN_ENV,
   ENGINE_MCP_URL_ENV,
   EngineMcpUnavailableError,
+  withLegacyEngineMcpEnvAliases,
 } from './engine';
 // x36: the one adapter that already produced a `status` event — its narrower is
 // the contract this module's announcement is checked against.
@@ -248,6 +249,39 @@ describe('the --mcp-config payload (D23)', () => {
     expect(server.type).toBe('http');
     expect(server.url).toBe(`\${${ENGINE_MCP_URL_ENV}}`);
     expect(server.headers.Authorization).toBe(`Bearer \${${ENGINE_MCP_TOKEN_ENV}}`);
+  });
+
+  test('b5 — every `${VAR}` the VENDOR has to expand is a variable the supervisor actually sets', () => {
+    // The one assertion in this file that is not tautological under a rename.
+    // Everything above interpolates the same constant it is checking, so a
+    // wrong-but-consistent name would sail through. This scrapes the literal
+    // `${…}` names back OUT of the emitted JSON as plain strings and checks
+    // each against the env map `./manager.ts`'s `resolveMcpEnv` actually
+    // builds — because the expansion happens in Claude Code, not here, and a
+    // name that is merely self-consistent still loses the MCP connection.
+    const supervisorEnv = withLegacyEngineMcpEnvAliases({
+      [ENGINE_MCP_URL_ENV]: 'https://api.ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV]: 'tok-1',
+      [ENGINE_MCP_HELPER_URL_ENV]: 'http://127.0.0.1:9/mcp-headers',
+      [ENGINE_MCP_HELPER_SECRET_ENV]: 'grant-secret',
+    });
+    const referencedIn = (json: string): string[] => [...json.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)].map((m) => m[1]!);
+
+    // Both shipped shapes: the static-header fallback and the x21 helper (which
+    // REPLACES the header, so it legitimately references fewer variables).
+    for (const json of [buildDepartmentMcpConfig(), buildDepartmentMcpConfig({ headersHelper: '/opt/runner/mcp-headers' })]) {
+      const referenced = referencedIn(json);
+      expect(referenced.length).toBeGreaterThan(0);
+      for (const name of referenced) {
+        expect(Object.keys(supervisorEnv)).toContain(name);
+      }
+    }
+
+    // And the names really are the post-b5 spellings, written out in full so a
+    // silent revert to `PIPELINE_MESH_*` fails here rather than in production.
+    const staticHeaderRefs = referencedIn(buildDepartmentMcpConfig());
+    expect(staticHeaderRefs).toContain('PIPELINE_DEPARTMENT_MCP_URL');
+    expect(staticHeaderRefs).toContain('PIPELINE_DEPARTMENT_EXECUTION_TOKEN');
   });
 
   test('a configured headersHelper REPLACES the static header rather than joining it', () => {

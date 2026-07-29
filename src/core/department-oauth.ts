@@ -45,12 +45,21 @@ import { systemClock } from './clock';
 import type { Logger } from './log';
 import { nullLogger } from './log';
 
-/** The one scope a runner ever requests for an execution (13 §6: "machine-only,
- *  never user-delegated"). */
-export const MESH_EXECUTION_SCOPE = 'mesh:execution';
+/**
+ * The one scope a runner ever requests for an execution (13 §6: "machine-only,
+ * never user-delegated").
+ *
+ * The VALUE deliberately still reads `mesh:execution` after `b5`'s rename.
+ * It is a WIRE IDENTIFIER: it is what the cloud's authorization server
+ * validates on `POST /oauth/token`, and it is embedded in execution tokens
+ * that are already live. Renaming it here would break every connected runner
+ * the moment this build shipped. `c13` owns it, behind a dual-ACCEPT window on
+ * the server side; `08-terminology.md` §3's tier-3 table is the record.
+ */
+export const EXECUTION_SCOPE = 'mesh:execution';
 
 /** The scope a MIGRATED runner exchanges its client credentials for in order to
- *  register (13 §10.2; cloud `mesh-oauth/types.ts`'s `RUNNER_REGISTER_SCOPE`). */
+ *  register (13 §10.2; cloud `department-oauth/types.ts`'s `RUNNER_REGISTER_SCOPE`). */
 export const RUNNER_REGISTER_SCOPE = 'runner:register';
 
 /** The minimal `fetch` surface this module needs — injectable so tests never
@@ -136,16 +145,16 @@ function trimBase(baseUrl: string): string {
 
 /** `${issuer}/mcp` — the ONE audience an execution token is ever requested
  *  for (13 §10: MCP server canonical resource). Mirrors the cloud's own
- *  `issuer()`/`canonicalResource()` (`cloud/apps/api/src/modules/mesh-oauth/resource.ts`)
+ *  `issuer()`/`canonicalResource()` (`cloud/apps/api/src/modules/department-oauth/resource.ts`)
  *  trailing-slash normalization so the string matches byte-for-byte. */
-export function meshMcpResource(baseUrl: string): string {
+export function departmentMcpResource(baseUrl: string): string {
   return `${trimBase(baseUrl)}/mcp`;
 }
 
 /** `${issuer}/api` — the REST audience, and the ONLY one a `runner:register`
  *  token is ever issued for (13 §10 D15; the cloud refuses any other with
  *  `invalid_target`). No fourth audience was invented for P6. */
-export function meshApiResource(baseUrl: string): string {
+export function runnerApiResource(baseUrl: string): string {
   return `${trimBase(baseUrl)}/api`;
 }
 
@@ -228,7 +237,7 @@ async function requestClientCredentialsToken(request: ClientCredentialsRequest):
     ...(request.extraParams ?? {}),
   });
 
-  logger.debug(`mesh-oauth: requesting ${request.what} for ${request.subject}`);
+  logger.debug(`department-oauth: requesting ${request.what} for ${request.subject}`);
 
   // The deadline (when one is asked for), as a timer on the INJECTED clock.
   //
@@ -276,7 +285,7 @@ async function requestClientCredentialsToken(request: ClientCredentialsRequest):
   } catch (err) {
     clearDeadline();
     const message = err instanceof Error ? err.message : String(err);
-    logger.warn(`mesh-oauth: ${request.what} request for ${request.subject} failed — network error: ${message}`);
+    logger.warn(`department-oauth: ${request.what} request for ${request.subject} failed — network error: ${message}`);
     return { ok: false, error: { error: 'network_error', description: message } };
   }
 
@@ -290,21 +299,21 @@ async function requestClientCredentialsToken(request: ClientCredentialsRequest):
   if (!response.ok) {
     const { error, description } = narrowErrorBody(decoded);
     logger.warn(
-      `mesh-oauth: ${request.what} for ${request.subject} refused (HTTP ${response.status}, ${error})${description ? `: ${description}` : ''}`
+      `department-oauth: ${request.what} for ${request.subject} refused (HTTP ${response.status}, ${error})${description ? `: ${description}` : ''}`
     );
     return { ok: false, error: { error, ...(description !== undefined ? { description } : {}), status: response.status } };
   }
 
   const success = narrowSuccessBody(decoded, request.scope);
   if (success === null) {
-    logger.warn(`mesh-oauth: ${request.what} response for ${request.subject} was malformed`);
+    logger.warn(`department-oauth: ${request.what} response for ${request.subject} was malformed`);
     return {
       ok: false,
       error: { error: 'invalid_response', description: 'token endpoint returned a malformed success body', status: response.status },
     };
   }
 
-  logger.debug(`mesh-oauth: ${request.what} obtained for ${request.subject} (expires in ${success.expiresInS}s)`);
+  logger.debug(`department-oauth: ${request.what} obtained for ${request.subject} (expires in ${success.expiresInS}s)`);
   return {
     ok: true,
     token: {
@@ -325,8 +334,8 @@ export async function requestExecutionToken(options: RequestExecutionTokenOption
     baseUrl: options.baseUrl,
     clientId: options.clientId,
     clientSecret: options.clientSecret,
-    scope: MESH_EXECUTION_SCOPE,
-    resource: meshMcpResource(options.baseUrl),
+    scope: EXECUTION_SCOPE,
+    resource: departmentMcpResource(options.baseUrl),
     extraParams: { execution_id: options.executionId },
     what: 'execution token',
     subject: `execution ${options.executionId}`,
@@ -354,7 +363,7 @@ export async function requestRunnerRegistrationToken(
     clientId: options.clientId,
     clientSecret: options.clientSecret,
     scope: RUNNER_REGISTER_SCOPE,
-    resource: meshApiResource(options.baseUrl),
+    resource: runnerApiResource(options.baseUrl),
     what: 'registration token',
     subject: `runner ${options.clientId}`,
     timeoutMs: options.timeoutMs ?? REGISTRATION_TOKEN_TIMEOUT_MS,

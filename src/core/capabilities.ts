@@ -2,15 +2,18 @@
  * D17 capability advertisement (department-mesh d7 —
  * `07-runtime-contract.md` §2.2, `06-department-registry.md` §5): each
  * runner instance advertises what ISOLATION TIERS, GPU access, OS, and
- * resource hints it can offer, so the mesh scheduler can match a
+ * resource hints it can offer, so the cloud scheduler can match a
  * department's `requiredIsolation`/labels against runners that can actually
  * satisfy them — never placing a `container`-only department on a
  * `process`-tier runner, or vice versa.
  *
  * PROTOCOL FOLLOW-UP (flagged, not fixed here): protocol 0.4.0's
  * `RegisterMessageSchema` has no typed `capabilities` field — only
- * `labels`/`capacity`/`os` plus the mesh's own `departments`/`mesh_protocol`
- * additions (`08-protocol-delta.md` §7). It IS built with `wireVariant()` →
+ * `labels`/`capacity`/`os` plus the department wire's own `departments` /
+ * `mesh_protocol` additions (`08-protocol-delta.md` §7). `mesh_protocol` is a
+ * WIRE FIELD NAME belonging to `@baizor/pipeline-protocol`, exact-pinned at
+ * 0.4.0 — `c13` renames it, `b5` deliberately does not. It IS built with
+ * `wireVariant()` →
  * `.passthrough()`
  * (`node_modules/@baizor/pipeline-protocol/dist/wire/handshake.js`), so an
  * extra `capabilities` key survives the parse untouched on both sides. This

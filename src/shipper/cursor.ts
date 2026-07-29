@@ -23,7 +23,7 @@
  *     construction; same bound/pruning.
  *   - `statsRevisionShipped` — run id → the `revision` stamped on the LAST
  *     shipped `stats.run_record` for that run (design D13). Missing entry ⇒ 1
- *     (the pre-revision fleet's implicit first ship).
+ *     (an implicit first ship, from before revisions existed).
  *   - `statsTokensShipped` — run ids whose last-shipped record already carried
  *     NON-NULL `tokens`. The re-ship trigger is the one-way tokens
  *     null→non-null transition (enrichment never un-sets tokens), so this set

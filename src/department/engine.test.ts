@@ -20,8 +20,15 @@ import {
   CLAUDE_CODE_ENGINE_CAPABILITIES,
   CONTAINER_ENGINE_CAPABILITIES,
   ENGINE_CAPABILITY_LEVELS,
+  ENGINE_ENV_LEGACY_ALIASES,
+  ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_SECRET_ENV_LEGACY,
+  ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_HELPER_URL_ENV_LEGACY,
   ENGINE_MCP_TOKEN_ENV,
+  ENGINE_MCP_TOKEN_ENV_LEGACY,
   ENGINE_MCP_URL_ENV,
+  ENGINE_MCP_URL_ENV_LEGACY,
   ENGINE_NAMES,
   ENGINE_REGISTRY,
   EngineMcpUnavailableError,
@@ -31,11 +38,14 @@ import {
   lookupEngine,
   PIPELINE_ENGINE_CAPABILITIES,
   PROCESS_ENGINE_CAPABILITIES,
+  readEngineEnv,
+  readEngineMcpHelperChannel,
   requireEngineMcpEnv,
   supportedEngines,
+  withLegacyEngineMcpEnvAliases,
 } from './engine';
 import { JsonlProcessAdapter } from './jsonl-process';
-import { MESH_EXECUTION_TOKEN_ENV, MESH_MCP_URL_ENV } from './manager';
+import { DEPARTMENT_EXECUTION_TOKEN_ENV, DEPARTMENT_MCP_URL_ENV } from './manager';
 import { PIPELINE_DRIVE_CAPABILITIES, PipelineDriveAdapter } from './pipeline-drive';
 
 /** The four modules this runner actually registers (`../cli.ts`). If a
@@ -271,8 +281,8 @@ describe('refusing rather than running blind (D24, responsibility 4)', () => {
   test('the env names are the ones the supervisor actually injects', () => {
     // Single source of truth: `manager.ts` re-exports these under its own
     // shipped names, so a rename cannot desynchronize the two halves.
-    expect(ENGINE_MCP_URL_ENV).toBe(MESH_MCP_URL_ENV);
-    expect(ENGINE_MCP_TOKEN_ENV).toBe(MESH_EXECUTION_TOKEN_ENV);
+    expect(ENGINE_MCP_URL_ENV).toBe(DEPARTMENT_MCP_URL_ENV);
+    expect(ENGINE_MCP_TOKEN_ENV).toBe(DEPARTMENT_EXECUTION_TOKEN_ENV);
   });
 
   test('returns the injected url + token when the supervisor could mint one', () => {
@@ -325,5 +335,86 @@ describe('refusing rather than running blind (D24, responsibility 4)', () => {
     } catch (err) {
       expect((err as Error).message).not.toContain('https://x/mcp');
     }
+  });
+
+  // ── b5: the dual-name window ─────────────────────────────────────────────
+
+  test('b5 — the alias table is exactly the four renamed variables, new → old', () => {
+    expect(ENGINE_ENV_LEGACY_ALIASES).toEqual({
+      PIPELINE_DEPARTMENT_MCP_URL: 'PIPELINE_MESH_MCP_URL',
+      PIPELINE_DEPARTMENT_EXECUTION_TOKEN: 'PIPELINE_MESH_EXECUTION_TOKEN',
+      PIPELINE_DEPARTMENT_HELPER_URL: 'PIPELINE_MESH_HELPER_URL',
+      PIPELINE_DEPARTMENT_HELPER_SECRET: 'PIPELINE_MESH_HELPER_SECRET',
+    });
+    // …and it agrees with the exported constants, so neither can drift.
+    expect(ENGINE_ENV_LEGACY_ALIASES[ENGINE_MCP_URL_ENV]).toBe(ENGINE_MCP_URL_ENV_LEGACY);
+    expect(ENGINE_ENV_LEGACY_ALIASES[ENGINE_MCP_TOKEN_ENV]).toBe(ENGINE_MCP_TOKEN_ENV_LEGACY);
+    expect(ENGINE_ENV_LEGACY_ALIASES[ENGINE_MCP_HELPER_URL_ENV]).toBe(ENGINE_MCP_HELPER_URL_ENV_LEGACY);
+    expect(ENGINE_ENV_LEGACY_ALIASES[ENGINE_MCP_HELPER_SECRET_ENV]).toBe(ENGINE_MCP_HELPER_SECRET_ENV_LEGACY);
+  });
+
+  test('b5 — withLegacyEngineMcpEnvAliases adds every old spelling, keeps unrelated keys, and is idempotent', () => {
+    const built = withLegacyEngineMcpEnvAliases({
+      OTHER: 'untouched',
+      [ENGINE_MCP_URL_ENV]: 'https://ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV]: 'tok-1',
+    });
+    expect(built).toEqual({
+      OTHER: 'untouched',
+      [ENGINE_MCP_URL_ENV]: 'https://ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV]: 'tok-1',
+      [ENGINE_MCP_URL_ENV_LEGACY]: 'https://ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV_LEGACY]: 'tok-1',
+    });
+    // A variable the supervisor did NOT set stays unset in BOTH spellings —
+    // this is what keeps x21's "no grant ⇒ no helper env" three-state intact.
+    expect(built[ENGINE_MCP_HELPER_URL_ENV_LEGACY]).toBeUndefined();
+    expect(withLegacyEngineMcpEnvAliases(built)).toEqual(built);
+  });
+
+  test('b5 — readEngineEnv prefers the new name, falls back to the old, and treats empty as absent', () => {
+    expect(readEngineEnv({ [ENGINE_MCP_TOKEN_ENV]: 'new' }, ENGINE_MCP_TOKEN_ENV)).toBe('new');
+    expect(readEngineEnv({ [ENGINE_MCP_TOKEN_ENV_LEGACY]: 'old' }, ENGINE_MCP_TOKEN_ENV)).toBe('old');
+    expect(readEngineEnv({ [ENGINE_MCP_TOKEN_ENV]: 'new', [ENGINE_MCP_TOKEN_ENV_LEGACY]: 'old' }, ENGINE_MCP_TOKEN_ENV)).toBe('new');
+    // Empty on the new name is NOT a value — fall through rather than return ''.
+    expect(readEngineEnv({ [ENGINE_MCP_TOKEN_ENV]: '', [ENGINE_MCP_TOKEN_ENV_LEGACY]: 'old' }, ENGINE_MCP_TOKEN_ENV)).toBe('old');
+    expect(readEngineEnv({ [ENGINE_MCP_TOKEN_ENV]: '', [ENGINE_MCP_TOKEN_ENV_LEGACY]: '' }, ENGINE_MCP_TOKEN_ENV)).toBeUndefined();
+    expect(readEngineEnv({}, ENGINE_MCP_TOKEN_ENV)).toBeUndefined();
+    // A name with no alias never invents one.
+    expect(readEngineEnv({ SOMETHING: 'x' }, 'SOMETHING_ELSE')).toBeUndefined();
+  });
+
+  test('b5 — a LEGACY-ONLY invocation still connects, in both readers', () => {
+    // The whole reason the window exists: an engine module in THIS build,
+    // handed an env map written by a supervisor from before the rename.
+    const legacy = invocationWithEnv({
+      [ENGINE_MCP_URL_ENV_LEGACY]: 'https://ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV_LEGACY]: 'tok-legacy',
+      [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: 'http://127.0.0.1:9/mcp-headers',
+      [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: 'legacy-secret',
+    });
+    expect(requireEngineMcpEnv(legacy, 'claude-code')).toEqual({ url: 'https://ai-pipeline.dev/mcp', token: 'tok-legacy' });
+    expect(readEngineMcpHelperChannel(legacy)).toEqual({ url: 'http://127.0.0.1:9/mcp-headers', secret: 'legacy-secret' });
+  });
+
+  test('b5 — what the supervisor builds is what every reader resolves, for all four variables', () => {
+    // The end-to-end claim in one assertion: SET through the setter, READ
+    // through the readers, by BOTH spellings, same values.
+    const env = withLegacyEngineMcpEnvAliases({
+      [ENGINE_MCP_URL_ENV]: 'https://ai-pipeline.dev/mcp',
+      [ENGINE_MCP_TOKEN_ENV]: 'tok-1',
+      [ENGINE_MCP_HELPER_URL_ENV]: 'http://127.0.0.1:9/mcp-headers',
+      [ENGINE_MCP_HELPER_SECRET_ENV]: 'grant-secret',
+    });
+    for (const [current, legacy] of Object.entries(ENGINE_ENV_LEGACY_ALIASES)) {
+      expect(env[legacy]).toBe(env[current]!);
+      expect(readEngineEnv(env, current)).toBe(env[current]!);
+      // …and a consumer that only knows the OLD name reads the same value
+      // straight out of the map, because the supervisor set it there.
+      expect(env[legacy]).toBe(readEngineEnv(env, current)!);
+    }
+    const invocation = invocationWithEnv(env);
+    expect(requireEngineMcpEnv(invocation, 'claude-code')).toEqual({ url: 'https://ai-pipeline.dev/mcp', token: 'tok-1' });
+    expect(readEngineMcpHelperChannel(invocation)).toEqual({ url: 'http://127.0.0.1:9/mcp-headers', secret: 'grant-secret' });
   });
 });

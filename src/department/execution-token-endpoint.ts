@@ -37,7 +37,7 @@
  *
  * The response body is an **execution token**: short-lived,
  * audience-restricted to `<base>/mcp`, and scoped to the one execution. The
- * session already holds a copy of exactly that (`PIPELINE_MESH_EXECUTION_TOKEN`
+ * session already holds a copy of exactly that (`PIPELINE_DEPARTMENT_EXECUTION_TOKEN`
  * in its own environment). This endpoint therefore hands a session nothing it
  * does not already have — only a FRESHER copy. The durable credential (the
  * runner's OAuth `client_secret`) never crosses this boundary: the

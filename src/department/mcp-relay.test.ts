@@ -1,5 +1,5 @@
 /**
- * `MeshRelay` — the optional durability relay (department-mesh d6,
+ * `McpRelay` — the optional durability relay (department-mesh d6,
  * 13-mcp-authorization.md §12.1, T26). Covers the DoD's exact wording:
  * live-forward, spool-when-network-down, drain-replays-in-order-once,
  * the spooled bytes carry NO `Authorization` header (asserted by reading
@@ -10,10 +10,10 @@
 import { describe, expect, test } from 'bun:test';
 import { CaptureLogger, FakeClock } from '../../tests/_helpers';
 import { MemShipperFs } from '../../tests/_shipper-helpers';
-import type { FetchLike } from '../core/mesh-oauth';
-import type { ExecutionTokenResult } from '../core/mesh-oauth';
+import type { FetchLike } from '../core/department-oauth';
+import type { ExecutionTokenResult } from '../core/department-oauth';
 import type { ExecutionTokenSource } from './execution-token-manager';
-import { MeshRelay } from './mesh-relay';
+import { McpRelay } from './mcp-relay';
 
 const SPOOL_DIR = 'C:/state/department/relay-spool';
 const RESOURCE_URL = 'https://api.ai-pipeline.dev/mcp';
@@ -62,7 +62,7 @@ function makeRelay(overrides: Partial<{ tokenSource: FakeTokenSource; fetchScrip
   const logger = overrides.logger ?? new CaptureLogger();
   const tokenSource = overrides.tokenSource ?? new FakeTokenSource();
   const { fetchImpl, calls: fetchCalls } = makeScriptedFetch(overrides.fetchScript);
-  const relay = new MeshRelay({
+  const relay = new McpRelay({
     tokenSource,
     spoolDir: SPOOL_DIR,
     fs,
@@ -82,7 +82,7 @@ function readSpoolChunks(fs: MemShipperFs): Array<{ name: string; raw: string; p
   });
 }
 
-describe('MeshRelay — live forward', () => {
+describe('McpRelay — live forward', () => {
   test('delivers immediately, attaching the current execution token — never the caller-supplied Authorization', async () => {
     const { relay, fetchCalls } = makeRelay({ fetchScript: [{ status: 200, body: '{"ok":true}' }] });
     const result = await relay.forward({
@@ -119,7 +119,7 @@ describe('MeshRelay — live forward', () => {
   });
 });
 
-describe('MeshRelay — spool when the network is down (13 §12.1 / T26)', () => {
+describe('McpRelay — spool when the network is down (13 §12.1 / T26)', () => {
   test('a transport-level failure spools instead of failing the call', async () => {
     const { relay, fs } = makeRelay({ fetchScript: ['network_error'] });
     const result = await relay.forward({
@@ -159,7 +159,7 @@ describe('MeshRelay — spool when the network is down (13 §12.1 / T26)', () =>
   });
 });
 
-describe('MeshRelay — drain (replay on recovery)', () => {
+describe('McpRelay — drain (replay on recovery)', () => {
   test('replays spooled calls in order, removing each from the spool once delivered', async () => {
     const tokenSource = new FakeTokenSource();
     const { relay, fs } = makeRelay({ tokenSource, fetchScript: ['network_error', 'network_error', 'network_error'] });
@@ -185,7 +185,7 @@ describe('MeshRelay — drain (replay on recovery)', () => {
     const callsAtForwardTime = tokenSource.calls.length;
 
     // getToken() is the freshness authority (ExecutionTokenManager re-requests
-    // transparently on expiry) — MeshRelay's obligation is simply to call it
+    // transparently on expiry) — McpRelay's obligation is simply to call it
     // AGAIN at drain time rather than caching/replaying anything itself.
     // Script a DIFFERENT ("renewed") token for the drain-time call.
     tokenSource.script.push({ ok: true, token: { accessToken: 'renewed-token', tokenType: 'Bearer', expiresAt: 2_000_000, scope: 'mesh:execution' } });
@@ -267,14 +267,14 @@ describe('secrets discipline', () => {
   });
 });
 
-// ── Drain helpers — construct a fresh MeshRelay pointed at the SAME on-disk
+// ── Drain helpers — construct a fresh McpRelay pointed at the SAME on-disk
 //    spool (same `fs` + `spoolDir`) with a NEW scripted fetch, so a drain's
 //    fetch behaviour can be scripted independently of whatever forward()
 //    used. Mirrors how a real process restart (or a later drain() call)
 //    would reuse the durable spool with a fresh network attempt. ───────────
 
-function relayOnSameSpool(fs: MemShipperFs, tokenSource: FakeTokenSource, fetchImpl: FetchLike, logger?: CaptureLogger): MeshRelay {
-  return new MeshRelay({ tokenSource, spoolDir: SPOOL_DIR, fs, fetchImpl, logger });
+function relayOnSameSpool(fs: MemShipperFs, tokenSource: FakeTokenSource, fetchImpl: FetchLike, logger?: CaptureLogger): McpRelay {
+  return new McpRelay({ tokenSource, spoolDir: SPOOL_DIR, fs, fetchImpl, logger });
 }
 
 async function drainAndCapture(fs: MemShipperFs, tokenSource: FakeTokenSource, script: ScriptedResponse[], logger?: CaptureLogger) {

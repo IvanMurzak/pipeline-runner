@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { ConfigStore, type AgentIdentity } from '../src/core/config';
 import { AgentClient, type AgentClientOptions } from '../src/core/connection';
-import type { ClientCredentialsResult } from '../src/core/mesh-oauth';
+import type { ClientCredentialsResult } from '../src/core/department-oauth';
 import { RegisterCredentialProvider } from '../src/core/register-credential';
 import type { Transport } from '../src/core/transport';
 import { CaptureLogger, FakeClock, MemFs, MockTransport, tick } from './_helpers';

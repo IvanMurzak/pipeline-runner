@@ -12,6 +12,12 @@
  */
 
 import { describe, expect, test } from 'bun:test';
+import {
+  ENGINE_MCP_HELPER_SECRET_ENV,
+  ENGINE_MCP_HELPER_SECRET_ENV_LEGACY,
+  ENGINE_MCP_HELPER_URL_ENV,
+  ENGINE_MCP_HELPER_URL_ENV_LEGACY,
+} from './engine';
 import { runHeadersHelper } from './mcp-headers-helper';
 
 const URL_ = 'http://127.0.0.1:51234/mcp-headers';
@@ -35,7 +41,7 @@ function io(
     capture,
     io: {
       argv: options.argv ?? ['/usr/local/bin/bun', '/opt/r/mcp-headers-helper.ts', 'dexec-42'],
-      env: options.env ?? { PIPELINE_MESH_HELPER_URL: URL_, PIPELINE_MESH_HELPER_SECRET: SECRET },
+      env: options.env ?? { [ENGINE_MCP_HELPER_URL_ENV]: URL_, [ENGINE_MCP_HELPER_SECRET_ENV]: SECRET },
       stdout: (text) => {
         capture.stdout += text;
       },
@@ -88,11 +94,59 @@ describe('the headers-helper program', () => {
   });
 
   test('no injected channel ⇒ exit 2 — this is the case where the runner offered none', async () => {
-    for (const env of [{}, { PIPELINE_MESH_HELPER_URL: URL_ }, { PIPELINE_MESH_HELPER_SECRET: SECRET }, { PIPELINE_MESH_HELPER_URL: URL_, PIPELINE_MESH_HELPER_SECRET: '' }]) {
+    for (const env of [
+      {},
+      { [ENGINE_MCP_HELPER_URL_ENV]: URL_ },
+      { [ENGINE_MCP_HELPER_SECRET_ENV]: SECRET },
+      { [ENGINE_MCP_HELPER_URL_ENV]: URL_, [ENGINE_MCP_HELPER_SECRET_ENV]: '' },
+      // …and the same three holes in the pre-rename spellings, so "fall back
+      // to the old name" cannot accidentally mean "accept half a channel".
+      { [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: URL_ },
+      { [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: SECRET },
+      { [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: URL_, [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: '' },
+    ]) {
       const { io: helperIo, capture } = io({ env });
       expect(await runHeadersHelper(helperIo)).toBe(2);
       expect(capture.stdout).toBe('');
     }
+  });
+
+  test('b5 — the helper reads the PRE-RENAME spellings too, and prefers the new ones', async () => {
+    // The case that matters: this program is a GRANDCHILD of the supervisor
+    // (Claude Code re-runs it on connect and on 401), so it can easily be a
+    // newer build than the session whose environment it inherits. A helper
+    // that only knew the new names would 401-loop forever there.
+    const legacyOnly = io({ env: { [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: URL_, [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: SECRET } });
+    expect(await runHeadersHelper(legacyOnly.io)).toBe(0);
+    expect(JSON.parse(legacyOnly.capture.stdout)).toEqual({ Authorization: 'Bearer tok-2' });
+    expect(legacyOnly.capture.requests[0]!.authorization).toBe(`Bearer ${SECRET}`);
+    expect(legacyOnly.capture.requests[0]!.url).toContain(URL_);
+
+    // Both present and identical — the shipped state during the window.
+    const both = io({
+      env: {
+        [ENGINE_MCP_HELPER_URL_ENV]: URL_,
+        [ENGINE_MCP_HELPER_SECRET_ENV]: SECRET,
+        [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: URL_,
+        [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: SECRET,
+      },
+    });
+    expect(await runHeadersHelper(both.io)).toBe(0);
+    expect(both.capture.requests[0]!.authorization).toBe(`Bearer ${SECRET}`);
+
+    // Both present and DIFFERENT — the new name wins, unambiguously.
+    const conflicting = io({
+      env: {
+        [ENGINE_MCP_HELPER_URL_ENV]: URL_,
+        [ENGINE_MCP_HELPER_SECRET_ENV]: SECRET,
+        [ENGINE_MCP_HELPER_URL_ENV_LEGACY]: 'http://127.0.0.1:1/stale',
+        [ENGINE_MCP_HELPER_SECRET_ENV_LEGACY]: 'stale-secret',
+      },
+    });
+    expect(await runHeadersHelper(conflicting.io)).toBe(0);
+    expect(conflicting.capture.requests[0]!.url).toContain(URL_);
+    expect(conflicting.capture.requests[0]!.authorization).toBe(`Bearer ${SECRET}`);
+    expect(conflicting.capture.stderr).not.toContain('stale-secret');
   });
 
   test('an unreachable runner is a clean exit 1 inside Claude Code\'s 10s window, not a hang', async () => {
