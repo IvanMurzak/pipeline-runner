@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { buildServicePlan } from './plan';
-import { selectBackend } from './index';
+import { runService, selectBackend } from './index';
 import { parseTaskState, renderTaskCreateCommand, windowsTaskBackend } from './windows-task';
 import { ServiceError, type ServiceContext, type ServiceExecResult } from './types';
 
@@ -147,9 +147,19 @@ describe('install', () => {
     expect(r.messages.join(' ')).toContain('restart-on-failure could not be configured');
   });
 
-  test('a failed /Create is fatal and carries the real error text', () => {
+  test('a failed /Create is fatal, carries the real error, AND names the way past it', () => {
+    // Registering in the scheduler's root folder is admin-gated on some
+    // machines even though running the task afterwards is not. A bare "Access
+    // is denied" sends people hunting a bug in the runner.
     const { ctx } = world([{ match: '/Create', result: { code: 1, stderr: 'ERROR: Access is denied.' } }]);
     expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/Access is denied/);
+    expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/RunAs/);
+  });
+
+  test('a NON-privilege failure gets no elevation hint — the blanket advice is what people learn to ignore', () => {
+    const { ctx } = world([{ match: '/Create', result: { code: 1, stderr: 'ERROR: The task XML is malformed.' } }]);
+    expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/malformed/);
+    expect(() => windowsTaskBackend.install(PLAN, ctx)).not.toThrow(/RunAs/);
   });
 });
 
@@ -167,5 +177,25 @@ describe('restart — the verb an upgrade depends on', () => {
     const { ctx } = world([READY]);
     const r = windowsTaskBackend.restart(PLAN, ctx);
     expect(r.commands.map((c) => c.args[0])).not.toContain('/End');
+  });
+});
+
+describe('the --service-host flag (0.7.2 regression)', () => {
+  // 0.7.2 shipped `windowsHost` as an API option with NO CLI flag behind it.
+  // `service uninstall --service-host scm` therefore parsed as plain
+  // `uninstall`, ran against the DEFAULT backend, and deleted the caller's
+  // SCHEDULED TASK while they believed they were removing the old SCM service.
+  // Observed on a real machine minutes after 0.7.2 was published.
+  test('an unknown flag is REFUSED, never ignored', () => {
+    expect(() => runService(['status', '--not-a-real-flag'])).toThrow();
+  });
+
+  test('--service-host selects the backend it names', () => {
+    expect(selectBackend('win32', 'task').id).toBe('windows-task');
+    expect(selectBackend('win32', 'scm').id).toBe('windows');
+  });
+
+  test('a bad --service-host value is refused rather than defaulted', () => {
+    expect(() => runService(['status', '--service-host', 'systemd'])).toThrow(/must be/);
   });
 });

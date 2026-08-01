@@ -187,7 +187,9 @@ export function previewService(opts: ServiceOptions = {}): ServicePreview {
 function serviceUsage(): void {
   console.log(
     [
-      'usage: pipeline-runner service <install|uninstall|status|start|stop|restart> [--dry-run] [--name <name>] [--home <path>]',
+      'usage: pipeline-runner service <install|uninstall|status|start|stop|restart>',
+      '                               [--dry-run] [--name <name>] [--home <path>]',
+      '                               [--service-host <task|scm>]   (Windows only)',
       '',
       '  install    register + start the runner as an OS service (systemd/launchd/Windows)',
       '  uninstall  stop + deregister the service',
@@ -204,17 +206,53 @@ function serviceUsage(): void {
       '  --home <path>   pin this instance to an isolated home (PIPELINE_RUNNER_HOME) — its',
       '                  own config dir, data dir, job-workspace root, and lock file, so it',
       '                  never collides with another instance on the same host.',
+      '  --service-host <task|scm>   Windows only. `task` (default) is a per-user scheduled',
+      '                  task: no elevation, runs as YOU, starts at logon. `scm` is a real',
+      '                  Windows service — it needs an elevated shell and CANNOT start this',
+      '                  runner (a Bun script never answers the Service Control Manager);',
+      '                  it exists for a headless box that must run while logged out, behind',
+      '                  a wrapper. EVERY verb takes it: pass the SAME host you installed',
+      '                  with, or you will address the other one.',
     ].join('\n')
   );
 }
 
 /** Parse `--name <val>`/`--home <val>` out of the service subcommand's rest
  *  args (positional-friendly, mirrors the pre-existing `--dry-run` check). */
-function parseInstanceFlags(rest: string[]): { name?: string; home?: string } {
-  const out: { name?: string; home?: string } = {};
+/**
+ * ⚠ An UNKNOWN flag is a hard error here, and that is the whole point.
+ *
+ * `windowsHost` shipped in 0.7.2 as an API option whose CLI flag was never
+ * wired up. `service uninstall --service-host scm` therefore parsed as
+ * `uninstall` with an ignored argument, ran against the DEFAULT backend, and
+ * deleted the caller's scheduled task while they believed they were removing
+ * the old SCM service. Silently ignoring a flag makes a command do something
+ * other than what it was asked, and a destructive verb is the worst possible
+ * place to find that out.
+ */
+function parseInstanceFlags(rest: string[]): {
+  name?: string;
+  home?: string;
+  windowsHost?: WindowsServiceHost;
+} {
+  const out: { name?: string; home?: string; windowsHost?: WindowsServiceHost } = {};
   for (let i = 0; i < rest.length; i++) {
-    if (rest[i] === '--name' && rest[i + 1] !== undefined) out.name = rest[++i];
-    else if (rest[i] === '--home' && rest[i + 1] !== undefined) out.home = rest[++i];
+    const arg = rest[i]!;
+    if (arg === '--name' && rest[i + 1] !== undefined) out.name = rest[++i];
+    else if (arg === '--home' && rest[i + 1] !== undefined) out.home = rest[++i];
+    else if (arg === '--service-host' && rest[i + 1] !== undefined) {
+      const value = rest[++i]!;
+      if (value !== 'task' && value !== 'scm') {
+        throw new ServiceError(`--service-host must be 'task' or 'scm' — got '${value}'`);
+      }
+      out.windowsHost = value;
+    } else if (arg === '--dry-run') continue;
+    else if (arg.startsWith('-')) {
+      throw new ServiceError(
+        `unknown flag '${arg}' — a flag this build does not understand is refused rather than ignored, ` +
+          'because ignoring it would run the command against a different target than you asked for',
+      );
+    }
   }
   return out;
 }

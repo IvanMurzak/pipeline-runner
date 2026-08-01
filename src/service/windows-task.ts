@@ -159,7 +159,21 @@ function query(plan: ServicePlan, ctx: ServiceContext): { ran: ServiceExecResult
 
 function fail(ran: ServiceExecResult, what: string): never {
   const detail = (ran.stderr || ran.stdout || '').trim().split(/\r?\n/)[0] ?? '';
-  throw new ServiceError(`${what} failed (exit ${ran.code})${detail ? `: ${detail}` : ''}`);
+  // Registering a task in the scheduler's ROOT folder is admin-gated on some
+  // machines (Group Policy / a hardened default ACL), even though RUNNING and
+  // stopping the same task afterwards is not. A bare "Access is denied" sends
+  // people looking for a bug in the runner; naming the one command that gets
+  // past it is the difference between a dead end and a fix. `start`/`stop`
+  // deliberately do NOT carry this hint — they do not need elevation, and a
+  // blanket "try Administrator" trains people to ignore it.
+  const denied = /access is denied/i.test(detail);
+  const hint =
+    denied && /\/Create|\/Delete|\/Change/.test(what)
+      ? '\nhint: registering a scheduled task can require an elevated shell on this machine. Run:' +
+        '\n  Start-Process pwsh -Verb RunAs -ArgumentList \'-NoExit\',\'-Command\',\'pipeline-runner service install\'' +
+        '\nOnce it exists, start/stop/restart and `pipeline-runner update` need no elevation.'
+      : '';
+  throw new ServiceError(`${what} failed (exit ${ran.code})${detail ? `: ${detail}` : ''}${hint}`);
 }
 
 /** A recording runner: every external call lands in `commands`, so a test can
