@@ -740,7 +740,11 @@ function metadataValue(raw: unknown): string | null {
  * `task.complete` with is a result nobody receives.
  */
 export function buildSessionContext(task: DeptTaskSpec, serverName: string = DEPARTMENT_MCP_SERVER_NAME): string {
-  const first = task.messages.find((message) => message.role === 'ROLE_USER');
+  // The first INBOUND message — same predicate, and the same reason, as
+  // `buildPromptLines`: a calling department's agent stamps `ROLE_AGENT`, so
+  // matching on the role finds nothing and the envelope block renders with no
+  // sender metadata at all.
+  const first = task.messages.find((message) => message.selfAuthored !== true);
   const meta = first?.metadata ?? {};
   const lines = [
     'You are running as an ai-pipeline DEPARTMENT session. A remote sender addressed a task to this',
@@ -793,10 +797,26 @@ function messageText(message: DeptMessage): string | null {
  * accepts user messages), so replaying them as user text would put words in
  * the sender's mouth.
  */
+/**
+ * Every INBOUND message's text, in order, as prompt lines.
+ *
+ * Inbound is the whole predicate: anything a sender addressed to this
+ * department, whatever `role` they stamped on it. It is NOT `role ===
+ * 'ROLE_USER'` — that was the filter here until 2026-08-01, and it silently
+ * dropped requests from other departments' agents, which legitimately send
+ * `ROLE_AGENT` (the MCP `tasks.send` schema offers both, and an agent is not a
+ * user). A `software` → `business` task whose single message ran to several
+ * thousand words produced zero lines and was refused with "the envelope
+ * carries no sender text to run a session on".
+ *
+ * What must still be excluded is our OWN past replies, which a respawn replays
+ * out of `messageHistory` — that is `selfAuthored`, set by `./manager.ts` at
+ * the one point such a message is recorded.
+ */
 export function buildPromptLines(task: DeptTaskSpec): string[] {
   const lines: string[] = [];
   for (const message of task.messages) {
-    if (message.role !== 'ROLE_USER') continue;
+    if (message.selfAuthored === true) continue;
     const text = messageText(message);
     if (text !== null) lines.push(buildUserInputLine(text));
   }

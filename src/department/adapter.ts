@@ -43,6 +43,32 @@ export interface DeptMessage {
   taskId?: string;
   createdAt?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * THIS department produced this message — it is our own reply, not something
+   * a sender addressed to us.
+   *
+   * PURELY INTERNAL, like `InvocationEnvelope.executionId`: it is set by
+   * `./manager.ts` when it records what a session emitted, and it never
+   * crosses the wire in either direction.
+   *
+   * It exists because `role` cannot answer the question. `role` is the
+   * SENDER's word about themselves, and a calling department's agent
+   * legitimately sends `ROLE_AGENT` (the MCP `tasks.send` schema offers
+   * exactly `ROLE_USER | ROLE_AGENT`, and an agent is not a user). So
+   * `role === 'ROLE_AGENT'` conflates "another department's agent asked me
+   * something" with "this is my own past reply" — and a prompt builder that
+   * filtered on it dropped the entire inbound request, then refused the task
+   * for carrying no text. That is exactly what happened on 2026-08-01 to a
+   * task from `software` to `business`
+   * (`claude-code: the envelope carries no sender text to run a session on`,
+   * on an envelope whose one message was several thousand words long).
+   *
+   * The self-echo it guards against is real, which is why the guard did not
+   * simply go away: `messageHistory` holds BOTH directions, and a respawn
+   * replays it in full, so without this flag a restarted session would be fed
+   * its own previous answers back as if a sender had written them.
+   */
+  selfAuthored?: boolean;
 }
 
 export interface Question {
