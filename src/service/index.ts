@@ -230,7 +230,7 @@ function serviceUsage(): void {
  * other than what it was asked, and a destructive verb is the worst possible
  * place to find that out.
  */
-function parseInstanceFlags(rest: string[]): {
+export function parseInstanceFlags(rest: string[]): {
   name?: string;
   home?: string;
   windowsHost?: WindowsServiceHost;
@@ -266,8 +266,12 @@ function parseInstanceFlags(rest: string[]): {
 export function runService(argv: string[]): void {
   const [sub, ...rest] = argv;
   const dryRun = rest.includes('--dry-run');
-  const opts: ServiceOptions = parseInstanceFlags(rest);
   try {
+    // INSIDE the try: `parseInstanceFlags` throws `ServiceError` for an unknown
+    // flag or a bad `--service-host`, and parsing outside it let that escape as
+    // an uncaught exception — a raw stack trace, in the one function whose doc
+    // promises it "never crashes with a raw stack".
+    const opts: ServiceOptions = parseInstanceFlags(rest);
     switch (sub) {
       case 'install': {
         if (dryRun) {

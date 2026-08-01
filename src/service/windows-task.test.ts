@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { buildServicePlan } from './plan';
-import { runService, selectBackend } from './index';
+import { parseInstanceFlags, selectBackend } from './index';
 import { parseTaskState, renderTaskCreateCommand, windowsTaskBackend } from './windows-task';
 import { ServiceError, type ServiceContext, type ServiceExecResult } from './types';
 
@@ -186,16 +186,31 @@ describe('the --service-host flag (0.7.2 regression)', () => {
   // `uninstall`, ran against the DEFAULT backend, and deleted the caller's
   // SCHEDULED TASK while they believed they were removing the old SCM service.
   // Observed on a real machine minutes after 0.7.2 was published.
+  test('--service-host is parsed, on any verb', () => {
+    expect(parseInstanceFlags(['--service-host', 'scm']).windowsHost).toBe('scm');
+    expect(parseInstanceFlags(['--service-host', 'task']).windowsHost).toBe('task');
+    expect(parseInstanceFlags([]).windowsHost).toBeUndefined();
+  });
+
   test('an unknown flag is REFUSED, never ignored', () => {
-    expect(() => runService(['status', '--not-a-real-flag'])).toThrow();
+    // Silently dropping a flag makes a command act on a different target than
+    // the one it was asked for. A destructive verb is the worst place to
+    // discover that.
+    expect(() => parseInstanceFlags(['--not-a-real-flag'])).toThrow(/unknown flag/);
+  });
+
+  test('a bad --service-host value is refused rather than defaulted', () => {
+    expect(() => parseInstanceFlags(['--service-host', 'systemd'])).toThrow(/must be/);
+  });
+
+  test('the flags that were always supported still parse', () => {
+    const p = parseInstanceFlags(['--name', 'gpu-01', '--home', 'C:\rt', '--dry-run']);
+    expect(p.name).toBe('gpu-01');
+    expect(p.home).toBe('C:\rt');
   });
 
   test('--service-host selects the backend it names', () => {
     expect(selectBackend('win32', 'task').id).toBe('windows-task');
     expect(selectBackend('win32', 'scm').id).toBe('windows');
-  });
-
-  test('a bad --service-host value is refused rather than defaulted', () => {
-    expect(() => runService(['status', '--service-host', 'systemd'])).toThrow(/must be/);
   });
 });
