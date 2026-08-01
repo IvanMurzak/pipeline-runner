@@ -114,9 +114,21 @@ describe('sender extraction (the same key the session context reads)', () => {
     expect(senderFromMessages([message({ metadata: { sender: 'ivan@acme' } })])).toBe('ivan@acme');
   });
 
-  test('skips agent turns to find the sender of the task', () => {
-    const messages = [message({ role: 'ROLE_AGENT', metadata: { sender: 'not-the-sender' } }), message({ messageId: 'm2', metadata: { sender: 'ivan@acme' } })];
+  test('skips OUR OWN turns to find the sender of the task', () => {
+    // The intent is unchanged — our own reply must never be read as the
+    // sender. What identifies it is `selfAuthored`, not the role: a calling
+    // department's agent legitimately sends ROLE_AGENT, and treating that as
+    // "ours" is what made cross-department tasks record no sender at all.
+    const messages = [
+      message({ role: 'ROLE_AGENT', selfAuthored: true, metadata: { sender: 'not-the-sender' } }),
+      message({ messageId: 'm2', metadata: { sender: 'ivan@acme' } }),
+    ];
     expect(senderFromMessages(messages)).toBe('ivan@acme');
+  });
+
+  test('an inbound ROLE_AGENT message IS the sender — another department is not us', () => {
+    const messages = [message({ role: 'ROLE_AGENT', metadata: { sender: 'software (TD)' } })];
+    expect(senderFromMessages(messages)).toBe('software (TD)');
   });
 
   test('no metadata, a non-string sender, or a blank one is null — never invented', () => {

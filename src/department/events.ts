@@ -259,7 +259,12 @@ const MAX_SENDER = 200;
  * invent one).
  */
 export function senderFromMessages(messages: readonly DeptMessage[]): string | null {
-  const first = messages.find((message) => message.role === 'ROLE_USER') ?? messages[0];
+  // The opening INBOUND message. Not `role === 'ROLE_USER'`: a calling
+  // department's agent sends `ROLE_AGENT`, and the `?? messages[0]` fallback
+  // made that misread survive as "no sender" rather than fail — so the journal
+  // recorded `—` for exactly the cross-department tasks a sender matters most
+  // on. Same predicate as `claude-code.ts`, so the two cannot disagree.
+  const first = messages.find((message) => message.selfAuthored !== true) ?? messages[0];
   const raw = first?.metadata?.sender;
   if (typeof raw !== 'string') return null;
   const flat = raw.replace(/\s+/g, ' ').trim();

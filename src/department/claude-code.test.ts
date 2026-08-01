@@ -220,15 +220,41 @@ describe('the argv (verified against `claude --help`, v2.1.220)', () => {
   });
 
   test('a replayed history contributes the sender\'s turns only — never the session\'s own past output', () => {
+    // `selfAuthored` is what marks our own turn — see `DeptMessage`. The role
+    // cannot: the sender picks it, and both values are legitimate inbound.
     const task = makeTaskSpec({
       messages: [
         makeMessage({ messageId: 'm1', role: 'ROLE_USER', parts: [{ text: 'first' }] }),
-        makeMessage({ messageId: 'm2', role: 'ROLE_AGENT', parts: [{ text: 'my own earlier answer' }] }),
+        makeMessage({ messageId: 'm2', role: 'ROLE_AGENT', parts: [{ text: 'my own earlier answer' }], selfAuthored: true }),
         makeMessage({ messageId: 'm3', role: 'ROLE_USER', parts: [{ text: 'second' }] }),
       ],
     });
     const texts = buildPromptLines(task).map((line) => (JSON.parse(line) as { message: { content: { text: string }[] } }).message.content[0]!.text);
     expect(texts).toEqual(['first', 'second']);
+  });
+
+  test('an inbound ROLE_AGENT message is a request, not our own output — it MUST reach the prompt', () => {
+    // The 2026-08-01 production failure, verbatim in shape: `software` sent
+    // `business` a multi-thousand-word request through MCP with role
+    // ROLE_AGENT (an agent is not a user, and `tasks.send` offers both), the
+    // prompt builder matched on ROLE_USER, produced zero lines, and the task
+    // was REJECTED with "the envelope carries no sender text to run a session
+    // on" — while carrying several pages of it.
+    const task = makeTaskSpec({
+      messages: [makeMessage({ messageId: 'm1', role: 'ROLE_AGENT', parts: [{ text: 'REQUEST from software (TD): final copy for the notice email.' }] })],
+    });
+    const texts = buildPromptLines(task).map((line) => (JSON.parse(line) as { message: { content: { text: string }[] } }).message.content[0]!.text);
+    expect(texts).toEqual(['REQUEST from software (TD): final copy for the notice email.']);
+    expect(texts).toHaveLength(1);
+  });
+
+  test('the envelope block reads its sender off an inbound ROLE_AGENT message too', () => {
+    // Same misread, second symptom: the session was told nothing about who
+    // addressed it, on exactly the cross-department tasks where that matters.
+    const task = makeTaskSpec({
+      messages: [makeMessage({ role: 'ROLE_AGENT', parts: [{ text: 'work' }], metadata: { sender: 'software (TD)' } })],
+    });
+    expect(buildSessionContext(task)).toContain('software (TD)');
   });
 
   test('the session context tells the model the one thing it cannot discover: unreported work reaches nobody', () => {

@@ -1240,6 +1240,12 @@ export class DepartmentManager {
         parts: event.parts,
         taskId: state.taskId,
         contextId: state.contextId,
+        // This is the ONE place a message enters the history from our own
+        // session rather than from a sender. Marking it here is what lets a
+        // respawn replay the history without feeding the session its own
+        // previous answers — see `DeptMessage.selfAuthored`, which explains
+        // why `role` cannot carry that distinction.
+        selfAuthored: true,
       });
     }
 
