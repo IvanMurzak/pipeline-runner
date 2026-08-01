@@ -27,6 +27,13 @@ function plan(overrides: Partial<ServicePlan> = {}): ServicePlan {
 
 const OPTS = {
   platform: 'win32',
+  // EXPLICIT since the win32 default flipped to Task Scheduler: this file
+  // tests the SCM backend, which is now the opt-in host for a headless box
+  // that must run logged-out. Without this the suite silently drives
+  // `windows-task` instead — see src/service/windows-task.ts for why the
+  // default moved (a Bun script cannot answer the SCM, so every start failed
+  // with Event 7000/7009 while `install` reported success).
+  windowsHost: 'scm' as const,
   env: { APPDATA: 'C:\\Users\\u\\AppData\\Roaming' },
   invocation: {
     program: 'C:\\Program Files\\bun\\bun.exe',

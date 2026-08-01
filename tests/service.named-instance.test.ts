@@ -163,7 +163,7 @@ describe('named instance end-to-end — windows', () => {
     const exec = new FakeExec();
     const fs = new FakeServiceFs();
     const result = installService({
-      platform: 'win32',
+      platform: 'win32', windowsHost: 'scm' as const,
       env: WIN_ENV,
       name: 'gpu-01',
       invocation: { program: 'C:\\bun\\bun.exe', args: ['C:\\agent\\cli.ts', 'start'] },
@@ -178,11 +178,11 @@ describe('named instance end-to-end — windows', () => {
   test('status/uninstall address the SAME per-name service (no accidental default-instance touch)', () => {
     const exec = new FakeExec(({ args }) => (args[0] === 'query' ? { code: 1060 } : {}));
     const fs = new FakeServiceFs();
-    const status = serviceStatus({ platform: 'win32', env: WIN_ENV, name: 'gpu-01', invocation: { program: 'x', args: ['y'] }, exec, fs });
+    const status = serviceStatus({ platform: 'win32', windowsHost: 'scm' as const, env: WIN_ENV, name: 'gpu-01', invocation: { program: 'x', args: ['y'] }, exec, fs });
     expect(status.state).toBe('not-installed');
     expect(exec.calls[0]).toEqual({ cmd: 'sc.exe', args: ['query', 'pipeline-runner@gpu-01'] });
 
-    const uninstall = uninstallService({ platform: 'win32', env: WIN_ENV, name: 'gpu-01', invocation: { program: 'x', args: ['y'] }, exec: new FakeExec(), fs });
+    const uninstall = uninstallService({ platform: 'win32', windowsHost: 'scm' as const, env: WIN_ENV, name: 'gpu-01', invocation: { program: 'x', args: ['y'] }, exec: new FakeExec(), fs });
     expect(uninstall.definitionPath).toBeNull();
   });
 });

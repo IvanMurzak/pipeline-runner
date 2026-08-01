@@ -126,6 +126,7 @@ import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './re
 // the read-only look at the INSTALLED definition that `journal` uses to find a
 // journal owned by another OS account (see ./department/journal-read.ts).
 import { inspectInstalledService, runService } from './service';
+import { runUpdate } from './service/update';
 // department-mesh (task d1): a SECOND, PARALLEL admission surface for
 // department tasks (`department.offer`/`.message`/`.cancel`) — mirrors
 // attachJobExecution's construction shape without touching pipeline dispatch.
@@ -215,6 +216,12 @@ function usage(): never {
       '  journal --department <id> [--json] [--limit <n>] [--name <name>] [--home <path>]',
       '  status',
       '  service <install|uninstall|status|start|stop|restart> [--dry-run] [--name <name>] [--home <path>]',
+      '  update [<version|dist-tag>] [--dry-run] [--no-restart]',
+      '',
+      '  `update` installs the package AND restarts the running runner through its',
+      '  service supervisor. Installing alone changes nothing about a live process:',
+      '  Bun reads the source at startup, so it keeps executing the old code with the',
+      '  new files underneath it.',
       '',
       '  `bind --adapter` is checked against this build\'s engine registry — an adapter',
       `  it has no module for is refused. Registered: ${describeRegisteredAdapters()}.`,
@@ -1012,6 +1019,49 @@ function runJournal(argv: string[]): void {
   if (code !== 0) process.exit(code);
 }
 
+/**
+ * `pipeline-runner update [<version|tag>] [--dry-run] [--no-restart]`
+ *
+ * Installing a new package does NOT change a running runner — Bun reads the
+ * source at startup, so the process keeps executing the old code with the new
+ * files underneath it. This installs and then asks the supervisor to restart,
+ * which is the only step that actually makes the new code the running code.
+ */
+function runUpdateCommand(argv: string[]): void {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(
+      [
+        'usage: pipeline-runner update [<version|dist-tag>] [--dry-run] [--no-restart]',
+        '',
+        '  Installs the package and then asks the service supervisor to restart the',
+        '  runner, so the new code is the code that is actually running. Updating the',
+        '  files alone changes nothing about a live process.',
+        '',
+        '  <version|dist-tag>  what to install. Default: latest',
+        '  --dry-run           print what would happen; install and restart nothing',
+        '  --no-restart        update the files only, leave the running process alone',
+      ].join('\n'),
+    );
+    return;
+  }
+  const target = argv.find((a) => !a.startsWith('-'));
+  try {
+    const outcome = runUpdate({
+      ...(target ? { target } : {}),
+      dryRun: argv.includes('--dry-run'),
+      noRestart: argv.includes('--no-restart'),
+      currentVersion: AGENT_VERSION,
+    });
+    for (const line of outcome.messages) console.log(`[pipeline-runner] ${line}`);
+    if (!outcome.restarted && outcome.restartSkippedReason !== undefined && !argv.includes('--dry-run')) {
+      console.log(`[pipeline-runner] not restarted: ${outcome.restartSkippedReason}`);
+    }
+  } catch (err) {
+    console.error(`[pipeline-runner] error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 1;
+  }
+}
+
 function runStatus(): void {
   const store = new ConfigStore();
   const identity = store.load();
@@ -1050,6 +1100,9 @@ switch (command) {
   case 'service':
     // T1-15: additive route to the service module (only change outside src/service/).
     runService(rest);
+    break;
+  case 'update':
+    runUpdateCommand(rest);
     break;
   case '--version':
     console.log(AGENT_VERSION);

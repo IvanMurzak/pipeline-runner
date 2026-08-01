@@ -143,11 +143,55 @@ function isNotActive(r: { code: number; stdout: string; stderr: string }): boole
   return r.code === ERROR_SERVICE_NOT_ACTIVE || /1062|has not been started/i.test(`${r.stdout}\n${r.stderr}`);
 }
 
+/** `sc start` when the launched program never answered the SCM. */
+const ERROR_SERVICE_REQUEST_TIMEOUT = 1053;
+
+/**
+ * PURE: turn an `sc.exe` exit code into something an operator can act on.
+ *
+ * A bare `failed (exit 29)` is a dead end: the number is a Win32 error the
+ * caller has to go and look up, and the two that actually happen here have
+ * very different remedies. This is the layer that says which.
+ *
+ * `1053` is the important one, and it is not a transient fault: it means the
+ * program the SCM launched never announced itself as a service, which a Bun
+ * script structurally cannot do. The remedy is not "retry" or "run as
+ * Administrator" — it is to stop using the SCM for this, which is why the
+ * Windows default is now Task Scheduler (`./windows-task.ts`).
+ */
+export function describeScExitCode(code: number): string | null {
+  switch (code) {
+    case ERROR_ACCESS_DENIED:
+      return 'access denied — this needs an elevated (Administrator) shell';
+    case ERROR_SERVICE_REQUEST_TIMEOUT:
+      return (
+        'the program did not report itself to the Service Control Manager within 30s. ' +
+        'A Bun/Node script cannot: only a real service executable can. ' +
+        'Use the Task Scheduler backend instead — `pipeline-runner service install` now defaults to it ' +
+        '(re-run it to migrate), or keep the SCM behind a wrapper like WinSW/NSSM'
+      );
+    case ERROR_SERVICE_ALREADY_RUNNING:
+      return 'the service is already running';
+    case ERROR_SERVICE_NOT_ACTIVE:
+      return 'the service is not running';
+    case ERROR_SERVICE_DOES_NOT_EXIST:
+      return 'no such service — install it first';
+    default:
+      return null;
+  }
+}
+
 /** x24: name elevation when — and only when — it is what actually went wrong.
- *  A blanket "try Administrator" on every failure trains people to ignore it. */
+ *  A blanket "try Administrator" on every failure trains people to ignore it.
+ *  Now also names the OTHER codes that actually occur — see
+ *  {@link describeScExitCode}; before this, `sc.exe` failures surfaced as a
+ *  bare exit number and 1053 in particular sent people looking for a
+ *  permissions problem that was not there. */
 function elevationHint(r: { code: number; stdout: string; stderr: string }, what: string): string {
   const denied = r.code === ERROR_ACCESS_DENIED || /access is denied|\b5\b\s*:\s*access/i.test(`${r.stdout}\n${r.stderr}`);
-  return denied ? `\nhint: ${what} requires an elevated (Administrator) shell.` : '';
+  if (denied) return `\nhint: ${what} requires an elevated (Administrator) shell.`;
+  const described = describeScExitCode(r.code);
+  return described === null ? '' : `\nhint: ${described}.`;
 }
 
 /** x24: `start`/`restart` against a service the SCM has never heard of. */

@@ -42,7 +42,7 @@ function win(exec: FakeExec) {
   // APPDATA only so `buildServicePlan` can resolve a configDir; the Windows
   // backend is SCM-only and never touches the filesystem seam.
   return {
-    platform: 'win32',
+    platform: 'win32', windowsHost: 'scm' as const,
     env: { APPDATA: join('C:', 'Users', 'ada', 'AppData', 'Roaming') },
     fs: new FakeServiceFs(),
     exec,

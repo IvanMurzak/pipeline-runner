@@ -24,7 +24,12 @@ describe('selectBackend', () => {
   test('maps each supported platform to its backend', () => {
     expect(selectBackend('linux').id).toBe('systemd');
     expect(selectBackend('darwin').id).toBe('launchd');
-    expect(selectBackend('win32').id).toBe('windows');
+    // win32 defaults to the SCHEDULER, not the SCM: a Bun script cannot answer
+    // the Service Control Manager, so every `sc start` failed with Event
+    // 7000/7009 while `install` reported success. The SCM host stays available
+    // for a headless box that must run logged-out.
+    expect(selectBackend('win32').id).toBe('windows-task');
+    expect(selectBackend('win32', 'scm').id).toBe('windows');
   });
 
   test('supported platform list is [linux, darwin, win32]', () => {
@@ -90,7 +95,7 @@ describe('previewService (pure, touches nothing)', () => {
 
   test('windows preview has a null path and the sc.exe create command', () => {
     const preview = previewService({
-      platform: 'win32',
+      platform: 'win32', windowsHost: 'scm' as const,
       invocation: { program: 'C:\\bun\\bun.exe', args: ['C:\\agent\\cli.ts', 'start'] },
       workingDirectory: 'C:\\agent',
       environment: {},

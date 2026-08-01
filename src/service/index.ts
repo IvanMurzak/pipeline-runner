@@ -20,6 +20,7 @@ import { buildServicePlan, type PlanInputs, type ServicePlan } from './plan';
 import { createLaunchdBackend } from './launchd';
 import { createSystemdBackend } from './systemd';
 import { createWindowsBackend } from './windows';
+import { windowsTaskBackend } from './windows-task';
 import {
   nodeServiceExec,
   nodeServiceFs,
@@ -59,19 +60,33 @@ export {
 /** The platforms with a service backend. */
 export const SUPPORTED_PLATFORMS = ['linux', 'darwin', 'win32'] as const;
 
+/**
+ * Which Windows host to register with. `task` is the DEFAULT and the one that
+ * works for the runner; `scm` is the old `sc.exe` service, kept for the one
+ * case a scheduled task cannot serve — a headless box that must run while
+ * nobody is logged in — and documented as needing elevation.
+ *
+ * See `./windows-task.ts` for why the default flipped: `sc.exe` registers a
+ * Bun script as a `WIN32_OWN_PROCESS`, the SCM waits 30s for a service that
+ * will never announce itself, and the start fails (Event 7000/7009). That
+ * backend's own header always said a script is not a service; `install`
+ * reported success anyway.
+ */
+export type WindowsServiceHost = 'task' | 'scm';
+
 /** Select the backend for a raw `process.platform` value. */
-export function selectBackend(platform: string): ServiceBackend {
+export function selectBackend(platform: string, windowsHost: WindowsServiceHost = 'task'): ServiceBackend {
   switch (platform) {
     case 'linux':
       return createSystemdBackend();
     case 'darwin':
       return createLaunchdBackend();
     case 'win32':
-      return createWindowsBackend();
+      return windowsHost === 'scm' ? createWindowsBackend() : windowsTaskBackend;
     default:
       throw new ServiceError(
         `unsupported platform: ${platform} — service install supports ${SUPPORTED_PLATFORMS.join(', ')} ` +
-          '(systemd / launchd / Windows Service)'
+          '(systemd / launchd / Windows Task Scheduler)'
       );
   }
 }
@@ -83,6 +98,9 @@ export interface ServiceOptions extends PlanInputs {
   exec?: ServiceExec;
   fs?: ServiceFs;
   logger?: Logger;
+  /** Windows only: which host to register with. Default `task` — see
+   *  {@link WindowsServiceHost}. */
+  windowsHost?: WindowsServiceHost;
 }
 
 function resolve(opts: ServiceOptions): {
@@ -92,7 +110,7 @@ function resolve(opts: ServiceOptions): {
 } {
   const platform = opts.platform ?? process.platform;
   const env = opts.env ?? process.env;
-  const backend = selectBackend(platform); // throws on unsupported — never a silent no-op
+  const backend = selectBackend(platform, opts.windowsHost); // throws on unsupported — never a silent no-op
   const plan = buildServicePlan(opts, platform, env);
   const ctx: ServiceContext = {
     fs: opts.fs ?? nodeServiceFs(),
