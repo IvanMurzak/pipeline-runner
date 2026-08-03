@@ -25,9 +25,9 @@ import {
 import { CaptureLogger, FakeClock } from './_helpers';
 import { FakeUploadTransport, journalLine, MemShipperFs, settle, validRunRecord } from './_shipper-helpers';
 
-const JOURNAL = 'C:/proj/.claude/pipeline/.runtime/events.jsonl';
+const JOURNAL = 'C:/proj/.pipelines/.runtime/events.jsonl';
 const STATE = 'C:/state/agent/shipper/j1';
-const STATS_DIR = 'C:/proj/.claude/pipeline/.stats';
+const STATS_DIR = 'C:/proj/.pipelines/.stats';
 const RUNS_FILE = `${STATS_DIR}/workflows/release/runs.jsonl`;
 
 /** Fixture records end at 2026-07-11T13:00Z; "now" is the following day, so

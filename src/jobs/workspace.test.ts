@@ -14,7 +14,7 @@ import {
 const ROOT = join('/tmp', 'jobs');
 
 /** A fs pre-seeded so the standard fixture lease prepares successfully. */
-function readyFs(dir: string, pipelineRel = '.claude/pipeline/release'): FakeJobFs {
+function readyFs(dir: string, pipelineRel = '.pipelines/release'): FakeJobFs {
   const fs = new FakeJobFs();
   const pipelineRoot = join(dir, ...pipelineRel.split('/'));
   fs.existing.add(pipelineRoot);
@@ -52,8 +52,8 @@ describe('sanitizeJobId', () => {
 });
 
 describe('pipelineRootRel', () => {
-  test('a bare name resolves under .claude/pipeline/', () => {
-    expect(pipelineRootRel('release')).toBe('.claude/pipeline/release');
+  test('a bare name resolves under .pipelines/', () => {
+    expect(pipelineRootRel('release')).toBe('.pipelines/release');
   });
 
   test('a path is taken verbatim (normalized)', () => {

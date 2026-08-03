@@ -7,14 +7,14 @@ import {
 } from './drive';
 import { DRIVE_COMPLETED, DRIVE_HALTED, DRIVE_PROVIDER_LIMIT, driveAwaiting } from './_helpers';
 
-const TARGET = { pipelineRoot: '/ws/.claude/pipeline/release', runId: 'run-1' };
+const TARGET = { pipelineRoot: '/ws/.pipelines/release', runId: 'run-1' };
 
 describe('buildDriveArgs', () => {
   test('initial start', () => {
     expect(buildDriveArgs(TARGET, { kind: 'start', startIteration: 'steps/01-plan.md' })).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--start',
@@ -27,7 +27,7 @@ describe('buildDriveArgs', () => {
     expect(buildDriveArgs(TARGET, { kind: 'resume' })).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--resume',
@@ -39,7 +39,7 @@ describe('buildDriveArgs', () => {
     expect(buildDriveArgs(TARGET, { kind: 'answer', startIteration: 'steps/02-deploy.md', answer: 'host-a' })).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--resume',
@@ -62,7 +62,7 @@ describe('buildDriveArgs', () => {
     ).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--default-model',
@@ -79,7 +79,7 @@ describe('buildDriveArgs', () => {
     expect(buildDriveArgs({ ...TARGET, defaultModel: 'sonnet' }, { kind: 'resume' })).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--default-model',
@@ -93,7 +93,7 @@ describe('buildDriveArgs', () => {
     expect(buildDriveArgs({ ...TARGET, defaultEffort: 'max' }, { kind: 'resume' })).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--default-effort',
@@ -112,7 +112,7 @@ describe('buildDriveArgs', () => {
     ).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-1',
       '--default-model',
@@ -146,7 +146,7 @@ describe('buildDriveArgs', () => {
       expect(args).toEqual([
         'drive',
         '--root',
-        '/ws/.claude/pipeline/release',
+        '/ws/.pipelines/release',
         '--run-id',
         'run-1',
         '--start',
@@ -173,7 +173,7 @@ describe('buildDriveArgs', () => {
 
     test('a PLAIN RESUME never carries --var even though the target still holds variables', () => {
       const args = buildDriveArgs({ ...TARGET, variables: { PP_SERVICE: 'payments' } }, { kind: 'resume' });
-      expect(args).toEqual(['drive', '--root', '/ws/.claude/pipeline/release', '--run-id', 'run-1', '--resume', '--json']);
+      expect(args).toEqual(['drive', '--root', '/ws/.pipelines/release', '--run-id', 'run-1', '--resume', '--json']);
       expect(args).not.toContain('--var');
     });
 
@@ -186,7 +186,7 @@ describe('buildDriveArgs', () => {
       expect(args).toEqual([
         'drive',
         '--root',
-        '/ws/.claude/pipeline/release',
+        '/ws/.pipelines/release',
         '--run-id',
         'run-1',
         '--resume',
@@ -202,7 +202,7 @@ describe('buildDriveArgs', () => {
       expect(buildDriveArgs(TARGET, { kind: 'start', startIteration: 'steps/01-plan.md' })).toEqual([
         'drive',
         '--root',
-        '/ws/.claude/pipeline/release',
+        '/ws/.pipelines/release',
         '--run-id',
         'run-1',
         '--start',
@@ -224,7 +224,7 @@ describe('buildDriveArgs', () => {
       expect(args).toEqual([
         'drive',
         '--root',
-        '/ws/.claude/pipeline/release',
+        '/ws/.pipelines/release',
         '--run-id',
         'run-1',
         '--default-model',

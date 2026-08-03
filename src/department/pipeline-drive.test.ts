@@ -48,7 +48,7 @@ const DRIVE_STARTED: RuntimeEvent = { type: 'status', state: 'WORKING', message:
 
 function makeDriveSpec(overrides: Partial<PipelineDriveSpec> = {}): PipelineDriveSpec {
   return {
-    pipelineRoot: '/ws/.claude/pipeline/release',
+    pipelineRoot: '/ws/.pipelines/release',
     startIteration: 'steps/01-plan.md',
     ...overrides,
   };
@@ -96,7 +96,7 @@ describe('PipelineDriveAdapter — argv is byte-identical to pipeline-dispatch (
     expect(exec.calls).toHaveLength(1);
     expect(exec.calls[0]).toMatchObject({
       cmd: 'pipeline',
-      args: ['drive', '--root', '/ws/.claude/pipeline/release', '--run-id', 'run-1', '--start', 'steps/01-plan.md', '--json'],
+      args: ['drive', '--root', '/ws/.pipelines/release', '--run-id', 'run-1', '--start', 'steps/01-plan.md', '--json'],
     });
     expect(exec.calls[0]!.opts.cwd).toBe('/ws');
   });
@@ -116,7 +116,7 @@ describe('PipelineDriveAdapter — argv is byte-identical to pipeline-dispatch (
     expect(exec.calls[0]!.args).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'run-2',
       '--default-model',
@@ -247,7 +247,7 @@ describe('PipelineDriveAdapter — resuming a parked question (07 §5 respawn-on
     expect(exec.calls[1]!.args).toEqual([
       'drive',
       '--root',
-      '/ws/.claude/pipeline/release',
+      '/ws/.pipelines/release',
       '--run-id',
       'dtask-park-1',
       '--resume',
@@ -902,14 +902,14 @@ describe('narrowPipelineDriveSpec (./config.ts parsing counterpart)', () => {
   test('a well-formed spec parses through, optional fields included', () => {
     expect(
       narrowPipelineDriveSpec({
-        pipelineRoot: '/ws/.claude/pipeline/release',
+        pipelineRoot: '/ws/.pipelines/release',
         startIteration: 'steps/01-plan.md',
         defaultModel: 'opus',
         defaultEffort: 'high',
         variables: { PP_SERVICE: 'payments', PP_BAD: 5 },
       })
     ).toEqual({
-      pipelineRoot: '/ws/.claude/pipeline/release',
+      pipelineRoot: '/ws/.pipelines/release',
       startIteration: 'steps/01-plan.md',
       defaultModel: 'opus',
       defaultEffort: 'high',

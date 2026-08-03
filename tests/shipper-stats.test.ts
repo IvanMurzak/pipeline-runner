@@ -8,7 +8,7 @@ import { describe, expect, test } from 'bun:test';
 import { DiskStatsSource, isTerminalEventType, statsDirForJournal, statsRecordEvent } from '../src/shipper/stats';
 import { MemShipperFs } from './_shipper-helpers';
 
-const STATS_DIR = 'C:/proj/.claude/pipeline/.stats';
+const STATS_DIR = 'C:/proj/.pipelines/.stats';
 
 describe('DiskStatsSource', () => {
   test('finds the newest matching record across nested runs.jsonl files, skipping runs/ dirs and garbage lines', () => {
@@ -70,11 +70,11 @@ describe('DiskStatsSource', () => {
 
 describe('stats helpers', () => {
   test('statsDirForJournal derives the sibling .stats dir from the journal path', () => {
-    expect(statsDirForJournal('C:/proj/.claude/pipeline/.runtime/events.jsonl').replace(/\\/g, '/')).toBe(
-      'C:/proj/.claude/pipeline/.stats'
+    expect(statsDirForJournal('C:/proj/.pipelines/.runtime/events.jsonl').replace(/\\/g, '/')).toBe(
+      'C:/proj/.pipelines/.stats'
     );
-    expect(statsDirForJournal('/home/u/p/.claude/pipeline/.runtime/events.jsonl').replace(/\\/g, '/')).toBe(
-      '/home/u/p/.claude/pipeline/.stats'
+    expect(statsDirForJournal('/home/u/p/.pipelines/.runtime/events.jsonl').replace(/\\/g, '/')).toBe(
+      '/home/u/p/.pipelines/.stats'
     );
   });
 

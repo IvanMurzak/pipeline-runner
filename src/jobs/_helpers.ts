@@ -208,7 +208,7 @@ export function makeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
     attempt: 1,
     pipeline_ref: { repo: 'git@example.com:acme/api.git', ref: 'main', pipeline: 'release', content_hash: null },
     checkout_dir: checkout,
-    pipeline_root: `${checkout}/.claude/pipeline/release`,
+    pipeline_root: `${checkout}/.pipelines/release`,
     start_iteration: 'steps/01-plan.md',
     lease_ttl_s: 90,
     secret_slugs: [],

@@ -7,7 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import { JournalTail } from '../src/shipper/tail';
 import { MemShipperFs } from './_shipper-helpers';
 
-const JOURNAL = 'C:/proj/.claude/pipeline/.runtime/events.jsonl';
+const JOURNAL = 'C:/proj/.pipelines/.runtime/events.jsonl';
 
 describe('JournalTail', () => {
   test('delivers complete lines once and never re-reads them', () => {

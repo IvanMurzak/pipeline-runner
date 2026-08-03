@@ -111,7 +111,7 @@ describe('task dispatch — happy path (task → match → resolve → drive)', 
       { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'started' },
       { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'completed', outcome: 'completed' },
     ]);
-    expect(logger.joined()).toContain("task task-1 dispatched to pipeline '.claude/pipeline/release'");
+    expect(logger.joined()).toContain("task task-1 dispatched to pipeline '.pipelines/release'");
   });
 
   test('onWorkspaceReady points the shipper at the RESOLVED pipeline root', async () => {
@@ -174,7 +174,7 @@ describe('task dispatch — no match ⇒ the run FAILS (never drives a guess)', 
 describe('task dispatch — the resolution seam', () => {
   test('an injected resolver replaces the CLI matcher (no match subprocess)', async () => {
     const seen: TaskDispatchInput[] = [];
-    const resolution: TaskPipelineResolution = { pipeline: '.claude/pipeline/release', manifest: RELEASE_MANIFEST, score: 9 };
+    const resolution: TaskPipelineResolution = { pipeline: '.pipelines/release', manifest: RELEASE_MANIFEST, score: 9 };
     const exec = dispatchExec(matchOutput([]), [DRIVE_COMPLETED]);
     const { executor } = makeExecutor(exec, {
       resolveTaskPipeline: async (input) => {
@@ -262,7 +262,7 @@ describe('task dispatch — through the JobManager', () => {
       resolveStartIteration: defaultResolveStartIteration,
       resolveTaskPipeline: async () => {
         resolved += 1;
-        return { pipeline: '.claude/pipeline/release', manifest: RELEASE_MANIFEST, score: 1 };
+        return { pipeline: '.pipelines/release', manifest: RELEASE_MANIFEST, score: 1 };
       },
     });
     manager.attach(dispatcher);

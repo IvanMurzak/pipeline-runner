@@ -80,7 +80,7 @@ interface PendingEvent {
 }
 
 export interface EventShipperOptions {
-  /** `<project>/.claude/pipeline/.runtime/events.jsonl`. */
+  /** `<project>/.pipelines/.runtime/events.jsonl`. */
   journalPath: string;
   /** The upload transport (see ./upload-transport.ts). */
   transport: UploadTransport;

@@ -97,13 +97,13 @@ export function sanitizeJobId(jobId: string): string {
 
 /**
  * The pipeline root, relative to the checkout (forward slashes). A bare NAME
- * resolves under the `.claude/pipeline/` convention dir; anything with a path
+ * resolves under the `.pipelines/` convention dir; anything with a path
  * separator is taken as a repo-relative path verbatim.
  */
 export function pipelineRootRel(pipeline: string): string {
   const normalized = pipeline.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   if (normalized.includes('..')) throw new JobError(`pipeline path must not traverse upward: ${pipeline}`);
-  return normalized.includes('/') ? normalized : `.claude/pipeline/${normalized}`;
+  return normalized.includes('/') ? normalized : `.pipelines/${normalized}`;
 }
 
 /**

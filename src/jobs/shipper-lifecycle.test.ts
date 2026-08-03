@@ -38,9 +38,9 @@ function makeContext(overrides: Partial<JobWorkspaceContext> = {}): JobWorkspace
 }
 
 describe('journalPathFor', () => {
-  test('pins <checkout>/.claude/pipeline/.runtime/events.jsonl (06.1)', () => {
+  test('pins <checkout>/.pipelines/.runtime/events.jsonl (06.1)', () => {
     expect(journalPathFor({ dir: 'C:/w/job-1' }).replace(/\\/g, '/')).toBe(
-      'C:/w/job-1/.claude/pipeline/.runtime/events.jsonl'
+      'C:/w/job-1/.pipelines/.runtime/events.jsonl'
     );
   });
 });
@@ -56,7 +56,7 @@ describe('createShipperLifecycle — onWorkspaceReady / onJobFinished (fake tran
 
     // Seed the `.stats` record the terminal event should fold in through the
     // REAL default `DiskStatsSource` (not stubbed) — proves the production
-    // wiring's conventional layout: <checkout>/.claude/pipeline/.stats/**/runs.jsonl.
+    // wiring's conventional layout: <checkout>/.pipelines/.stats/**/runs.jsonl.
     const statsDir = statsDirForJournal(journalPath);
     // Wire-faithful: the shipper validates every record against
     // `RunRecordStatsSchema` BEFORE spooling, so a stub missing required
