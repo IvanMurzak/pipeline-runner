@@ -12,7 +12,7 @@ import type { StatsSource } from '../src/shipper/stats';
 import { CaptureLogger, FakeClock } from './_helpers';
 import { FakeUploadTransport, journalLine, MemShipperFs, settle, validRunRecord } from './_shipper-helpers';
 
-const JOURNAL = 'C:/proj/.pipelines/.runtime/events.jsonl';
+const JOURNAL = 'C:/proj/.pipeline/.runtime/events.jsonl';
 const STATE = 'C:/state/agent/shipper/j1';
 
 interface Rig {

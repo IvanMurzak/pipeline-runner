@@ -12,7 +12,7 @@ import {
 } from './matcher';
 
 const CHECKOUT = join('/w', 'job-1');
-const PIPELINES_DIR = join(CHECKOUT, '.claude', 'pipeline');
+const PIPELINES_DIR = join(CHECKOUT, '.pipeline');
 
 function respondWith(result: JobExecResult): FakeJobExec {
   return new FakeJobExec(() => result);
@@ -49,12 +49,12 @@ describe('dispatch — match argv', () => {
 describe('dispatch — pipelinePathFromManifest', () => {
   test('a conventional pipeline resolves to its checkout-relative root', () => {
     const manifest = join(PIPELINES_DIR, 'release', 'PIPELINE.md');
-    expect(pipelinePathFromManifest(CHECKOUT, manifest)).toBe('.pipelines/release');
+    expect(pipelinePathFromManifest(CHECKOUT, manifest)).toBe('.pipeline/release');
   });
 
   test('a NESTED pipeline keeps its full path (bare name would mis-resolve)', () => {
     const manifest = join(PIPELINES_DIR, 'workflows', 'implement-task', 'PIPELINE.md');
-    expect(pipelinePathFromManifest(CHECKOUT, manifest)).toBe('.pipelines/workflows/implement-task');
+    expect(pipelinePathFromManifest(CHECKOUT, manifest)).toBe('.pipeline/workflows/implement-task');
   });
 
   test('a manifest outside the checkout is refused', () => {
@@ -72,7 +72,7 @@ describe('dispatch — cliTaskPipelineResolver', () => {
     const resolution = await resolve({ checkoutDir: CHECKOUT, task: makeTask() });
 
     expect(resolution).toEqual({
-      pipeline: '.pipelines/release',
+      pipeline: '.pipeline/release',
       manifest: join(PIPELINES_DIR, 'release', 'PIPELINE.md'),
       score: 4.2,
     });
@@ -82,7 +82,7 @@ describe('dispatch — cliTaskPipelineResolver', () => {
       buildMatchArgs(PIPELINES_DIR, 'Ship the release\nCut a release for the api service\nrelease')
     );
     expect(exec.calls[0]!.opts.cwd).toBe(CHECKOUT);
-    expect(logger.joined()).toContain("dispatch matched pipeline '.pipelines/release'");
+    expect(logger.joined()).toContain("dispatch matched pipeline '.pipeline/release'");
   });
 
   test('takes candidates[0] — the CLI already ranked deterministically', async () => {
@@ -94,7 +94,7 @@ describe('dispatch — cliTaskPipelineResolver', () => {
     );
     const resolve = cliTaskPipelineResolver({ exec });
     const resolution = await resolve({ checkoutDir: CHECKOUT, task: makeTask() });
-    expect(resolution.pipeline).toBe('.pipelines/release');
+    expect(resolution.pipeline).toBe('.pipeline/release');
   });
 
   test('a custom pipeline binary and pipelines dir are honored', async () => {

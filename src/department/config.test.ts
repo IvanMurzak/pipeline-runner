@@ -131,7 +131,7 @@ describe('parseDepartmentRuntimesEnv', () => {
             adapterId: 'pipeline-drive',
             command: 'pipeline',
             pipelineDrive: {
-              pipelineRoot: '/ws/.pipelines/release',
+              pipelineRoot: '/ws/.pipeline/release',
               startIteration: 'steps/01-plan.md',
               defaultModel: 'opus',
               defaultEffort: 'high',
@@ -142,7 +142,7 @@ describe('parseDepartmentRuntimesEnv', () => {
       );
       expect(map.get('release')?.adapterId).toBe('pipeline-drive');
       expect(map.get('release')?.pipelineDrive).toEqual({
-        pipelineRoot: '/ws/.pipelines/release',
+        pipelineRoot: '/ws/.pipeline/release',
         startIteration: 'steps/01-plan.md',
         defaultModel: 'opus',
         defaultEffort: 'high',

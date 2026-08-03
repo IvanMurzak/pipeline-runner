@@ -3,7 +3,7 @@
  * `08-cloud-sync.md` D13 + D18; supersedes the T1-12 minimal seam).
  *
  * The engine writes per-run measurement records to
- * `<project>/.pipelines/.stats/<pipeline-rel>/runs.jsonl` (one JSON
+ * `<project>/.pipeline/.stats/<pipeline-rel>/runs.jsonl` (one JSON
  * line per finished run — the `RunRecord` of the OSS
  * `apps/pipeline-cli/src/lib/stats.ts`) plus a human `.log` per run. The
  * SubagentStop stats relay hook may REWRITE a run's line later, enriching
@@ -220,8 +220,8 @@ function parseRecordLines(text: string): Array<Record<string, unknown>> {
   return records;
 }
 
-/** Derive `<project>/.pipelines/.stats` from the journal path
- *  (`<project>/.pipelines/.runtime/events.jsonl`). */
+/** Derive `<project>/.pipeline/.stats` from the journal path
+ *  (`<project>/.pipeline/.runtime/events.jsonl`). */
 export function statsDirForJournal(journalPath: string): string {
   // dirname(journalPath) = .../.runtime → sibling `.stats`.
   const runtimeDir = journalPath.replace(/[\\/][^\\/]*$/, '');

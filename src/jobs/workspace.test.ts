@@ -14,7 +14,7 @@ import {
 const ROOT = join('/tmp', 'jobs');
 
 /** A fs pre-seeded so the standard fixture lease prepares successfully. */
-function readyFs(dir: string, pipelineRel = '.pipelines/release'): FakeJobFs {
+function readyFs(dir: string, pipelineRel = '.pipeline/release'): FakeJobFs {
   const fs = new FakeJobFs();
   const pipelineRoot = join(dir, ...pipelineRel.split('/'));
   fs.existing.add(pipelineRoot);
@@ -52,8 +52,8 @@ describe('sanitizeJobId', () => {
 });
 
 describe('pipelineRootRel', () => {
-  test('a bare name resolves under .pipelines/', () => {
-    expect(pipelineRootRel('release')).toBe('.pipelines/release');
+  test('a bare name resolves under .pipeline/', () => {
+    expect(pipelineRootRel('release')).toBe('.pipeline/release');
   });
 
   test('a path is taken verbatim (normalized)', () => {
@@ -94,7 +94,7 @@ describe('prepareWorkspace', () => {
     ]);
     expect(exec.calls.every((c) => c.cmd === 'git')).toBe(true);
     expect(ws.dir).toBe(dir);
-    expect(ws.pipelineRoot).toBe(join(dir, '.claude', 'pipeline', 'release'));
+    expect(ws.pipelineRoot).toBe(join(dir, '.pipeline', 'release'));
     expect(ws.startIteration).toBe('steps/01-plan.md');
   });
 
@@ -158,7 +158,7 @@ describe('prepareWorkspace', () => {
         },
       })
     );
-    expect(seen).toEqual([[join(dir, '.claude', 'pipeline', 'release'), 'sha-abc']]);
+    expect(seen).toEqual([[join(dir, '.pipeline', 'release'), 'sha-abc']]);
   });
 
   test('an unpinned lease (content_hash null) skips verification silently', async () => {
@@ -185,7 +185,7 @@ describe('prepareWorkspace', () => {
 // override), unlike the direct-injection tests above.
 describe('prepareWorkspace — default content-hash verifier (cliContentHashVerifier)', () => {
   const dir = join(ROOT, 'job-1');
-  const pipelineRoot = join(dir, '.claude', 'pipeline', 'release');
+  const pipelineRoot = join(dir, '.pipeline', 'release');
 
   test('a match passes, shelling the same pipelineBin drive uses', async () => {
     const exec = new FakeJobExec((_cmd, args) =>
@@ -237,7 +237,7 @@ describe('prepareWorkspace — default content-hash verifier (cliContentHashVeri
 // instead of the flat lexical rule.
 describe('prepareWorkspace — default start-iteration resolver (cliStartIterationResolver)', () => {
   const dir = join(ROOT, 'job-1');
-  const pipelineRoot = join(dir, '.claude', 'pipeline', 'release');
+  const pipelineRoot = join(dir, '.pipeline', 'release');
 
   /** A pipeline whose top-level `steps/*.md` is a DECOY: the real entry (as
    *  a graph/target-family pipeline might organize its routing steps) lives

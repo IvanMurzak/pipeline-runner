@@ -29,7 +29,7 @@ import { defaultResolveStartIteration } from './workspace';
 
 const ROOT = join('/w');
 const DIR = join(ROOT, 'job-1');
-const PIPELINE_ROOT = join(DIR, '.claude', 'pipeline', 'release');
+const PIPELINE_ROOT = join(DIR, '.pipeline', 'release');
 
 /** An fs pre-seeded so the fixture lease's workspace prep succeeds. */
 function readyFs(): FakeJobFs {
@@ -653,7 +653,7 @@ describe('JobExecutor — c6 resume mode', () => {
       job_id: 'job-1',
       run_id: 'run-1',
       checkout_dir: RECORD_DIR,
-      pipeline_root: join(RECORD_DIR, '.claude', 'pipeline', 'release'),
+      pipeline_root: join(RECORD_DIR, '.pipeline', 'release'),
       start_iteration: 'steps/01-plan.md',
       ...overrides,
     });

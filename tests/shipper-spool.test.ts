@@ -10,7 +10,7 @@ import { EventShipper } from '../src/shipper/shipper';
 import { CaptureLogger, FakeClock } from './_helpers';
 import { FakeUploadTransport, journalLine, MemShipperFs, settle } from './_shipper-helpers';
 
-const JOURNAL = 'C:/proj/.pipelines/.runtime/events.jsonl';
+const JOURNAL = 'C:/proj/.pipeline/.runtime/events.jsonl';
 const STATE = 'C:/state/agent/shipper/j1';
 const SPOOL_DIR = `${STATE}/spool`;
 

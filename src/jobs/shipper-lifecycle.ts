@@ -60,13 +60,13 @@ export interface ShipperLifecycleOptions {
    *  `shipperStateDir`, a hash of the journal path under the agent data dir). */
   stateDirFor?(journalPath: string): string;
   /** Override `.stats` record lookup (tests only; default: `DiskStatsSource`
-   *  over the checkout's `.pipelines/.stats` dir). */
+   *  over the checkout's `.pipeline/.stats` dir). */
   statsSourceFor?(context: JobWorkspaceContext): StatsSource;
 }
 
-/** Derive the journal path the design pins: `<checkout>/.pipelines/.runtime/events.jsonl`. */
+/** Derive the journal path the design pins: `<checkout>/.pipeline/.runtime/events.jsonl`. */
 export function journalPathFor(context: Pick<JobWorkspaceContext, 'dir'>): string {
-  return join(context.dir, '.claude', 'pipeline', '.runtime', 'events.jsonl');
+  return join(context.dir, '.pipeline', '.runtime', 'events.jsonl');
 }
 
 /** The lifecycle events PLUS the graceful-shutdown drain (c6). */

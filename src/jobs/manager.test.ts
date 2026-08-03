@@ -27,7 +27,7 @@ const ROOT = join('/w');
 
 /** Seed the fs so a given job id's fixture workspace prepares successfully. */
 function seedJob(fs: FakeJobFs, jobId: string): void {
-  const pipelineRoot = join(ROOT, jobId, '.claude', 'pipeline', 'release');
+  const pipelineRoot = join(ROOT, jobId, '.pipeline', 'release');
   fs.existing.add(pipelineRoot);
   fs.listings.set(join(pipelineRoot, 'steps'), ['01-plan.md']);
 }
@@ -298,7 +298,7 @@ const OLD_CHECKOUT = join(ROOT, 'job-old');
 function storedRecord(overrides: Partial<JobRecord> = {}): JobRecord {
   return makeRecord({
     checkout_dir: OLD_CHECKOUT,
-    pipeline_root: join(OLD_CHECKOUT, '.claude', 'pipeline', 'release'),
+    pipeline_root: join(OLD_CHECKOUT, '.pipeline', 'release'),
     accepted_at: new Date(0).toISOString(),
     updated_at: new Date(0).toISOString(),
     ...overrides,

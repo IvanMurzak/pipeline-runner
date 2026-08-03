@@ -56,7 +56,7 @@ class RealFsScriptedExec implements JobExec {
     if (cmd === 'git') {
       if (args.includes('checkout')) {
         const dir = args[1]!; // ['-C', <dir>, 'checkout', ...]
-        const pipelineRoot = join(dir, '.claude', 'pipeline', 'release');
+        const pipelineRoot = join(dir, '.pipeline', 'release');
         mkdirSync(join(pipelineRoot, 'steps'), { recursive: true });
         writeFileSync(join(pipelineRoot, 'steps', '01-plan.md'), '# plan\n');
       }
@@ -159,7 +159,7 @@ describe('c6 integration — crash, restart, adoption, cancel (real fs)', () => 
   test('kill -9 → restart < TTL: FRESH resume with --resume in the same checkout, no wipe', async () => {
     const paths = makeBase();
     const { checkout } = await runAndKill(paths);
-    const marker = join(checkout, '.claude', 'pipeline', 'release', 'steps', '01-plan.md');
+    const marker = join(checkout, '.pipeline', 'release', 'steps', '01-plan.md');
     expect(existsSync(marker)).toBe(true);
 
     // Restart 30s later (< 90s TTL).

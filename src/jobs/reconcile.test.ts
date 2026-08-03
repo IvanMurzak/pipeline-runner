@@ -77,8 +77,8 @@ describe('claude transcript path encoding (step-transcripts rule)', () => {
 
 describe('fsSubstrateProbe — the real-layout probe over the fs seam', () => {
   const HOME = '/home/u';
-  const record = makeRecord(); // checkout /w/job-old, root /w/job-old/.pipelines/release
-  const runtime = join('/w/job-old/.pipelines/release', '.runtime', 'run-1');
+  const record = makeRecord(); // checkout /w/job-old, root /w/job-old/.pipeline/release
+  const runtime = join('/w/job-old/.pipeline/release', '.runtime', 'run-1');
 
   function seededFs(): MemShipperFs {
     const fs = new MemShipperFs();

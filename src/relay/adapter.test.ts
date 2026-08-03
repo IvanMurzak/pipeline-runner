@@ -22,7 +22,7 @@ import { NeedsInputRelay, type RelayClientPort } from './bridge';
 
 const ROOT = join('/w');
 const DIR = join(ROOT, 'job-1');
-const PIPELINE_ROOT = join(DIR, '.claude', 'pipeline', 'release');
+const PIPELINE_ROOT = join(DIR, '.pipeline', 'release');
 
 /** A minimal `RelayClientPort` double: records sent frames, toggles
  *  online/offline, and lets the test push inbound frames through the same

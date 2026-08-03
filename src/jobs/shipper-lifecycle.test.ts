@@ -27,7 +27,7 @@ function uploadBatch(frame: WireFrame): { run_id: string; events: Array<{ seq: n
 function makeContext(overrides: Partial<JobWorkspaceContext> = {}): JobWorkspaceContext {
   return {
     dir: DIR,
-    pipelineRoot: join(DIR, '.claude', 'pipeline', 'release'),
+    pipelineRoot: join(DIR, '.pipeline', 'release'),
     startIteration: 'steps/01-plan.md',
     job_id: 'job-1',
     run_id: 'run-1',
@@ -38,9 +38,9 @@ function makeContext(overrides: Partial<JobWorkspaceContext> = {}): JobWorkspace
 }
 
 describe('journalPathFor', () => {
-  test('pins <checkout>/.pipelines/.runtime/events.jsonl (06.1)', () => {
+  test('pins <checkout>/.pipeline/.runtime/events.jsonl (06.1)', () => {
     expect(journalPathFor({ dir: 'C:/w/job-1' }).replace(/\\/g, '/')).toBe(
-      'C:/w/job-1/.pipelines/.runtime/events.jsonl'
+      'C:/w/job-1/.pipeline/.runtime/events.jsonl'
     );
   });
 });
@@ -56,7 +56,7 @@ describe('createShipperLifecycle — onWorkspaceReady / onJobFinished (fake tran
 
     // Seed the `.stats` record the terminal event should fold in through the
     // REAL default `DiskStatsSource` (not stubbed) — proves the production
-    // wiring's conventional layout: <checkout>/.pipelines/.stats/**/runs.jsonl.
+    // wiring's conventional layout: <checkout>/.pipeline/.stats/**/runs.jsonl.
     const statsDir = statsDirForJournal(journalPath);
     // Wire-faithful: the shipper validates every record against
     // `RunRecordStatsSchema` BEFORE spooling, so a stub missing required

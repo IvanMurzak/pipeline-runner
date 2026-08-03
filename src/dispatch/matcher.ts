@@ -38,7 +38,7 @@ export interface TaskDispatchInput {
 export interface TaskPipelineResolution {
   /** The resolved pipeline identity for the executor to drive: a
    *  checkout-relative path (forward slashes, e.g.
-   *  `.pipelines/release`) that `pipelineRootRel` resolves verbatim. */
+   *  `.pipeline/release`) that `pipelineRootRel` resolves verbatim. */
   pipeline: string;
   /** The winning manifest's path exactly as the matcher reported it. */
   manifest: string;
@@ -56,7 +56,7 @@ export interface TaskPipelineResolution {
 export type TaskPipelineResolver = (input: TaskDispatchInput) => Promise<TaskPipelineResolution>;
 
 /** The conventional pipelines tree the matcher scans, checkout-relative. */
-export const PIPELINES_DIR_REL = '.pipelines';
+export const PIPELINES_DIR_REL = '.pipeline';
 
 /**
  * The BM25 query for a task: `title + "\n" + body` (the protocol contract),
@@ -138,7 +138,7 @@ export interface CliMatcherOptions {
   exec: JobExec;
   /** The `pipeline` CLI binary (defaults to `pipeline`, like drive). */
   pipelineBin?: string;
-  /** Pipelines tree relative to the checkout (default `.pipelines`). */
+  /** Pipelines tree relative to the checkout (default `.pipeline`). */
   pipelinesDirRel?: string;
   logger?: Logger;
 }
@@ -146,7 +146,7 @@ export interface CliMatcherOptions {
 /**
  * The default resolver: shell out to `pipeline match` (deterministic, LLM-free
  * BM25 — see the module header) and take the top candidate. Failure modes:
- *   - no `.pipelines` dir (match exit 1)   → JobError, no-match
+ *   - no `.pipeline` dir (match exit 1)   → JobError, no-match
  *   - zero candidates (empty project / no score) → JobError, no-match
  *   - any other exit / unparseable output        → JobError with the detail
  */
