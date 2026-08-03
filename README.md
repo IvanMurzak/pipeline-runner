@@ -11,7 +11,7 @@ a native OS service (systemd on Linux, launchd on macOS, a Windows Service).
 ## Prerequisite: the `pipeline` CLI must be on PATH
 
 The runner does not execute pipelines itself — it shells out to the
-[`pipeline`](https://github.com/IvanMurzak/ai-pipeline-plugin) CLI (from the
+[`pipeline`](https://github.com/IvanMurzak/pipeline-claude) CLI (from the
 `ai-pipeline` Claude Code plugin) to match and drive runs
 (`pipeline match`, `pipeline drive`). Install the plugin on any machine you
 intend to register as a runner so `pipeline` resolves on PATH before running
