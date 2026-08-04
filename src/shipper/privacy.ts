@@ -34,7 +34,8 @@
  *     parse — and its awaiting-input derivation — still works while zero
  *     authored content leaves the machine.
  *
- * Pipeline-RELATIVE step identity (`iteration_path`, `step_id`, `script_path`,
+ * Pipeline-RELATIVE step identity (`iteration_path`, `step_name` — `step_id`
+ * before schema v5 — `script_path`,
  * pipeline/branch names, tool names) is metadata: it is pipeline STRUCTURE the
  * product's metadata-tier dashboards are built on ("failing step index", per-
  * step statuses) and the ingest derivation correlates open/close on it.
@@ -148,6 +149,9 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     index: 'keep',
     resolved_model: 'keep',
     resolved_effort: 'keep',
+    // v5's step identity plus v4's, so shipping a journal written before the
+    // rename keeps its step tag instead of silently dropping it.
+    step_name: 'keep',
     step_id: 'keep',
     step_type: 'keep',
     resumed: 'keep',
@@ -158,6 +162,7 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     index: 'keep',
     resolved_model: 'keep',
     resolved_effort: 'keep',
+    step_name: 'keep',
     step_id: 'keep',
     resumed: 'keep',
     emission: 'keep',
@@ -170,6 +175,7 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     has_blocker_delegation: 'keep',
     halt_reason: 'summary',
     terminal: 'keep',
+    step_name: 'keep',
     step_id: 'keep',
     step_type: 'keep',
     failure_class: 'keep',
