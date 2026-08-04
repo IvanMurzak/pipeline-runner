@@ -234,3 +234,39 @@ describe('privacy filter — synthetic stats record', () => {
     expect((filtered.data as Record<string, unknown>).outcome).toBe('completed');
   });
 });
+
+describe('privacy filter — v5 step-key rename', () => {
+  // Journal schema v5 renamed the iteration events' step identity from
+  // `step_id` to `step_name`. Both must survive the metadata tier: this
+  // module's own header calls pipeline-RELATIVE step identity metadata, and the
+  // product's per-step dashboards are built on it. Allowlisting only the new
+  // name would silently strip the identity out of every journal written before
+  // the rename — which is most of the ones a runner ships today.
+  test.each(['iteration.started', 'iteration.resumed', 'iteration.completed'])(
+    '%s keeps BOTH step_name (v5) and step_id (v4)',
+    (type) => {
+      const event = journalEvent(type, 'r1', {
+        iteration_path: 'steps/review.md',
+        outcome: 'completed',
+        step_name: 'review',
+        step_id: 'review',
+      });
+      const data = (filterEventForTier(event, 'metadata') as { data: Record<string, unknown> }).data;
+      expect(data.step_name).toBe('review');
+      expect(data.step_id).toBe('review');
+    },
+  );
+
+  test('a sibling field that merely LOOKS like step identity is still dropped', () => {
+    // `keep` is verbatim by design, so the guard is the allowlist itself.
+    const event = journalEvent('iteration.started', 'r1', {
+      iteration_path: 'steps/a.md',
+      step_name: 'a',
+      step_description: SECRETS.prompt,
+    });
+    const data = (filterEventForTier(event, 'metadata') as { data: Record<string, unknown> }).data;
+    expect(data.step_name).toBe('a');
+    expect(data.step_description).toBeUndefined();
+    expect(JSON.stringify(data)).not.toContain(SECRETS.prompt);
+  });
+});
