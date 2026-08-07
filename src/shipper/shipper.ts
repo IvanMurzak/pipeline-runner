@@ -192,11 +192,18 @@ export class EventShipper {
     this.maxTrackedRuns = options.maxTrackedRuns ?? DEFAULT_MAX_TRACKED_RUNS;
     this.backoff = options.backoff ?? DEFAULT_BACKOFF;
     this.rng = options.rng ?? Math.random;
+    this.projectRoot = options.projectRoot ?? '(unknown-project-root)';
     this.filterOptions = {
       fingerprintSalt:
         options.fingerprintSalt ?? (options.env ?? process.env).PIPELINE_PRIVACY_SALT ?? '',
+      // SG4 (`b23`): the root this shipper knows, handed to the filter so a
+      // path can be RELATIVIZED rather than fingerprinted. Every journal
+      // envelope already names its own `project_root` and the filter reads it
+      // from there; this is the backstop for an emitter that omits it (and it
+      // is inert when it is not an absolute path, which is what the
+      // `(unknown-project-root)` default is).
+      pathRoots: [this.projectRoot],
     };
-    this.projectRoot = options.projectRoot ?? '(unknown-project-root)';
 
     const resolved = resolvePrivacyTier(options.privacyTier, options.env ?? process.env);
     this.tier = resolved.tier;
