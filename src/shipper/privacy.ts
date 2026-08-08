@@ -82,6 +82,62 @@
  * land HERE (`b23`). That composition is deleted: there is one rule, and this
  * is it.
  *
+ * ── THE STEP-IDENTITY RULE (ux-v2 `b24`) ────────────────────────────────────
+ *
+ * EVERY ALLOWLIST THAT DESCRIBES A STEP MUST CARRY THAT STEP'S IDENTITY.
+ *
+ * Design `02` D15 dissolves the duplicate-row problem by giving a step ONE
+ * identity: since `b4` the CLI mints a UUIDv7 at step start and carries the
+ * SAME value on that step's `iteration.*` events AND on its `runs.jsonl`
+ * StepStat, so the control plane's two reporters name one row instead of two.
+ *
+ * The filter defeated it. `step_uuid` appeared in NO allowlist — `grep -c
+ * step_uuid` over this file returned 0 — so deny-by-default stripped it off
+ * both paths. The server fell back to deriving an identity per path, over two
+ * different keys (`step:<index>` from the event stream, `stats:<name>` from the
+ * fold), and wrote a row for each: production held FOUR `step_executions` rows
+ * for TWO steps, on both of `i1`'s runs. The client minted the right answer and
+ * this file threw it away.
+ *
+ * The fix is the RULE, not the two entries `i1` happened to observe.
+ *
+ * IT IS ENFORCED BY A SWEEP, NOT BY A CONSTRUCTOR, and that is deliberate.
+ * `step_uuid: 'keep'` is written out LITERALLY in every step-shaped allowlist
+ * below — no helper injects it — because these tables are pinned field-for-
+ * field by a structural test that parses this source and REFUSES any member
+ * that is not a literal key/value pair (`pipeline-protocol`'s
+ * `privacy.test.ts`, "structural pin"). That refusal is a trust-boundary
+ * control, not a style rule: a constructor that folds fields in at runtime
+ * would mean the source no longer says what ships, and the pin exists exactly
+ * so that reading this file is enough to know. Saving twelve literal lines is
+ * not worth giving that up.
+ *
+ * So the guard is {@link stepShapedAllowlistViolations}: it scans the LIVE
+ * tables and names any step-shaped allowlist lacking identity, so a FUTURE
+ * step-shaped entry cannot land without it. A conformance test asserts the
+ * sweep is empty, in every repo that carries a copy of this filter.
+ *
+ * An allowlist is step-shaped when EITHER holds: it lists one of
+ * {@link STEP_SHAPED_MARKER_FIELDS}, or its event type is in
+ * {@link STEP_SCOPED_EVENT_TYPES} — the types whose emitter stamps `step_uuid`.
+ * The second clause exists because the first cannot see the four
+ * `improver.*`/`script_creator.*` types or the three `b7` attribution types:
+ * they carry a step's identity while listing no other `step_*` field at all, so
+ * a marker-only sweep would have declared them clean.
+ *
+ * WHY `step_uuid` IS SAFE AT THE `metadata` TIER (the `keep` rule). It is a
+ * locally-minted UUIDv7: 48 bits of millisecond timestamp plus random bits
+ * (RFC 9562 §5.7). It is not derived from and cannot be inverted to a path, an
+ * account name, a hostname, a project name, or any authored content — the
+ * generator takes no input from the environment beyond the clock. It is
+ * strictly LESS disclosing than fields this tier already keeps verbatim
+ * (`step_name`, `iteration_path`, `pipeline_name`), and it is the same KIND of
+ * value as `run_id`/`session_id`/`tool_use_id`, which are `keep` for the same
+ * reason: an opaque correlator the product's own dashboards are built on. It is
+ * therefore `keep`, not `fingerprint` — fingerprinting an already-opaque
+ * identifier would buy no privacy and would break the row identity, since the
+ * two reporters' values must remain byte-equal to name one row.
+ *
  * Unknown journal lines that are not JSON objects cannot be classified and are
  * never shipped at any tier (the G2 run_id rule already excludes them).
  */
@@ -426,6 +482,95 @@ export function scrubPayloadPaths<T>(payload: T, options: PathScrubOptions = {})
 
 type FieldRule = 'keep' | 'fingerprint' | 'summary' | 'question' | 'message_parts';
 
+// ── The step-identity rule (ux-v2 `b24`) — see this file's header ────────────
+
+/** The step's ROW IDENTITY on the wire (`02` D15): the UUIDv7 the CLI mints at
+ *  step start (`b4`) and carries unchanged on that step's events and on its
+ *  `runs.jsonl` StepStat. `keep`, for the reasons in the header. */
+export const STEP_IDENTITY_FIELD = 'step_uuid';
+
+/** Listing any of these makes an allowlist STEP-SHAPED: it is describing a
+ *  step, so it must also carry the step's identity. */
+export const STEP_SHAPED_MARKER_FIELDS = [
+  'step_uuid',
+  'step_name',
+  'step_id',
+  'step_type',
+  'step_index',
+] as const;
+
+/**
+ * Event types whose EMITTER stamps `step_uuid`, so their allowlist must keep
+ * it. Exhaustive as of `b24`, with the emission site for each — this list is
+ * the half of the sweep that marker-matching cannot see, because most of these
+ * carry a step's identity while listing no other `step_*` field.
+ *
+ *   iteration.started        CLI `commands/next.ts` (dispatch argv)
+ *   iteration.resumed        no emitter today; symmetric with the two around
+ *                            it and allowlisted for the v4/v5 journals that do
+ *   iteration.completed      CLI `commands/next.ts` (sequential + layer folds)
+ *   improver.started         CLI `commands/next.ts`, `commands/drive.ts`
+ *   improver.completed       CLI `commands/next.ts`, `commands/drive.ts`
+ *   script_creator.started   CLI `commands/next.ts`, `commands/drive.ts`
+ *   script_creator.completed CLI `commands/next.ts`, `commands/drive.ts`
+ *   tool.called              plugin `hooks/analytics-relay.ts` (`b7`)
+ *   turn.usage               plugin `hooks/analytics-relay.ts` (`b7`)
+ *   manager.stopped          plugin `hooks/analytics-relay.ts` (`b7`)
+ *
+ * `awaiting_input` is step-shaped too, but by MARKER rather than by this list:
+ * its emitter (`commands/drive.ts`) sends `step_name`, which this filter was
+ * also dropping. `run.awaiting_input` — the relay's hook-emitted sibling — has
+ * no allowlist entry at all and so ships `data: {}`; that is deny-by-default
+ * working as designed, and giving it one is a new-surface decision rather than
+ * an identity restoration, so `b24` reports it instead of changing it.
+ */
+export const STEP_SCOPED_EVENT_TYPES = [
+  'iteration.started',
+  'iteration.resumed',
+  'iteration.completed',
+  'improver.started',
+  'improver.completed',
+  'script_creator.started',
+  'script_creator.completed',
+  'tool.called',
+  'turn.usage',
+  'manager.stopped',
+] as const;
+
+function isStepShaped(type: string, allowlist: Record<string, FieldRule>): boolean {
+  if ((STEP_SCOPED_EVENT_TYPES as readonly string[]).includes(type)) return true;
+  return STEP_SHAPED_MARKER_FIELDS.some((marker) => marker in allowlist);
+}
+
+/**
+ * THE SWEEP. Every step-shaped allowlist that does not carry step identity,
+ * named. Empty is the invariant, and a conformance test asserts it — so a new
+ * step-shaped allowlist that forgets `step_uuid: 'keep'` fails CI instead of
+ * silently stripping the field all the way to production, which is what
+ * happened here.
+ *
+ * Deliberately computed over the LIVE tables rather than a hand-kept list: a
+ * hand-kept list is the thing that was wrong in the first place. (And not a
+ * constructor that folds the field in — see the header: these tables are
+ * pinned field-for-field by a structural test that refuses non-literal
+ * members, on purpose.)
+ */
+export function stepShapedAllowlistViolations(): string[] {
+  const missing: string[] = [];
+  for (const [type, allowlist] of Object.entries(DATA_ALLOWLISTS)) {
+    if (isStepShaped(type, allowlist) && allowlist[STEP_IDENTITY_FIELD] !== 'keep') {
+      missing.push(`DATA_ALLOWLISTS['${type}']`);
+    }
+  }
+  // The stats fold's per-step allowlist is step-shaped by definition — it IS a
+  // step record — and reaches the same `step_executions` row from the other
+  // reporting path, which is precisely where the duplication came from.
+  if (STATS_STEP_ALLOWLIST[STEP_IDENTITY_FIELD] !== 'keep') {
+    missing.push('STATS_STEP_ALLOWLIST');
+  }
+  return missing;
+}
+
 /** Envelope fields kept at the metadata tier. Anything else on the envelope
  *  (a newer peer's passthrough addition) is dropped. */
 const ENVELOPE_ALLOWLIST: Record<string, FieldRule> = {
@@ -478,6 +623,7 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     step_type: 'keep',
     resumed: 'keep',
     emission: 'keep',
+    step_uuid: 'keep',
   },
   'iteration.resumed': {
     iteration_path: 'keep',
@@ -488,6 +634,7 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     step_id: 'keep',
     resumed: 'keep',
     emission: 'keep',
+    step_uuid: 'keep',
   },
   'iteration.completed': {
     iteration_path: 'keep',
@@ -501,11 +648,27 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
     step_id: 'keep',
     step_type: 'keep',
     failure_class: 'keep',
+    step_uuid: 'keep',
   },
-  'improver.started': { iteration_path: 'keep' },
-  'improver.completed': { iteration_path: 'keep', applied: 'keep', has_script_brief: 'keep' },
-  'script_creator.started': { iteration_path: 'keep' },
-  'script_creator.completed': { iteration_path: 'keep', script_path: 'keep', outcome: 'keep' },
+  // The improver/script-creator pairs are step-shaped by EMITTER, not by
+  // marker: each runs as its own `step_executions` row (`04` §2 rule 1 lists
+  // `improver:<p>` / `script_creator:<p>` among the v7, CLI-minted classes), so
+  // each carries a `step_uuid` while listing no other `step_*` field. A
+  // marker-only sweep would have called all four clean.
+  'improver.started': { iteration_path: 'keep', step_uuid: 'keep' },
+  'improver.completed': {
+    iteration_path: 'keep',
+    applied: 'keep',
+    has_script_brief: 'keep',
+    step_uuid: 'keep',
+  },
+  'script_creator.started': { iteration_path: 'keep', step_uuid: 'keep' },
+  'script_creator.completed': {
+    iteration_path: 'keep',
+    script_path: 'keep',
+    outcome: 'keep',
+    step_uuid: 'keep',
+  },
   'blocker.delegated': {
     parent_iteration_path: 'keep',
     blocker_issue_url: 'keep',
@@ -516,7 +679,7 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
   'blocker.resolved': { blocker_issue_url: 'keep', merged_pr_url: 'keep' },
   'pipeline.completed': { pipeline_name: 'keep' },
   'pipeline.halted': { pipeline_name: 'keep', iteration_path: 'keep', halt_reason: 'summary' },
-  'manager.stopped': { run_id: 'keep', agent_id: 'keep' },
+  'manager.stopped': { run_id: 'keep', agent_id: 'keep', step_uuid: 'keep' },
   'worktree.created': {
     worktree_path: 'fingerprint',
     branch: 'keep',
@@ -528,13 +691,25 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
   },
   'worktree.finalized': { worktree_path: 'fingerprint', ok: 'keep', outcome: 'keep' },
   'worktree.destroyed': { worktree_path: 'fingerprint', ok: 'keep', outcome: 'keep' },
-  'tool.called': { tool_name: 'keep', success: 'keep', agent_spawn: 'keep', tool_use_id: 'keep' },
+  // `b7` attribution: these say WHICH STEP did the work — the relay resolves
+  // the step uuid off the session binding and stamps it so the control plane
+  // does not have to guess which execution a tool call or a token tally
+  // belongs to. Stripping it here threw the attribution away and left the
+  // server to fall back on `usageTarget`'s ambient `manager` bucket.
+  'tool.called': {
+    tool_name: 'keep',
+    success: 'keep',
+    agent_spawn: 'keep',
+    tool_use_id: 'keep',
+    step_uuid: 'keep',
+  },
   'turn.usage': {
     assistant_turns: 'keep',
     input_tokens: 'keep',
     output_tokens: 'keep',
     cache_read_tokens: 'keep',
     cache_creation_tokens: 'keep',
+    step_uuid: 'keep',
   },
   'run.started': {
     pipeline_name: 'keep',
@@ -545,7 +720,23 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
   },
   'run.completed': { pipeline_name: 'keep', outcome: 'keep' },
   'run.halted': { pipeline_name: 'keep', iteration_path: 'keep', halt_reason: 'summary' },
-  awaiting_input: { run_id: 'keep', iteration: 'keep', question_id: 'keep', question: 'question' },
+  // The park event names the step it parked ON. Its emitter (`commands/drive.ts`)
+  // sends `step_name` and `iteration_path` as fields ADDITIVE to
+  // `AwaitingInputData` — which is exactly why they were missing here: this
+  // table was built from the protocol schema field-for-field, so identity the
+  // emitter added beyond the schema was dropped by default. Both are step
+  // identity by this file's own header, both are already `keep` on the three
+  // `iteration.*` types, and both go through the SG4 value scrub like every
+  // other leaf. `question` stays CONTENT (placeholdered), unchanged.
+  awaiting_input: {
+    run_id: 'keep',
+    iteration: 'keep',
+    question_id: 'keep',
+    question: 'question',
+    step_name: 'keep',
+    iteration_path: 'keep',
+    step_uuid: 'keep',
+  },
   // Synthetic stats record (shipper-emitted, see ./stats.ts) — its own nested
   // filter runs first; the entry here lets the envelope-level walk pass the
   // already-filtered record through.
@@ -603,6 +794,11 @@ const STATS_FAILURE_ALLOWLIST: Record<string, FieldRule> = {
   step: 'keep',
 };
 
+/** A StepStat IS a step record, so it is step-shaped by definition — and it is
+ *  the OTHER reporter of the same `step_executions` row. This is the entry
+ *  whose omission produced the `stats:<name>` duplicate: without `step_uuid`
+ *  the server had nothing to address the event stream's row with, so the fold
+ *  opened a second one. */
 const STATS_STEP_ALLOWLIST: Record<string, FieldRule> = {
   id: 'keep',
   started_at: 'keep',
@@ -612,6 +808,7 @@ const STATS_STEP_ALLOWLIST: Record<string, FieldRule> = {
   effort: 'keep',
   step_type: 'keep',
   failure_class: 'keep',
+  step_uuid: 'keep',
 };
 
 const STATS_TOKENS_ALLOWLIST: Record<string, FieldRule> = {
