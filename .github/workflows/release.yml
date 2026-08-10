@@ -43,7 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need tags + history to check for an existing tag
 
@@ -54,7 +54,7 @@ jobs:
       # npm Trusted Publishing requires Node >= 22.14.0 and npm >= 11.5.1. Pin
       # both rather than trusting the runner image; setup-node's bundled npm
       # can still be older than that at this Node version.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.14.0"
           registry-url: "https://registry.npmjs.org"
@@ -141,13 +141,13 @@ jobs:
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.11"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22.14.0"
           registry-url: "https://registry.npmjs.org"
