@@ -11,6 +11,11 @@ plus the Agent SDK executor — is the only mode that can run (E3).
 This page records what the runner enforces today, **and the two preconditions
 it does not enforce**, so neither is later mistaken for a guarantee.
 
+**Status as of 2026-08-12: both preconditions below are WAIVED, not met.** The
+owner reviewed them and cleared hosted `standalone` to ship with the exposure
+unchanged — see §5 for the decision. The findings in §2 and §3 remain accurate
+and are unchanged by that decision.
+
 ---
 
 ## 1. What the runner enforces
@@ -89,7 +94,7 @@ c1 does not register from.
 
 ---
 
-## 2. ⚠ Precondition NOT met: `settingSources: ["project"]` cannot be pinned
+## 2. ⚠ Precondition NOT met — WAIVED 2026-08-12, see §5: `settingSources: ["project"]` cannot be pinned
 
 **E9 asks for `settingSources: ["project"]` on hosted runs. This repository
 cannot set it, and does not pretend to.**
@@ -128,7 +133,7 @@ there and a one-line change here.
 
 ---
 
-## 3. ⚠ Precondition NOT met: there is no per-run *sandbox*
+## 3. ⚠ Precondition NOT met — WAIVED 2026-08-12, see §5: there is no per-run *sandbox*
 
 The task spec is explicit that project scope executes repository content —
 `.claude/settings.json` can define hooks, and hooks are shell commands — and
@@ -205,11 +210,49 @@ this task's overlay is applied at.
 anywhere a previous tenant wrote, and the runner's own token is no longer
 reachable by tilde expansion from inside a run — but jobs still execute on the
 host as the runner's OS user, and any absolute path that user can read is still
-readable. The sandbox is still owed.
+readable. The sandbox is still owed — as of 2026-08-12 the owner has waived it
+as a shipping precondition rather than closing it; see §5.
 
 ---
 
-## 5. Wiring a hosted runner
+## 5. 2026-08-12 — Owner decision: both preconditions waived, hosted `standalone` cleared to ship
+
+**On 2026-08-12 the owner waived both preconditions above (§2 and §3) and
+lifted the release block on hosted `standalone`.** This section records the
+decision. It does not change, supersede, or soften anything found in §2 or §3
+— both remain accurate descriptions of the runner as it exists today.
+
+- **The per-run container sandbox described in §3 is not going to be built.**
+  The owner's first call was to build it before shipping further, then
+  reversed that call the same day, judging it disproportionate to the value of
+  hosted `standalone`. There is no scheduled work closing §3.
+- **Hosted `standalone` is cleared to ship with the exposure in §3 exactly as
+  measured.** A customer repository's `.claude/settings.json` hooks can still
+  execute, as shell commands, on the host as the runner's own OS user — see
+  "What is NOT true" in §3, which this decision leaves unchanged.
+- **§2 and §3 are WAIVED, not met.** This decision adds no flag, no container,
+  and no sandbox. A future reader must not infer, from the fact that hosted
+  `standalone` ships, that either precondition was ever closed.
+- This risk was raised before the decision was made; the owner reaffirmed the
+  waiver after hearing it. It is recorded here as an accepted risk, not an
+  oversight.
+
+**What limits the exposure, without closing it:** `f4`'s fresh per-run `$HOME`
+(§4) means `~` no longer resolves anywhere a previous tenant wrote, and the
+runner's own token is not reachable by tilde expansion from inside a run; the
+per-job workspace is also disposable and torn down at a terminal outcome (§3,
+"What IS true"). **Neither is a sandbox.** Any absolute path the runner's OS
+user can read — including the token at `~/.config/pipeline-runner/config.json`
+reached by its literal absolute path rather than by `~` — is still readable
+from inside a hosted job.
+
+The per-run container sandbox described in §3
+(`src/department/container.ts`, currently reachable only from department
+runs) remains the right long-term fix. It is simply not being built now.
+
+---
+
+## 6. Wiring a hosted runner
 
 `JobExecutorOptions.hostedStandalone` — its **presence** makes a runner hosted.
 Absent, behaviour is byte-identical to before this task.
