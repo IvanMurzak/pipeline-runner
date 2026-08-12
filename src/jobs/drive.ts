@@ -62,6 +62,21 @@ export interface DriveTarget {
    *  effort`). Emitted as `--default-effort` → computePlan's `defaultEffort`.
    *  Absent/blank ⇒ no flag. */
   defaultEffort?: string;
+  /** f1 — `--executor <kind>` (01-modes.md E8/E15): WHICH implementation runs
+   *  one step. A hosted run pins `claude-sdk` (`standalone`), the only mode
+   *  that can execute on our hardware (E3) — there is no user's Claude Code
+   *  installation and no user's subscription there.
+   *
+   *  Rides EVERY invocation (start / resume / answer), like defaultModel and
+   *  defaultEffort above and unlike `variables`: the executor is a property of
+   *  the RUN, and a resume that silently dropped back to the CLI default
+   *  (`claude-cli`) would be exactly the split-brain failure c4's seams exist
+   *  to prevent — a mode whose whole premise is "no `claude` binary here"
+   *  quietly requiring one, on a machine that does not have it.
+   *
+   *  Absent/blank ⇒ no flag, so a non-hosted run's argv is byte-identical to
+   *  before this field existed. */
+  executor?: string;
   /** env-variables design (task b1/d1) — the lease's frozen `PP_*` map
    *  (`lease.variables`). Mapped to one `--var NAME=value` flag per entry —
    *  but, unlike `defaultModel`/`defaultEffort` above, ONLY on the START
@@ -83,6 +98,10 @@ export function buildDriveArgs(target: DriveTarget, mode: DriveMode): string[] {
   if (defaultModel) args.push('--default-model', defaultModel);
   const defaultEffort = target.defaultEffort?.trim();
   if (defaultEffort) args.push('--default-effort', defaultEffort);
+  // f1: same run-level treatment — emitted on start, resume AND answer so a
+  // hosted `standalone` run cannot decay into `claude-cli` on re-entry.
+  const executor = target.executor?.trim();
+  if (executor) args.push('--executor', executor);
   switch (mode.kind) {
     case 'start':
       args.push('--start', mode.startIteration);

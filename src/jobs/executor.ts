@@ -82,6 +82,15 @@ import {
   type ProviderLimitDetector,
 } from './drive';
 import type { JobRecord, RecordedQuestion } from './job-store';
+// f1: hosted `standalone` selection + the org provider key.
+import {
+  describeHostedProviderKey,
+  hostedDriveEnv,
+  HOSTED_EXECUTOR,
+  redactingLogger,
+  resolveHostedCredential,
+  type HostedStandaloneOptions,
+} from './standalone';
 import {
   cliContentHashVerifier,
   prepareWorkspace,
@@ -213,6 +222,15 @@ export interface JobExecutorOptions {
   pipelineBin?: string;
   /** EXTRA env for drive invocations (secret injection is a follow-up). */
   env?: Record<string, string | undefined>;
+  /** f1 — HOSTED `standalone` mode. Its PRESENCE makes this a hosted runner:
+   *  drive is pinned to `--executor=claude-sdk` (E3 — the only mode that can
+   *  run on our hardware) and the provider key comes from the ORG's credential
+   *  through `jobs/standalone.ts`, never from anything on this machine.
+   *
+   *  ABSENT ⇒ every existing behaviour is untouched: no flag, no env overlay,
+   *  no credential resolution, byte-identical argv. A local runner is exactly
+   *  what it was. */
+  hostedStandalone?: HostedStandaloneOptions;
   needsInput?: NeedsInputRelay;
   detectProviderLimit?: ProviderLimitDetector;
   /** Pause length before resume attempt N (0-based) for a detected limit. */
@@ -239,7 +257,11 @@ export interface JobExecutorOptions {
 
 export class JobExecutor {
   private readonly clock: Clock;
-  private readonly logger: Logger;
+  /** Not `readonly`: a hosted standalone job REPLACES this with a redacting
+   *  wrapper (f1) the moment the org credential is resolved, so every later
+   *  log call on this executor is covered by construction rather than by each
+   *  call site remembering. */
+  private logger: Logger;
   private readonly makeId: () => string;
   private readonly needsInput: NeedsInputRelay;
   private readonly detectLimit: ProviderLimitDetector;
@@ -581,12 +603,52 @@ export class JobExecutor {
   /** The shared drive loop: invoke → detect limit → classify → repeat. */
   private async driveLoop(workspace: PreparedWorkspace, driveTarget: DriveTarget, initial: DriveMode): Promise<JobResult> {
     const lease = this.options.lease;
+
+    // ── f1: hosted `standalone` ────────────────────────────────────────────
+    // Applied HERE because this is the one funnel every drive invocation
+    // passes through — the initial start AND every resume/answer re-entry,
+    // for both the fresh path and c6's recorded-resume path. Deciding it at
+    // the two `DriveTarget` construction sites instead would leave the
+    // executor pin and the key overlay to be re-stated correctly in each,
+    // which is precisely how one of them eventually drifts.
+    //
+    // FAIL CLOSED: an unresolvable org credential ends the job before any
+    // process is spawned. The alternative — spawning and letting c1's ladder
+    // find whatever this machine happens to carry — is the cross-tenant
+    // billing failure this whole path exists to prevent.
+    let driveEnv = this.options.env;
+    const hosted = this.options.hostedStandalone;
+    if (hosted !== undefined) {
+      let credential;
+      try {
+        credential = await resolveHostedCredential(hosted.credential, {
+          jobId: lease.job_id,
+          runId: lease.run_id,
+          jobJwt: lease.job_jwt,
+          secretSlugs: lease.secret_slugs,
+        });
+      } catch (err) {
+        const reason = `hosted standalone run cannot start: ${err instanceof Error ? err.message : String(err)}`;
+        await this.reportTerminal('halted', { halt_reason: reason });
+        return this.fail(reason);
+      }
+      // Layer two, runner-side, armed BEFORE the key can reach any log line.
+      this.logger = redactingLogger(this.logger, credential);
+      driveTarget = { ...driveTarget, executor: HOSTED_EXECUTOR };
+      driveEnv = hostedDriveEnv(credential, this.options.env);
+      // Length and source only — never the value (this package's standing rule).
+      this.logger.info(
+        `job ${lease.job_id}: hosted standalone — --executor=${HOSTED_EXECUTOR}, ` +
+          `${describeHostedProviderKey(credential)}`
+      );
+    }
+
     let mode: DriveMode = initial;
     for (;;) {
       const args = buildDriveArgs(driveTarget, mode);
       const result = await this.options.exec.run(this.pipelineBin, args, {
         cwd: workspace.dir,
-        env: this.options.env,
+        env: driveEnv,
         signal: this.abort.signal,
       });
       {
