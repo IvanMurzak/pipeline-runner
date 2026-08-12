@@ -64,6 +64,7 @@ import type { JobRecord, JobStore } from './job-store';
 import { recordFromLease } from './job-store';
 import { classifyRecord, fsSubstrateProbe, type SubstrateProbe } from './reconcile';
 import { quarantineGcMs, type RetentionPolicy } from './retention';
+import type { RunStateStore } from './run-state';
 import { nodeJobExec, nodeJobFs, type JobExec, type JobFs } from './types';
 import { cliContentHashVerifier, sanitizeJobId, type ContentHashVerifier, type StartIterationResolver } from './workspace';
 import { buildAcceptFrame, buildRunStatusFrame, isCancelMessage, isLeaseMessage, type LeaseMessage } from './wire';
@@ -120,6 +121,10 @@ export interface JobManagerOptions {
   /** c6: the substrate probe the reconcile/adoption validate through.
    *  Defaults to the real filesystem + `~/.claude/projects` layout. */
   substrate?: SubstrateProbe;
+  /** f3: the CROSS-MACHINE run-state handoff store, passed through to every
+   *  executor. Absent ⇒ nothing is published or fetched and this runner behaves
+   *  exactly as before — a run released here can only be resumed here. */
+  runState?: RunStateStore;
   /** c6: terminal workspace/record policy (default: immediate delete). */
   retention?: RetentionPolicy;
   clock?: Clock;
@@ -557,6 +562,8 @@ export class JobManager {
       resolveTaskPipeline: this.options.resolveTaskPipeline,
       // c6: the durable-record port — executor phase transitions persist.
       record: store === undefined ? undefined : { update: (patch) => store.update(jobId, patch) },
+      // f3: the cross-machine handoff store (cursor only, never a session).
+      runState: this.options.runState,
       resume,
       clock: this.options.clock,
       logger: this.logger,

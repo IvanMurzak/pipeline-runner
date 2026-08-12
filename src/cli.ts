@@ -90,6 +90,7 @@ import {
   PIPELINE_RUNNER_HOME_ENV,
   readHomeLockPid,
   resolveLockHomeDir,
+  resolveRunStateDir,
   resolveWorkspaceRoot,
 } from './core/home';
 import { consoleLogger } from './core/log';
@@ -110,6 +111,7 @@ import {
   createGracefulShutdown,
   createShipperLifecycle,
   DEFAULT_RETENTION_SWEEP_INTERVAL_MS,
+  fsRunStateStore,
   fsSubstrateProbe,
   JobStore,
   resolveRetentionPolicy,
@@ -573,6 +575,19 @@ function runStart(argv: string[] = []): void {
     logger: consoleLogger,
   });
 
+  // f3 (design 01 §Scale E13): the cross-machine run-state handoff. OPT-IN and
+  // explicit — `PIPELINE_RUNNER_RUN_STATE_DIR` must name storage every machine
+  // in the pool can see, because a machine-local default would look configured
+  // while never letting a run reach a second machine. Unset ⇒ null ⇒ the
+  // manager passes no store and this runner behaves exactly as it did before.
+  const runStateDir = resolveRunStateDir();
+  if (runStateDir !== null) {
+    consoleLogger.info(
+      `cross-machine run-state handoff enabled at ${runStateDir} — the durable cursor is published there; ` +
+        'step sessions and transcripts are NOT (see docs/cross-machine-resume.md)'
+    );
+  }
+
   // T2-03: accept job leases (additive — attaches `lease` + `cancel`
   // handlers only; the register/heartbeat/reconnect paths are untouched).
   manager = attachJobExecution(client, {
@@ -593,6 +608,8 @@ function runStart(argv: string[] = []): void {
     store: jobStore,
     substrate: fsSubstrateProbe(shipperFs, homedir()),
     retention: resolveRetentionPolicy(process.env, consoleLogger),
+    // f3: cursor-only cross-machine handoff (null ⇒ omitted ⇒ unchanged).
+    ...(runStateDir === null ? {} : { runState: fsRunStateStore(shipperFs, runStateDir) }),
   });
 
   // department-mesh (task d1): the adapter registry starts with
