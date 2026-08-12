@@ -84,6 +84,8 @@ import {
 // f2: reject any EXPLICITLY non-`standalone` `runner:` on a hosted run.
 import { assertHostedRunnerAllowed } from './hosted-mode';
 import type { JobRecord, RecordedQuestion } from './job-store';
+// f3: the cross-machine run-state handoff — the durable cursor, never a session.
+import type { RunStateStore } from './run-state';
 // f1: hosted `standalone` selection + the org provider key.
 import {
   describeHostedProviderKey,
@@ -247,6 +249,18 @@ export interface JobExecutorOptions {
    *  seam (`cliTaskPipelineResolver` — same binary as drive, so tests script
    *  it and never spawn). Non-task leases NEVER invoke it. */
   resolveTaskPipeline?: TaskPipelineResolver;
+  /** f3 — CROSS-MACHINE resume. Its presence lets a run that was released by
+   *  one machine be picked up by another: the durable cursor is published after
+   *  every drive invocation and restored into a fresh checkout when the server
+   *  re-offers the run here with `resume_hint`.
+   *
+   *  Only the cursor travels. SDK session files and their transcripts stay on
+   *  the machine that made them, by decision — see `./run-state.ts` and
+   *  `docs/cross-machine-resume.md`.
+   *
+   *  ABSENT ⇒ nothing is published, nothing is fetched, and every existing
+   *  path behaves exactly as it did: same-machine resume is unaffected. */
+  runState?: RunStateStore;
   /** c6: the durable-record port (phase transitions persist through it). */
   record?: JobRecordPort;
   /** c6: resume mode — re-enter the recorded state instead of preparing. */
@@ -382,6 +396,10 @@ export class JobExecutor {
     }
     if (this.cancelled_) {
       this.setState('failed');
+      // f3: a server cancel bypasses reportTerminal (no run_status by design),
+      // so drop the published cursor here — a cancelled run must not be
+      // resumable on another machine.
+      this.discardRunState();
       const result: JobResult = {
         job_id: this.jobId,
         run_id: this.runId,
@@ -491,7 +509,86 @@ export class JobExecutor {
       ...(lease.variables !== undefined ? { variables: lease.variables } : {}),
     };
 
+    // ── f3: cross-machine handoff ──────────────────────────────────────────
+    // We are on the FRESH-prep path, which means this machine holds no record
+    // for this run — either it is genuinely new, or it was released elsewhere
+    // and the server re-offered it here. `resume_hint` is the server telling us
+    // which; a run that has moved has a published cursor waiting.
+    //
+    // Restoring it turns `--start` into `--resume`, and the engine picks up at
+    // the step the cursor names. No session file comes with it, so the step it
+    // lands on spawns fresh — that is the decision, not an omission.
+    const handoff = this.adoptPublishedRunState(workspace);
+    if (handoff !== null) return this.driveLoop(workspace, driveTarget, handoff);
+
     return this.driveLoop(workspace, driveTarget, { kind: 'start', startIteration: workspace.startIteration });
+  }
+
+  /**
+   * f3: restore a run released by ANOTHER machine into this fresh checkout.
+   * Returns the drive mode to use, or null to start normally.
+   *
+   * Deliberately narrow. Only a `resume_hint` lease is considered, so an
+   * ordinary new run never consults the store; and a refusal (no bundle, a
+   * cursor naming machine-local paths, local state already present) always
+   * falls through to a clean `--start` rather than resuming over a guess.
+   */
+  private adoptPublishedRunState(workspace: PreparedWorkspace): DriveMode | null {
+    const lease = this.options.lease;
+    const store = this.options.runState;
+    if (store === undefined || lease.resume_hint !== true) return null;
+    const bundle = store.fetch(lease.run_id);
+    if (bundle === null) {
+      this.logger.info(`job ${lease.job_id}: resume_hint but no published run state for run ${lease.run_id} — starting fresh`);
+      return null;
+    }
+    const restored = store.restore(bundle, { pipelineRoot: workspace.pipelineRoot, runId: lease.run_id });
+    if (!restored.restored) {
+      this.logger.warn(`job ${lease.job_id}: published run state for run ${lease.run_id} not restored (${restored.reason}) — starting fresh`);
+      return null;
+    }
+    this.logger.info(
+      `job ${lease.job_id}: run ${lease.run_id} ADOPTED FROM ANOTHER MACHINE — cursor captured ${bundle.captured_at} ` +
+        `restored into ${workspace.pipelineRoot}; step sessions are NOT carried, the current step spawns fresh` +
+        (restored.pending_question ? '; a question was outstanding at capture and will be asked again' : '')
+    );
+    return { kind: 'resume' };
+  }
+
+  /**
+   * f3: publish the durable cursor so another machine could take this run over.
+   *
+   * Called after EVERY drive invocation returns — the same "one funnel"
+   * argument the hosted block above uses. That is also the only correct moment:
+   * between invocations the run is quiescent and `next.json` has just been
+   * persisted, so what we publish is never a torn read of a live cursor.
+   *
+   * Best-effort by construction. A handoff store is an optimisation on top of
+   * single-machine resume, and a run must never fail because shared storage
+   * hiccuped.
+   */
+  private publishRunState(workspace: PreparedWorkspace): void {
+    const store = this.options.runState;
+    if (store === undefined) return;
+    try {
+      const published = store.publish({ pipelineRoot: workspace.pipelineRoot, runId: this.runId });
+      if (published.bundle === null) {
+        this.logger.info(`job ${this.jobId}: run state not published (${published.reason})`);
+      }
+    } catch (err) {
+      this.logger.warn(`job ${this.jobId}: publishing run state failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** f3: the run reached a terminal outcome — no other machine should resume it. */
+  private discardRunState(): void {
+    const store = this.options.runState;
+    if (store === undefined) return;
+    try {
+      store.discard(this.runId);
+    } catch (err) {
+      this.logger.warn(`job ${this.jobId}: discarding run state failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -668,6 +765,10 @@ export class JobExecutor {
         env: driveEnv,
         signal: this.abort.signal,
       });
+      // f3: BEFORE the interrupt check, so a graceful-shutdown suspend — the
+      // release that most often precedes a pickup elsewhere — publishes the
+      // cursor it just stopped on instead of stranding the run on this box.
+      this.publishRunState(workspace);
       {
         const interrupted = this.interruptResult();
         if (interrupted !== null) return interrupted;
@@ -856,6 +957,9 @@ export class JobExecutor {
         `job ${this.jobId}: terminal event flush failed (${err instanceof Error ? err.message : String(err)}) — sending run_status anyway`
       );
     }
+    // f3: the one funnel every terminal outcome passes through, so a finished
+    // run can never be picked up somewhere else from a leftover cursor.
+    this.discardRunState();
     this.report(phase, detail);
   }
 

@@ -33,6 +33,8 @@ export const LOCK_FILE_NAME = 'runner.lock';
 /** Generalizes the historical `PIPELINE_RUNNER_JOBS_DIR` — still respected
  *  as the most-specific override (wins even over a configured home). */
 export const PIPELINE_RUNNER_JOBS_DIR_ENV = 'PIPELINE_RUNNER_JOBS_DIR';
+/** f3: opt-in directory for the CROSS-MACHINE run-state handoff (see below). */
+export const PIPELINE_RUNNER_RUN_STATE_DIR_ENV = 'PIPELINE_RUNNER_RUN_STATE_DIR';
 
 /**
  * The job-workspace root (fresh shallow-clone checkouts —
@@ -52,6 +54,24 @@ export function resolveWorkspaceRoot(
   const home = resolveHome(env);
   if (home !== null) return join(home, 'jobs');
   return join(defaultConfigDir(env, platform), 'jobs');
+}
+
+/**
+ * f3: where this runner publishes and reads the CROSS-MACHINE run-state
+ * handoff (`jobs/run-state.ts` — the durable cursor, never a session).
+ *
+ * Deliberately has **no default**. Every other path here resolves to something
+ * machine-local, and a machine-local default would be worse than useless: it
+ * would look configured while never letting a run reach a second machine. This
+ * directory only means anything if the machines in a pool can all see it (a
+ * shared mount, a synced volume), so it must be stated explicitly.
+ *
+ * Absent ⇒ no handoff store ⇒ a run released on this machine can only be
+ * resumed on this machine, exactly as before f3.
+ */
+export function resolveRunStateDir(env: Record<string, string | undefined> = process.env): string | null {
+  const dir = env[PIPELINE_RUNNER_RUN_STATE_DIR_ENV];
+  return dir !== undefined && dir.trim().length > 0 ? dir : null;
 }
 
 /**
