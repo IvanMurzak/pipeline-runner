@@ -81,6 +81,8 @@ import {
   type ProviderLimit,
   type ProviderLimitDetector,
 } from './drive';
+// f2: reject any EXPLICITLY non-`standalone` `runner:` on a hosted run.
+import { assertHostedRunnerAllowed } from './hosted-mode';
 import type { JobRecord, RecordedQuestion } from './job-store';
 // f1: hosted `standalone` selection + the org provider key.
 import {
@@ -619,6 +621,21 @@ export class JobExecutor {
     let driveEnv = this.options.env;
     const hosted = this.options.hostedStandalone;
     if (hosted !== undefined) {
+      // f2: REJECT any EXPLICITLY non-`standalone` `runner:` before anything
+      // else in this block — before the org credential is resolved (a
+      // control-plane call) and before any process is spawned. An absent key
+      // is allowed through (E10's default must not become an accidental
+      // gate); only a declared `session`/`manager`/`driver` (or v1's
+      // `headless`) is refused. See `hosted-mode.ts` for why this cannot use
+      // the already-resolved `Plan.runner`/`Manifest.runner`.
+      try {
+        assertHostedRunnerAllowed(workspace.pipelineRoot, this.options.fs);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        await this.reportTerminal('halted', { halt_reason: reason });
+        return this.fail(reason);
+      }
+
       let credential;
       try {
         credential = await resolveHostedCredential(hosted.credential, {

@@ -26,6 +26,26 @@ and is proven by [`src/jobs/standalone.test.ts`](../src/jobs/standalone.test.ts)
 | A machine-configured key **helper** cannot win | `PIPELINE_API_KEY_HELPER` is unset — see below, this is the easy one to miss |
 | No org key ⇒ **no run** | `resolveHostedCredential` throws; no process is spawned |
 | The key reaches no log | an off-object holder (`WeakMap`) + `redactingLogger` |
+| An **explicit** `runner: session`/`manager`/`driver` is refused before any resource is provisioned | task `f2-reject-nonstandalone` — [`src/jobs/hosted-mode.ts`](../src/jobs/hosted-mode.ts) / [`hosted-mode.test.ts`](../src/jobs/hosted-mode.test.ts) |
+
+### f2 — rejecting a declared non-`standalone` runner
+
+`session` and `manager` need an interactive Claude Code session on our server;
+`driver` needs the user's own Claude Code installation and subscription on our
+hardware. None of the three can run here (E3), so `driveLoop` refuses them
+before resolving the org credential or spawning any process — see
+`assertHostedRunnerAllowed` in `hosted-mode.ts`.
+
+The one thing worth restating here because it is easy to get backwards: the
+CLI's own `pipeline plan`/`Manifest.runner` **already defaults an absent
+`runner:` key to `'manager'`** (E10). Reading that resolved value would reject
+every ordinary hosted pipeline that never mentioned `runner:` at all — exactly
+the "accidental gate" the DoD forbids. `hosted-mode.ts` therefore reads the
+manifest **source** (`pipeline.yml`, or v1 `PIPELINE.md` frontmatter) directly
+through `JobFs.readFile`, so it can tell an EXPLICIT `manager` apart from an
+absent key — only the former is refused. No flag or environment variable
+relaxes this (`hosted-mode.test.ts` plants bypass-shaped env vars and proves
+they change nothing).
 
 ### Why the environment, and not `--api-key`
 
