@@ -187,16 +187,25 @@ order.**
 
 ---
 
-## 4. Out of scope here: pooled machines (task `f4`)
+## 4. Out of scope here: pooled machines (task `f4` — **landed**)
 
 Auto memory and the global `~/.claude.json` are read **regardless** of
-`settingSources`. On a fresh per-run container both are empty, which is what
-makes today survivable.
+`settingSources`. On a fresh per-run container both are empty, which is what made
+this task survivable when it shipped alone.
 
-`f4-runner-pooling-isolation` owns the reused-machine case — wiped home,
-`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CONFIG_DIR`, and a two-tenant test.
-**f4 has not landed**, and nothing in this task assumes it has. Those levers are
-deliberately not set here, so that f4 owns them in one place.
+`f4-runner-pooling-isolation` owns the reused-machine case and **has since
+landed**: a fresh per-run `$HOME`, `CLAUDE_CONFIG_DIR`,
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, and a two-tenant test that proves nothing
+crosses in either direction. See
+[`docs/runner-pooling-isolation.md`](./runner-pooling-isolation.md) —
+`src/jobs/agent-home.ts`, applied at the same hosted funnel in `driveLoop` that
+this task's overlay is applied at.
+
+**f4 does not close §3.** It removes the *ambient* path — `~` no longer resolves
+anywhere a previous tenant wrote, and the runner's own token is no longer
+reachable by tilde expansion from inside a run — but jobs still execute on the
+host as the runner's OS user, and any absolute path that user can read is still
+readable. The sandbox is still owed.
 
 ---
 
