@@ -72,6 +72,8 @@ import { nullLogger } from '../core/log';
 import type { WireFrame } from '../core/wire';
 // T2-05 ADDITIVE: the task-dispatch pipeline-resolution seam + its default.
 import { cliTaskPipelineResolver, type TaskPipelineResolver } from '../dispatch/matcher';
+// f4: the per-RUN isolated agent home (pooled-machine cross-tenant isolation).
+import { agentHomeEnv, agentHomesRootFor, disposeAgentHome, provisionAgentHome } from './agent-home';
 import {
   buildDriveArgs,
   classifyDriveOutcome,
@@ -235,6 +237,14 @@ export interface JobExecutorOptions {
    *  no credential resolution, byte-identical argv. A local runner is exactly
    *  what it was. */
   hostedStandalone?: HostedStandaloneOptions;
+  /** f4 — root for the PER-RUN isolated agent homes a hosted run's drive child
+   *  gets as its `$HOME` (`./agent-home.ts`). Defaults to
+   *  `<workspaceRoot>/.agent-homes`, so isolation is the behaviour of a hosted
+   *  runner that configured nothing, not of one that remembered to.
+   *
+   *  Read ONLY on the hosted path: a local runner's drive child keeps the
+   *  user's own home, which is theirs and holds their own configuration. */
+  agentHomeRoot?: string;
   needsInput?: NeedsInputRelay;
   detectProviderLimit?: ProviderLimitDetector;
   /** Pause length before resume attempt N (0-based) for a detected limit. */
@@ -699,7 +709,16 @@ export class JobExecutor {
     return this.driveLoop(workspace, driveTarget, { kind: 'resume' });
   }
 
-  /** The shared drive loop: invoke → detect limit → classify → repeat. */
+  /**
+   * The shared drive loop's PREAMBLE AND RESOURCE SCOPE: everything a hosted
+   * run decides once, before the first spawn and for every re-entry
+   * {@link runDriveLoop} makes, plus the `finally` that releases what it took.
+   *
+   * The split is f4's, for one reason: the per-run agent home is a resource
+   * with a LIFETIME, and a `finally` is the only way to be sure it is released
+   * down every one of the loop's exits — completed, halted, failed, cancelled,
+   * or a throw nobody predicted.
+   */
   private async driveLoop(workspace: PreparedWorkspace, driveTarget: DriveTarget, initial: DriveMode): Promise<JobResult> {
     const lease = this.options.lease;
 
@@ -716,6 +735,9 @@ export class JobExecutor {
     // find whatever this machine happens to carry — is the cross-tenant
     // billing failure this whole path exists to prevent.
     let driveEnv = this.options.env;
+    /** f4: this run's isolated home, once provisioned — the `finally` below
+     *  releases it. Null on a local run: nothing was provisioned to release. */
+    let agentHome: string | null = null;
     const hosted = this.options.hostedStandalone;
     if (hosted !== undefined) {
       // f2: REJECT any EXPLICITLY non-`standalone` `runner:` before anything
@@ -748,15 +770,68 @@ export class JobExecutor {
       }
       // Layer two, runner-side, armed BEFORE the key can reach any log line.
       this.logger = redactingLogger(this.logger, credential);
+
+      // ── f4: the per-RUN isolated agent home ──────────────────────────────
+      // `settingSources` — even once the CLI can pin it — does not close the
+      // global `~/.claude.json` or auto memory. On a POOLED machine those are
+      // one tenant's state loading into another tenant's run, and nothing about
+      // the failure is visible. So the child's `$HOME` is determined here.
+      //
+      // FAIL CLOSED, exactly like the credential above: a home we could not
+      // provision means we do not know what the child would read, and spawning
+      // into the machine's own home is the leak this exists to prevent.
+      try {
+        agentHome = provisionAgentHome({
+          // The RUN, never the job: c6 adoption re-keys the job_id and would
+          // otherwise resume into a brand-new empty home (see agent-home.ts).
+          runId: lease.run_id,
+          root: this.options.agentHomeRoot ?? agentHomesRootFor(this.options.workspaceRoot),
+          checkoutDir: workspace.dir,
+          // A fresh `--start` wipes a stale home; a resume must not — that
+          // directory holds the transcripts a resume is validated against.
+          fresh: initial.kind === 'start',
+          fs: this.options.fs,
+          logger: this.logger,
+        });
+      } catch (err) {
+        const reason = `hosted standalone run cannot start: ${err instanceof Error ? err.message : String(err)}`;
+        await this.reportTerminal('halted', { halt_reason: reason });
+        return this.fail(reason);
+      }
+
       driveTarget = { ...driveTarget, executor: HOSTED_EXECUTOR };
-      driveEnv = hostedDriveEnv(credential, this.options.env);
+      // Layered so each module's entries are applied last over the one below:
+      // caller base < agent home (f4) < provider key (f1). No layer can re-open
+      // a layer beneath it.
+      driveEnv = hostedDriveEnv(credential, agentHomeEnv(agentHome, this.options.env));
       // Length and source only — never the value (this package's standing rule).
       this.logger.info(
         `job ${lease.job_id}: hosted standalone — --executor=${HOSTED_EXECUTOR}, ` +
-          `${describeHostedProviderKey(credential)}`
+          `${describeHostedProviderKey(credential)}, isolated home ${agentHome} (auto memory off)`
       );
     }
 
+    try {
+      return await this.runDriveLoop(workspace, driveTarget, initial, driveEnv);
+    } finally {
+      // A SUSPENDED job keeps its home: the record is left intact for the next
+      // boot's reconcile, and this directory holds that resume's substrate —
+      // the same reason `manager.ts#finalizeJob` keeps a suspended checkout.
+      // Every other exit is terminal, and leaves nothing of this tenant behind.
+      if (agentHome !== null && !this.suspended_) {
+        disposeAgentHome(agentHome, this.options.fs, this.logger);
+      }
+    }
+  }
+
+  /** The drive loop proper: invoke → detect limit → classify → repeat. */
+  private async runDriveLoop(
+    workspace: PreparedWorkspace,
+    driveTarget: DriveTarget,
+    initial: DriveMode,
+    driveEnv: Record<string, string | undefined> | undefined
+  ): Promise<JobResult> {
+    const lease = this.options.lease;
     let mode: DriveMode = initial;
     for (;;) {
       const args = buildDriveArgs(driveTarget, mode);

@@ -90,11 +90,13 @@
  * `drive.ts` builds its SDK seams without it. See `docs/hosted-standalone.md`.
  *
  * The pooled-machine inputs that are read REGARDLESS of `settingSources` —
- * auto memory and the global `~/.claude.json` — are task f4's (wiped home,
- * `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`). f4 has NOT landed, and this module
- * must not pretend otherwise: on a fresh per-run container both are empty,
- * which is what makes today survivable, and that premise is recorded in
- * `docs/hosted-standalone.md` rather than assumed.
+ * auto memory and the global `~/.claude.json` — are task f4's, and f4 HAS since
+ * landed: `./agent-home.ts` gives each run its own `$HOME`, relocates
+ * `CLAUDE_CONFIG_DIR` and sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
+ * unconditionally. Its entries ride the SAME overlay as this module's, composed
+ * in `executor.ts#driveLoop` as `hostedDriveEnv(credential, agentHomeEnv(home,
+ * env))` — caller base < agent home < provider key, each layer applied last over
+ * the one below it. See `docs/runner-pooling-isolation.md`.
  */
 
 import type { Logger } from '../core/log';

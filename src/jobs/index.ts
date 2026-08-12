@@ -31,3 +31,6 @@ export * from './shutdown';
 // f3 (design 01 §Scale E13 / 02 §Work): the cross-machine run-state handoff —
 // the durable cursor travels, SDK session files never do.
 export * from './run-state';
+// f4 (design 01 §Scale E13): the per-RUN isolated agent home — pooled machines
+// must not carry one tenant's memory or global config into another's run.
+export * from './agent-home';
