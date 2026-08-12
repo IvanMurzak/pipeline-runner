@@ -41,10 +41,12 @@ export class FakeJobExec implements JobExec {
   }
 }
 
-/** In-memory job fs: pre-seed `existing` paths and `listings` per directory. */
+/** In-memory job fs: pre-seed `existing` paths, `listings` per directory, and
+ *  `files` content (path → text, for `readFile`). */
 export class FakeJobFs implements JobFs {
   existing = new Set<string>();
   listings = new Map<string, string[]>();
+  files = new Map<string, string>();
   removed: string[] = [];
   made: string[] = [];
 
@@ -64,6 +66,10 @@ export class FakeJobFs implements JobFs {
 
   listDir(path: string): string[] {
     return this.listings.get(path) ?? [];
+  }
+
+  readFile(path: string): string | null {
+    return this.files.get(path) ?? null;
   }
 }
 

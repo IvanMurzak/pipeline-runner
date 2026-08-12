@@ -82,8 +82,12 @@ export interface JobExec {
 
 /**
  * Injectable filesystem seam for workspace management. Deliberately tiny:
- * directory lifecycle + a listing (start-iteration discovery). No file writes
- * — job execution only ever writes through the spawned subprocesses.
+ * directory lifecycle, a listing (start-iteration discovery), and a single
+ * read (f2 — reading the manifest SOURCE directly, since `pipeline plan`'s
+ * resolved `runner` field already carries the CLI's own default and cannot
+ * tell an explicit value apart from an absent one; see `hosted-mode.ts`). No
+ * file writes — job execution only ever writes through the spawned
+ * subprocesses.
  */
 export interface JobFs {
   mkdirp(path: string): void;
@@ -92,6 +96,8 @@ export interface JobFs {
   removeDir(path: string): void;
   /** Entry NAMES of a directory; [] when it does not exist. */
   listDir(path: string): string[];
+  /** Full UTF-8 text of a file; null when it does not exist. */
+  readFile(path: string): string | null;
 }
 
 /** The real process spawner. Spawn errors are mapped to a non-zero result. */
@@ -380,6 +386,14 @@ export function nodeJobFs(): JobFs {
         return fs.readdirSync(path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw err;
+      }
+    },
+    readFile: (path) => {
+      try {
+        return fs.readFileSync(path, 'utf8');
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
         throw err;
       }
     },
