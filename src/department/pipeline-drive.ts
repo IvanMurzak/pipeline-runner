@@ -733,16 +733,25 @@ export class PipelineDriveAdapter implements EngineModule {
     sink(this.toRuntimeEvent(outcome));
   }
 
-  /** `classifyDriveOutcome` (`../jobs/drive.ts`, UNCHANGED) has four kinds;
-   *  `RuntimeEvent` has three that apply here. `halted` and `failed` map onto
-   *  the SAME `RuntimeEvent` shape — exactly mirroring `JobExecutor.driveLoop`'s
-   *  own switch, where the `'halted'` and `'failed'` cases already do the
-   *  identical thing (`reportTerminal('halted', …)` then `this.fail(…)`). */
+  /** `classifyDriveOutcome` (`../jobs/drive.ts`) has FIVE kinds as of c1
+   *  (`blocked` split out of `halted` so the runner's own `run_status` frame
+   *  can carry `outcome:'blocked'` — see `../jobs/executor.ts`'s driveLoop);
+   *  `RuntimeEvent` still has three that apply here and has NOT grown a
+   *  `blocked` variant (07 §2's shape is verbatim/closed for this adapter
+   *  surface), so `blocked` maps onto the same `failed` shape `halted`
+   *  already did — byte-identical adapter behavior to before c1, since exit-3
+   *  used to classify as `halted` and land here regardless. `halted`,
+   *  `blocked` and `failed` all map onto the SAME `RuntimeEvent` shape —
+   *  exactly mirroring `JobExecutor.driveLoop`'s own switch, where the
+   *  `'halted'` and `'failed'` cases already do the identical thing
+   *  (`reportTerminal('halted', …)` then `this.fail(…)`). */
   private toRuntimeEvent(outcome: DriveOutcome): RuntimeEvent {
     switch (outcome.kind) {
       case 'completed':
         return { type: 'completed', summary: outcome.outcome };
       case 'halted':
+        return { type: 'failed', reason: outcome.reason, retrySafe: false };
+      case 'blocked':
         return { type: 'failed', reason: outcome.reason, retrySafe: false };
       // `classifyDriveOutcome`'s 'failed' kind covers a usage error (exit 2),
       // an unrecognized exit code, AND a spawn-level failure (`code===null`

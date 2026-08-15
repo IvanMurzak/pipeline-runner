@@ -104,7 +104,7 @@ import {
   type PreparedWorkspace,
   type StartIterationResolver,
 } from './workspace';
-import { buildRunStatusFrame, TASK_PIPELINE_UNRESOLVED, type LeaseMessage, type LeaseTask } from './wire';
+import { buildRunStatusFrame, RUN_STATUS_OUTCOME_BLOCKED, TASK_PIPELINE_UNRESOLVED, type LeaseMessage, type LeaseTask } from './wire';
 import { JobError, type JobExec, type JobFs } from './types';
 
 export type JobState =
@@ -923,6 +923,14 @@ export class JobExecutor {
         }
         case 'halted': {
           await this.reportTerminal('halted', { halt_reason: outcome.reason });
+          return this.fail(outcome.reason);
+        }
+        case 'blocked': {
+          // c1: still a `phase:'halted'` frame (the enum is closed) but with
+          // the structured `outcome:'blocked'` alongside it, so the cloud
+          // learns this was a nested-blocker delegation rather than an
+          // opaque halt — see ./drive.ts DriveOutcome and ./wire.ts.
+          await this.reportTerminal('halted', { halt_reason: outcome.reason, outcome: RUN_STATUS_OUTCOME_BLOCKED });
           return this.fail(outcome.reason);
         }
         case 'failed': {

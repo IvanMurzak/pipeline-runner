@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { CaptureLogger, FakeClock, tick } from '../../tests/_helpers';
 import {
   AbortableHangExec,
+  DRIVE_BLOCKED,
   DRIVE_COMPLETED,
   DRIVE_HALTED,
   DRIVE_PROVIDER_LIMIT,
@@ -420,6 +421,30 @@ describe('JobExecutor — failure paths', () => {
     expect(result).toEqual({ job_id: 'job-1', run_id: 'run-1', ok: false, reason: 'step 02 halted: tests failed' });
     expect(world.sink.ofType('run_status').map((f) => f.phase)).toEqual(['started', 'halted']);
     expect(world.sink.ofType('run_status')[1]!.halt_reason).toBe('step 02 halted: tests failed');
+    expect('outcome' in world.sink.ofType('run_status')[1]!).toBe(false);
+    expect(world.states).toEqual(['preparing', 'running', 'failed']);
+  });
+
+  test('c1: drive blocked (exit 3) → run_status phase:halted, outcome:blocked, result failed', async () => {
+    const world = makeWorld([DRIVE_BLOCKED]);
+    const result = await world.executor.start();
+    expect(result).toEqual({
+      job_id: 'job-1',
+      run_id: 'run-1',
+      ok: false,
+      reason: 'blocked on a nested blocker (/ws/.runtime/run-1/records/step.json)',
+    });
+    expect(world.sink.frames).toEqual([
+      { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'started' },
+      {
+        type: 'run_status',
+        run_id: 'run-1',
+        job_id: 'job-1',
+        phase: 'halted',
+        halt_reason: 'blocked on a nested blocker (/ws/.runtime/run-1/records/step.json)',
+        outcome: 'blocked',
+      },
+    ]);
     expect(world.states).toEqual(['preparing', 'running', 'failed']);
   });
 
