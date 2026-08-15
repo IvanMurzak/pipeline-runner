@@ -9,7 +9,11 @@
  *   - Exit codes: 0 completed · 1 halted/depth-exhausted · 2 usage error ·
  *     3 blocked (nested blocker) · 4 awaiting-input (PARKED on a question).
  *   - Exit 4 stdout carries `{status:"awaiting-input", step_id, question_id,
- *     iteration_path, session_id, question:{text,context,options}}`; resume
+ *     iteration_path, session_id, question:{text,context,options,approval?}}`
+ *     — `approval` present only for an approval GATE (T3-14; a plain step
+ *     question cannot carry one by construction, pipeline-cli
+ *     `extractQuestion`); it is preserved here and validated at the relay's
+ *     frame boundary (c2 / 07 T2). Resume
  *     the SAME claude session via `--resume --start <iteration> --answer
  *     "<text>"`. `question_id` (06.2.1, b2 — the `pipeline-cli` contract
  *     surface) is drive's OWN minted identity, echoed by the relay's answer
@@ -136,6 +140,31 @@ export function buildDriveArgs(target: DriveTarget, mode: DriveMode): string[] {
   return args;
 }
 
+/**
+ * The narrowed question a parked drive reports — the runner-internal carrier
+ * of `question.approval` from drive's park JSON all the way to the relay's
+ * frame boundary (c2, closing runner information-loss #2).
+ *
+ * `approval` is typed `unknown` ON PURPOSE. It is drive-supplied data that
+ * this module deliberately does NOT validate: the SINGLE validation authority
+ * is `validateQuestionApproval` at the `needs_input` frame boundary
+ * (`../relay/wire-relay.ts`), and `unknown` is what makes that
+ * non-negotiable — no value carried here is assignable to the protocol
+ * `Question.approval` (`Approval | null`) without going through that parse,
+ * so a second, weaker opinion about what counts as an approval gate cannot be
+ * introduced anywhere on this path without the compiler objecting (07 T2).
+ */
+export interface DriveQuestion {
+  text: string;
+  context: string | null;
+  options: string[] | null;
+  /** T3-14 APPROVAL-GATE marker, carried VERBATIM and UNVALIDATED. Present
+   *  (non-null) ⇒ drive said this park is a gate; whether it IS one is
+   *  decided only by `ApprovalSchema` at the frame boundary. Absent ⇒ an
+   *  ordinary question, byte-identical to before this field existed. */
+  approval?: unknown;
+}
+
 /** A parked needs-input question as drive reports it (exit 4 final JSON). */
 export interface DriveParked {
   step_id: string | null;
@@ -146,7 +175,7 @@ export interface DriveParked {
   /** Resume target: `--resume --start <iteration_path> --answer <text>`. */
   iteration_path: string;
   session_id: string | null;
-  question: { text: string; context: string | null; options: string[] | null };
+  question: DriveQuestion;
 }
 
 /** A drive exec result classified into the job-level outcome.
@@ -196,13 +225,27 @@ function asString(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
-/** Defensive question narrowing — same shape pipeline-cli's extractQuestion yields. */
-function narrowQuestion(raw: unknown): DriveParked['question'] {
+/** Defensive question narrowing — same shape pipeline-cli's extractQuestion yields,
+ *  plus the T3-14 `approval` gate marker carried through verbatim (c2).
+ *
+ *  This narrowing used to REBUILD the question as `{text, context, options}`
+ *  only, which silently destroyed `approval` on every gate a dispatched runner
+ *  drove: the cloud received an ordinary question and could never classify the
+ *  run as `needs-approval` (runner information-loss #2). It now copies the
+ *  marker across UNCHANGED and UNJUDGED — including a malformed one. That is
+ *  deliberate: dropping a bad marker here would make the loss silent again,
+ *  and would put a second (weaker) opinion about approval-hood on the path.
+ *  Exactly one place decides, loudly: `validateQuestionApproval` at the frame
+ *  boundary (`../relay/wire-relay.ts`, 07 T2). A null/absent marker is not
+ *  copied at all — `!= null` presence semantics, so a plain question's narrowed
+ *  shape is byte-identical to before. */
+function narrowQuestion(raw: unknown): DriveQuestion {
   const q = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   return {
     text: asString(q.text) ?? 'step requested input but provided no question text',
     context: asString(q.context),
     options: Array.isArray(q.options) ? q.options.filter((o): o is string => typeof o === 'string') : null,
+    ...(q.approval != null ? { approval: q.approval } : {}),
   };
 }
 
