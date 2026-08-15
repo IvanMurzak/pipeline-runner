@@ -21,6 +21,12 @@
  *   - T3-06 additive: the OPTIONAL `execution_overrides` field
  *     (`ExecutionOverrides`: `{ model?, effort? }`) carrying a matrix CELL's
  *     per-run model/effort.
+ *   - c1 (`pipeline-ui-v2` task `c1-runner-blocked-outcome`) additive: an
+ *     exit-3/nested-blocker drive reports `phase:'halted', outcome:
+ *     RUN_STATUS_OUTCOME_BLOCKED` — `phase`'s three-value enum stays CLOSED
+ *     (`RunStatusPhase` above), the already-open `outcome` string field
+ *     carries the extra signal instead. An old cloud that predates this value
+ *     degrades to today's plain-halted handling.
  *
  * The envelope shape and the core frames (`register`/`heartbeat`/…) stay in
  * `../core/wire.ts`; this module only ADDS the job-execution frames. The
@@ -41,7 +47,7 @@ import type { WireFrame } from '../core/wire';
 
 // ── Protocol surface re-exported from the published package ─────────────────
 
-export { RUN_STATUS_PHASES, TASK_PIPELINE_UNRESOLVED } from '@baizor/pipeline-protocol';
+export { RUN_STATUS_OUTCOME_BLOCKED, RUN_STATUS_PHASES, TASK_PIPELINE_UNRESOLVED } from '@baizor/pipeline-protocol';
 
 export type {
   AcceptMessage,

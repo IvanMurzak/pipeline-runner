@@ -149,10 +149,20 @@ export interface DriveParked {
   question: { text: string; context: string | null; options: string[] | null };
 }
 
-/** A drive exec result classified into the job-level outcome. */
+/** A drive exec result classified into the job-level outcome.
+ *
+ * `blocked` is its OWN kind, not a `halted` alias (c1, closing runner
+ * information-loss #1): an exit-3 nested-blocker drive used to collapse into
+ * `{ kind: 'halted' }` indistinguishably from an ordinary failure, so the
+ * cloud never learned the run was blocked rather than merely halted. The
+ * executor still REPORTS a blocked drive on the wire as `phase:'halted'`
+ * (the `RunStatusPhase` enum is closed — see `RUN_STATUS_OUTCOME_BLOCKED` in
+ * `./wire`) but now sets `outcome:'blocked'` alongside it, so this
+ * classifier-level split is what makes that possible. */
 export type DriveOutcome =
   | { kind: 'completed'; outcome: string }
   | { kind: 'halted'; reason: string }
+  | { kind: 'blocked'; reason: string }
   | { kind: 'awaiting_input'; parked: DriveParked }
   | { kind: 'failed'; reason: string };
 
@@ -210,9 +220,13 @@ export function classifyDriveOutcome(result: JobExecResult): DriveOutcome {
       return { kind: 'halted', reason: asString(json?.reason) ?? asString(json?.status) ?? 'halted' };
     case DRIVE_EXIT.blocked: {
       // A nested blocker needs an interactive resolution pass — no cloud-side
-      // actor exists for that (v1), so the job halts with the pointer.
+      // actor exists for that (v1), so the job still halts with the pointer,
+      // but as a DISTINCT `blocked` kind (c1) rather than collapsed into
+      // plain `halted` — the executor maps this to `outcome:'blocked'` on
+      // the terminal run_status frame so the cloud learns the structured
+      // reason instead of an opaque halt.
       const record = asString(json?.blocker_record_file);
-      return { kind: 'halted', reason: `blocked on a nested blocker${record !== null ? ` (${record})` : ''}` };
+      return { kind: 'blocked', reason: `blocked on a nested blocker${record !== null ? ` (${record})` : ''}` };
     }
     case DRIVE_EXIT.awaitingInput: {
       const iteration = asString(json?.iteration_path);

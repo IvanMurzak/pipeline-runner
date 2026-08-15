@@ -276,16 +276,21 @@ describe('classifyDriveOutcome', () => {
     expect(classifyDriveOutcome({ code: 1, stdout: '', stderr: '' })).toEqual({ kind: 'halted', reason: 'halted' });
   });
 
-  test('exit 3 (blocked) maps to halted with the blocker pointer', () => {
+  test('exit 3 (blocked) classifies as its own "blocked" kind, not halted (c1, 04 §4.7)', () => {
     const result = {
       code: 3,
       stdout: '{"status":"blocked","blocker_record_file":"/ws/.runtime/run-1/records/step.json"}',
       stderr: '',
     };
     expect(classifyDriveOutcome(result)).toEqual({
-      kind: 'halted',
+      kind: 'blocked',
       reason: 'blocked on a nested blocker (/ws/.runtime/run-1/records/step.json)',
     });
+  });
+
+  test('exit 3 (blocked) without a blocker_record_file still classifies as blocked, pointer omitted', () => {
+    const result = { code: 3, stdout: '{"status":"blocked"}', stderr: '' };
+    expect(classifyDriveOutcome(result)).toEqual({ kind: 'blocked', reason: 'blocked on a nested blocker' });
   });
 
   test('exit 4 → awaiting_input with the parked question narrowed (no question_id: older-CLI shape)', () => {

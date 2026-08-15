@@ -170,6 +170,19 @@ export const DRIVE_HALTED: JobExecResult = {
   stderr: '',
 };
 
+/** c1: exit-3 nested-blocker drive result — classifies as its OWN `blocked`
+ *  kind (not `halted`), and reports on the wire as `phase:'halted',
+ *  outcome:'blocked'`. */
+export const DRIVE_BLOCKED: JobExecResult = {
+  code: 3,
+  stdout: JSON.stringify(
+    { status: 'blocked', blocker_record_file: '/ws/.runtime/run-1/records/step.json' },
+    null,
+    2
+  ),
+  stderr: '',
+};
+
 /** `questionId` omitted (default) simulates an older CLI that predates the
  *  b2 park-JSON `question_id` field (06.2.1) — the executor mint-fallback
  *  case (06.2.2). Pass one to simulate the current contract's passthrough. */
