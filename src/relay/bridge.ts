@@ -42,7 +42,7 @@ import {
   buildNeedsInputFrame,
   parseAnswerDelivery,
   type NeedsInputMessage,
-  type RelayQuestion,
+  type UnvalidatedRelayQuestion,
 } from './wire-relay';
 
 /**
@@ -73,11 +73,15 @@ export interface DriveSession {
 
 /** The parked-question input to {@link NeedsInputRelay.surface}. The executor
  *  derives it from `drive`'s awaiting-input JSON (`run_id` + the assigned
- *  `question_id` + the `{text,context,options}` question). */
+ *  `question_id` + the `{text,context,options,approval?}` question).
+ *
+ *  The question arrives UNVALIDATED (`UnvalidatedRelayQuestion`): its
+ *  `approval` marker is still drive's raw value, and `surface()` below is the
+ *  last hop before the frame boundary that judges it (c2 / 07 T2). */
 export interface SurfacedQuestion {
   run_id: string;
   question_id: string;
-  question: RelayQuestion;
+  question: UnvalidatedRelayQuestion;
 }
 
 /** The result of {@link NeedsInputRelay.surface}. */
@@ -153,7 +157,21 @@ export class NeedsInputRelay {
     const key = keyOf(q.run_id, q.question_id);
     const existing = this.pending.get(key);
     const id = existing?.id ?? this.makeId();
-    const frame = existing?.frame ?? buildNeedsInputFrame(q.run_id, q.question_id, q.question, id);
+    // c2 / 07 T2: the frame builder validates `question.approval` against the
+    // protocol's ApprovalSchema and DROPS a malformed one (the question then
+    // ships as an ordinary, non-gate question) — a fail-closed degradation
+    // that must be visible in the log, never silent. Note the `existing?.frame`
+    // reuse: a re-surface replays the frame validated on the FIRST surface, so
+    // an approval is judged exactly once per (run_id, question_id) identity and
+    // a re-surface can never smuggle a different marker onto the wire.
+    const frame =
+      existing?.frame ??
+      buildNeedsInputFrame(q.run_id, q.question_id, q.question, id, (detail) =>
+        this.logger.warn(
+          `needs_input for run ${q.run_id} question ${q.question_id} carried a malformed approval marker — ` +
+            `dropped, surfacing as an ordinary question (${detail})`
+        )
+      );
     this.pending.set(key, { runId: q.run_id, questionId: q.question_id, id, frame });
 
     const delivered = this.client.send(frame);

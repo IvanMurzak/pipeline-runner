@@ -79,6 +79,7 @@ import {
   classifyDriveOutcome,
   defaultProviderLimitDetector,
   type DriveMode,
+  type DriveQuestion,
   type DriveTarget,
   type ProviderLimit,
   type ProviderLimitDetector,
@@ -137,7 +138,11 @@ export interface ParkedQuestion {
   step_id: string | null;
   iteration_path: string;
   session_id: string | null;
-  question: { text: string; context: string | null; options: string[] | null };
+  /** The narrowed question, INCLUDING the T3-14 `approval` gate marker when
+   *  drive parked on a gate (c2). Still unvalidated here — see `DriveQuestion`
+   *  in `./drive` for why the runner never judges it before the relay's frame
+   *  boundary (07 T2). */
+  question: DriveQuestion;
 }
 
 /**

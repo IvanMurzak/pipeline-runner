@@ -34,6 +34,7 @@ import { systemClock } from '../core/clock';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import type { ShipperFileSystem } from '../shipper/fs';
+import type { DriveQuestion } from './drive';
 import type { ExecutionOverrides, LeaseMessage, PipelineRef } from './wire';
 import { sanitizeJobId } from './workspace';
 
@@ -50,7 +51,14 @@ export interface RecordedQuestion {
   step_id: string | null;
   iteration_path: string;
   session_id: string | null;
-  question: { text: string; context: string | null; options: string[] | null };
+  /** The parked question, INCLUDING the T3-14 `approval` gate marker (c2) —
+   *  otherwise a daemon death would DOWNGRADE a gate to an ordinary question
+   *  on re-surface, which is the same information loss this task closes, just
+   *  reached through the reconcile path. Persisted verbatim and unvalidated
+   *  (`DriveQuestion.approval` is `unknown`): the record is on-disk data, so
+   *  it is re-parsed by `ApprovalSchema` at the frame boundary EVERY time it
+   *  is re-surfaced — a hand-edited record cannot fabricate a gate. */
+  question: DriveQuestion;
 }
 
 /** The per-job durable record (04 schema + the additive fields later design
