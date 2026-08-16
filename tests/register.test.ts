@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { RegisterMessageSchema } from '@baizor/pipeline-protocol';
 import type { RunnerCapabilities } from '../src/core/capabilities';
 import { ConfigStore, type AgentIdentity } from '../src/core/config';
 import { applyRegisterAck, buildRegisterFrame, classifyReject, describeReject } from '../src/core/register';
@@ -38,6 +39,30 @@ describe('buildRegisterFrame', () => {
 
   test('advertises this agent protocol major', () => {
     expect(buildRegisterFrame(identity(), 'x').protocol_version).toBe(1);
+  });
+
+  // c4 (P2.5 chat): the a3 `chat_capable` handshake flag. Declared per
+  // CONNECTION, never inferred from a version — the cloud (d6) uses it as a
+  // hard gate, so a build that ships the code but wires no relay must not
+  // claim it.
+  describe('chat_capable (c4)', () => {
+    test('is omitted entirely when the caller does not declare it', () => {
+      expect(buildRegisterFrame(identity(), 'x')).not.toHaveProperty('chat_capable');
+      expect(buildRegisterFrame(identity(), 'x', TOKEN, {})).not.toHaveProperty('chat_capable');
+    });
+
+    test('is omitted — not sent as false — when the connection is not chat-capable', () => {
+      expect(buildRegisterFrame(identity(), 'x', TOKEN, { chatCapable: false })).not.toHaveProperty('chat_capable');
+    });
+
+    test('is sent as true when the connection wires the chat relay', () => {
+      expect(buildRegisterFrame(identity(), 'x', TOKEN, { chatCapable: true }).chat_capable).toBe(true);
+    });
+
+    test('is validated by the protocol schema alongside the rest of the frame', () => {
+      const frame = buildRegisterFrame(identity(), 'x', TOKEN, { chatCapable: true });
+      expect(RegisterMessageSchema.safeParse(frame).success).toBe(true);
+    });
   });
 
   // department-mesh d5 (P6, 13 §10.2): the SAME wire field carries either

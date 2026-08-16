@@ -309,6 +309,11 @@ export class JobExecutor {
   private resumeEarly: (() => void) | null = null;
   private consecutivePauses = 0;
   private questions = 0;
+  /** c4 (P2.5 chat): the question this job is CURRENTLY parked on, or null.
+   *  Set/cleared by `askRelay` — the single place this executor waits for an
+   *  answer, so both the fresh park and the c6 resume-from-record re-surface
+   *  are covered by construction. Read only through `chatTarget` below. */
+  private parked_: ParkedQuestion | null = null;
 
   // c6 interruption plumbing: `cancel()` (server cancel — no run_status) and
   // `suspend()` (graceful shutdown — record kept) share one mechanism: abort
@@ -351,6 +356,29 @@ export class JobExecutor {
   /** ISO time auto-resume is scheduled for, while `paused_provider_limit`. */
   get pausedUntil(): string | null {
     return this.pausedUntil_;
+  }
+
+  /**
+   * c4 (P2.5 chat, 07 T7): where a chat turn for this run would land, or null
+   * when this session is not awaiting input and therefore cannot take one.
+   *
+   * Satisfies `./chat-session.ts`'s `ChatCapableSession` structurally — the
+   * chat registry never sees the `ParkedQuestion` itself, only the question
+   * id it may deliver to and whether an approval gate stands in front of it.
+   *
+   * `approvalGated` uses PRESENCE semantics (`!= null`) on drive's RAW,
+   * unvalidated marker, and deliberately does not try to parse it. A marker
+   * this runner cannot recognize is still a marker: for the chat path,
+   * fail-closed means REFUSE, so an unparseable `approval` must read as
+   * gated. (The `needs_input` frame boundary in `../relay/wire-relay.ts`
+   * fails closed the other way — it drops an unparseable marker so the CLOUD
+   * is never told about a gate the runner could not verify. Both refuse to
+   * act on a marker they do not understand; only the safe action differs.)
+   */
+  get chatTarget(): { questionId: string; approvalGated: boolean } | null {
+    const parked = this.parked_;
+    if (parked === null) return null;
+    return { questionId: parked.question_id, approvalGated: parked.question.approval != null };
   }
 
   /** Fire a scheduled provider-limit resume NOW (manual override seam). */
@@ -947,8 +975,23 @@ export class JobExecutor {
   }
 
   /** Ask the relay for an answer, racing server cancel / shutdown suspend.
-   *  Returns either the answer text or the settled terminal result. */
+   *  Returns either the answer text or the settled terminal result.
+   *
+   *  c4: this is also the ONLY window in which `chatTarget` is non-null — the
+   *  park is published for the duration of the wait and retracted in the
+   *  `finally` on every exit path (answered, interrupted, relay throw), so a
+   *  chat turn can never be delivered into a session that has already
+   *  resumed. */
   private async askRelay(parked: ParkedQuestion): Promise<{ answer: string; settled: null } | { answer: null; settled: JobResult }> {
+    this.parked_ = parked;
+    try {
+      return await this.awaitAnswer(parked);
+    } finally {
+      this.parked_ = null;
+    }
+  }
+
+  private async awaitAnswer(parked: ParkedQuestion): Promise<{ answer: string; settled: null } | { answer: null; settled: JobResult }> {
     let answer: string | null;
     try {
       answer = await Promise.race([Promise.resolve(this.needsInput.onQuestion(parked)), this.interrupted()]);

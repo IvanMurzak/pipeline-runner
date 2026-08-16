@@ -104,6 +104,14 @@ export interface AgentClientOptions {
    *  which for an un-migrated identity resolves to the legacy runner token with
    *  no I/O — i.e. exactly the pre-P6 behaviour. Injected by tests. */
   registerCredentials?: RegisterCredentialProvider;
+  /** c4 (P2.5 chat): the handshake's `chat_capable` declaration, read at each
+   *  REGISTER (not once at construction) so it reflects whether the chat
+   *  relay is actually attached by the time this connection announces itself
+   *  — the wiring in `../cli.ts` completes after the client is built. Absent
+   *  ⇒ false ⇒ the field is omitted and the cloud will not send chat, which
+   *  is the correct answer for every connection that wires no relay (the
+   *  `register` command's validation connection, most tests). */
+  chatCapable?(): boolean;
   events?: AgentClientEvents;
 }
 
@@ -310,7 +318,9 @@ export class AgentClient {
     // answer in, however long resolving the credential took.
     this.armRegisterTimer();
     // The register frame is the FIRST frame on the connection, always.
-    connection?.send(buildRegisterFrame(identity, registerId, credential.value));
+    connection?.send(
+      buildRegisterFrame(identity, registerId, credential.value, { chatCapable: this.options.chatCapable?.() === true })
+    );
   }
 
   /** (Re)start the register deadline. Idempotent — clears any armed timer. */

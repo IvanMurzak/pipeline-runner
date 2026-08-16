@@ -29,6 +29,26 @@ import type { ConfigStore } from './config';
 import type { RegisterAckMessage, RegisterMessage, RegisterRejectMessage } from './wire';
 import { PROTOCOL_VERSION } from './wire';
 
+/** Per-connection capability declarations that are a property of THIS
+ *  process's wiring rather than of the persisted identity. */
+export interface RegisterCapabilityFlags {
+  /**
+   * c4 (P2.5 chat): does this connection actually route an inbound
+   * `chat_send` into the named run's executor session?
+   *
+   * Must be declared TRUTHFULLY — the cloud (d6) uses it as a hard gate on
+   * whether it may send chat at all, and specifically to tell "chat
+   * unavailable, old runner" apart from "chat unavailable, offline". It is
+   * therefore a fact about the chat relay being wired on this connection, not
+   * about the package version: a build that ships the code but never attaches
+   * the relay (the bare `register`-command validation connection, for
+   * instance) is NOT chat-capable and must not claim to be. Omitted/false ⇒
+   * the cloud will not send chat, which is the correct, degraded-but-honest
+   * outcome.
+   */
+  chatCapable?: boolean;
+}
+
 /**
  * Build the `register` frame — the FIRST frame on every connection. `id` is
  * the correlation id echoed by the reply.
@@ -37,8 +57,16 @@ import { PROTOCOL_VERSION } from './wire';
  * ⇒ the identity's legacy `runner_token`, which is the pre-P6 behaviour and the
  * shape every existing caller/test uses. It throws only when there is nothing
  * at all to present, which `ConfigStore.load()` already rejects upstream.
+ *
+ * `capabilities` carries per-connection flags (c4's `chat_capable`) that no
+ * persisted identity can answer for — see {@link RegisterCapabilityFlags}.
  */
-export function buildRegisterFrame(identity: AgentIdentity, id: string, credential?: string): RegisterMessage {
+export function buildRegisterFrame(
+  identity: AgentIdentity,
+  id: string,
+  credential?: string,
+  capabilities?: RegisterCapabilityFlags
+): RegisterMessage {
   const runnerToken = credential ?? identity.runner_token;
   if (runnerToken === undefined || runnerToken.length === 0) {
     throw new Error('cannot build a register frame: no register credential available');
@@ -60,6 +88,12 @@ export function buildRegisterFrame(identity: AgentIdentity, id: string, credenti
   // Omitted (not `null`) when this identity predates d7 / was never
   // re-registered, exactly like `capacity` above.
   if (identity.capabilities !== undefined) frame.capabilities = identity.capabilities;
+  // c4 (P2.5 chat): the a3 `chat_capable` handshake flag — a TYPED optional
+  // field in protocol 0.9.0, unlike the `capabilities` object above. Emitted
+  // ONLY when true: absent and `false` mean the same thing to the cloud, and
+  // an absent field keeps a non-chat connection's frame byte-identical to
+  // before this change.
+  if (capabilities?.chatCapable === true) frame.chat_capable = true;
   return frame;
 }
 

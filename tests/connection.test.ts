@@ -86,6 +86,34 @@ describe('register handshake over the connection', () => {
     expect(frame.id).toBeDefined();
   });
 
+  // c4 (P2.5 chat): `chat_capable` is read at EVERY register, not captured at
+  // construction — the daemon (`../src/cli.ts`) finishes wiring the chat relay
+  // after building the client, and a connection must never claim a capability
+  // that is not attached yet.
+  test('chat_capable is omitted when no chat relay is wired on this connection', async () => {
+    const world = makeWorld();
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!).not.toHaveProperty('chat_capable');
+  });
+
+  test('chat_capable is read fresh at each register, so late wiring is declared truthfully', async () => {
+    let wired = false;
+    const world = makeWorld({ clientOverrides: { chatCapable: () => wired } });
+    world.client.start();
+    await tick();
+    expect(world.wss.last.sent[0]!).not.toHaveProperty('chat_capable');
+
+    // The relay attaches, then the socket flaps and re-registers.
+    wired = true;
+    world.wss.last.serverSend({ type: 'register_reject', reason: 'capacity' });
+    await tick();
+    world.clock.advance(60_000);
+    await tick();
+    expect(world.wss.last.sent[0]!.type).toBe('register');
+    expect(world.wss.last.sent[0]!.chat_capable).toBe(true);
+  });
+
   test('register_ack → online, runner_id + cadence persisted, backoff reset, onOnline fired', async () => {
     const world = makeWorld();
     await goOnline(world, 15);

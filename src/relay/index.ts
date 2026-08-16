@@ -13,3 +13,8 @@
 export * from './wire-relay';
 export * from './bridge';
 export * from './adapter';
+// c4 (P2.5 chat): the run-bound chat channel — a SECOND frame pair on the
+// SAME connection and the SAME bridge (M6: no second transport), never a
+// second relay stack. See `./chat.ts`.
+export * from './chat-wire';
+export * from './chat';
