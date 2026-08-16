@@ -245,7 +245,7 @@ describe('chat channel, end to end over the real relay bridge', () => {
     await tick();
 
     expect(world.exec.of('pipeline')).toHaveLength(drivesBefore);
-    expect(chatReplies(world.sink)[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionUnavailable });
+    expect(chatReplies(world.sink)[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionGated });
     expect(world.manager.activeSession('run-2')?.chatTarget?.approvalGated).toBe(true);
   });
 
@@ -258,7 +258,7 @@ describe('chat channel, end to end over the real relay bridge', () => {
     world.dispatcher.dispatch(chatSend('run-2', 'msg-1', 'approved'));
     await tick();
 
-    expect(chatReplies(world.sink)[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionUnavailable });
+    expect(chatReplies(world.sink)[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionGated });
   });
 
   test('a running (not parked) session refuses the turn rather than queueing it', async () => {
@@ -270,7 +270,7 @@ describe('chat channel, end to end over the real relay bridge', () => {
 
     const replies = chatReplies(world.sink);
     expect(replies).toHaveLength(1);
-    expect(replies[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionUnavailable });
+    expect(replies[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionBusy });
   });
 
   test('chatTarget is retracted the moment the session resumes', async () => {

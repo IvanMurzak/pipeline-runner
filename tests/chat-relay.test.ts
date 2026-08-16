@@ -10,10 +10,16 @@
 
 import { describe, expect, test } from 'bun:test';
 import { CHAT_MESSAGE_MAX_CHARS, ChatReplyMessageSchema, ChatSendMessageSchema } from '@baizor/pipeline-protocol';
-import { ChatRelay, type ChatReplySink, type ChatSessionHandle, type ChatSessionRegistry } from '../src/relay/chat';
+import {
+  ChatRelay,
+  type ChatRelayOptions,
+  type ChatReplySink,
+  type ChatSessionHandle,
+  type ChatSessionRegistry,
+} from '../src/relay/chat';
 import { CHAT_ERROR_CODES } from '../src/relay/chat-wire';
 import { jobChatRegistry, type ChatCapableSession } from '../src/jobs/chat-session';
-import type { RelayClientPort } from '../src/relay/bridge';
+import type { PendingDeliveryOutcome, RelayClientPort } from '../src/relay/bridge';
 import type { WireFrame } from '../src/core/wire';
 import { CaptureLogger } from './_helpers';
 
@@ -77,7 +83,12 @@ function registryOf(...sessions: ChatSessionHandle[]): ChatSessionRegistry {
 }
 
 let stamps = 0;
-function makeRelay(sessions: ChatSessionRegistry, options: { maxRememberedTurns?: number } = {}) {
+type RelayBudgets = Pick<
+  ChatRelayOptions,
+  'maxRememberedTurns' | 'maxRememberedRuns' | 'maxRememberedRejections' | 'maxInFlightTurns'
+>;
+
+function makeRelay(sessions: ChatSessionRegistry, options: RelayBudgets = {}) {
   const client = new MockClientPort();
   const logger = new CaptureLogger();
   const relay = new ChatRelay({
@@ -85,7 +96,7 @@ function makeRelay(sessions: ChatSessionRegistry, options: { maxRememberedTurns?
     sessions,
     logger,
     now: () => new Date(Date.UTC(2026, 7, 15, 0, 0, ++stamps % 60)).toISOString(),
-    ...(options.maxRememberedTurns === undefined ? {} : { maxRememberedTurns: options.maxRememberedTurns }),
+    ...options,
   });
   return { client, logger, relay };
 }
@@ -228,6 +239,31 @@ describe('chat_reply', () => {
     expect(ChatReplyMessageSchema.safeParse(reply).success).toBe(true);
   });
 
+  // review A2: truncation is MARKED, so a reader can tell a clamped answer
+  // from a whole one.
+  test('a clamped chunk is flagged truncated on the wire and warned about in the log', () => {
+    const { client, logger } = makeRelay(
+      registryOf(new RecordingSession('run-1', (r) => r.done('y'.repeat(CHAT_MESSAGE_MAX_CHARS + 500))))
+    );
+
+    client.serverSend(chatSend());
+
+    const reply = client.replies()[0]!;
+    expect(reply.truncated).toBe(true);
+    expect(logger.joined()).toContain('500 characters dropped');
+    // The flag rides the schema's passthrough rather than breaking the parse.
+    expect(ChatReplyMessageSchema.safeParse(reply).success).toBe(true);
+  });
+
+  test('a chunk within the cap carries no truncation flag at all', () => {
+    const { client, logger } = makeRelay(registryOf(new RecordingSession('run-1', (r) => r.done('short'))));
+
+    client.serverSend(chatSend());
+
+    expect(client.replies()[0]).not.toHaveProperty('truncated');
+    expect(logger.joined()).not.toContain('truncated');
+  });
+
   test('an offline connection loses the reply but still settles the turn for replay', () => {
     const { client } = makeRelay(registryOf(new RecordingSession('run-1')));
     client.online = false;
@@ -347,6 +383,29 @@ describe('malformed chat_send', () => {
 
     expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.internalError });
   });
+
+  // review A1: the UI-bound frame gets the code and a generic sentence; the
+  // exception's own text is operator-only. An internal exception message can
+  // interpolate a path, a config value, or anything else the throwing seam
+  // had to hand — not a class of text to forward outward by default.
+  test('the internal_error frame does NOT echo the exception text, but the log does', () => {
+    const leak = 'INTERNAL-DETAIL-/srv/secrets/host.key';
+    const { client, logger } = makeRelay(
+      registryOf(
+        new RecordingSession('run-1', () => {
+          throw new Error(leak);
+        })
+      )
+    );
+
+    client.serverSend(chatSend());
+
+    const error = client.replies()[0]!.error as Record<string, unknown>;
+    expect(error.code).toBe(CHAT_ERROR_CODES.internalError);
+    expect(String(error.message)).not.toContain(leak);
+    expect(JSON.stringify(client.replies()[0])).not.toContain(leak);
+    expect(logger.joined()).toContain(leak);
+  });
 });
 
 // ── Redelivery (F7) ─────────────────────────────────────────────────────────
@@ -412,14 +471,157 @@ describe('redelivery dedupe on (run_id, message_id)', () => {
     release!();
   });
 
-  test('remembered turns are bounded', () => {
+  test("a run's replay memory is bounded, oldest first", () => {
     const target = new RecordingSession('run-1');
     const { relay, client } = makeRelay(registryOf(target), { maxRememberedTurns: 3 });
 
     for (let i = 0; i < 10; i += 1) client.serverSend(chatSend({ message_id: `msg-${i}` }));
 
     expect(target.delivered).toHaveLength(10);
+    expect(relay.rememberedTurnsFor('run-1')).toBe(3);
+  });
+});
+
+// ── Review B1: the redelivery memory must not be cheaply flushable ──────────
+
+describe('redelivery memory is not cheaply flushable (B1)', () => {
+  /** Frames for runs this runner does not own — free to produce, and the
+   *  lever the finding was about. */
+  function floodNotOwned(client: MockClientPort, count: number): void {
+    for (let i = 0; i < count; i += 1) {
+      client.serverSend(chatSend({ run_id: `run-nobody-${i}`, message_id: `flood-${i}` }));
+    }
+  }
+
+  test('B1(a): a flood of not_owned frames cannot evict a delivered turn — the redelivery still replays and injects nothing', () => {
+    const target = new RecordingSession('run-1');
+    // Deliberately tiny budgets: if rejections shared the delivered turns'
+    // budget, four flood frames would be more than enough to evict.
+    const { client, relay } = makeRelay(registryOf(target), {
+      maxRememberedTurns: 2,
+      maxRememberedRejections: 2,
+    });
+
+    client.serverSend(chatSend({ message_id: 'msg-real', message: 'deploy to prod-eu-1' }));
+    expect(target.delivered).toEqual(['deploy to prod-eu-1']);
+    const original = client.replies()[0]!;
+
+    floodNotOwned(client, 50);
+    expect(relay.rememberedTurnsFor('run-1')).toBe(1);
+    // The structural claim, stated so it fails loudly if the budgets are ever
+    // merged again: 1 delivered turn (run-1's bucket) + 2 rejections (that
+    // store's own cap). Under ONE shared cap of 2 this would be 2, and the
+    // delivered turn would be the entry that got evicted.
     expect(relay.trackedTurns).toBe(3);
+
+    // The F7 redelivery lands AFTER the flood. Before the fix this was
+    // indistinguishable from a new turn and would have been injected a second
+    // time — into whatever question the session is parked on now.
+    client.serverSend(chatSend({ message_id: 'msg-real', message: 'deploy to prod-eu-1' }));
+
+    expect(target.delivered).toEqual(['deploy to prod-eu-1']);
+    expect(client.replies().at(-1)).toEqual(original);
+  });
+
+  test('B1(b): an in-flight turn survives a flood of not_owned frames and is still deduped', () => {
+    let release: (() => void) | null = null;
+    const target = new RecordingSession(
+      'run-1',
+      (r) =>
+        new Promise<void>((resolve) => {
+          release = () => {
+            r.done('finally');
+            resolve();
+          };
+        })
+    );
+    const { client, relay, logger } = makeRelay(registryOf(target), {
+      maxRememberedTurns: 1,
+      maxRememberedRejections: 1,
+    });
+
+    client.serverSend(chatSend({ message_id: 'msg-slow', message: 'a slow turn' }));
+    expect(relay.inFlightTurns).toBe(1);
+
+    floodNotOwned(client, 50);
+
+    // Still exactly one in-flight turn: nothing evicted it.
+    expect(relay.inFlightTurns).toBe(1);
+    // And its repeat is still recognised and dropped, not re-injected.
+    client.serverSend(chatSend({ message_id: 'msg-slow', message: 'a slow turn' }));
+    expect(target.delivered).toEqual(['a slow turn']);
+    expect(logger.joined()).toContain('in-flight turn — dropped');
+
+    release!();
+  });
+
+  test("one run's traffic cannot flush another run's replay memory", () => {
+    const noisy = new RecordingSession('run-noisy');
+    const quiet = new RecordingSession('run-quiet');
+    const { client, relay } = makeRelay(registryOf(noisy, quiet), { maxRememberedTurns: 2 });
+
+    client.serverSend(chatSend({ run_id: 'run-quiet', message_id: 'msg-q', message: 'the important one' }));
+    const original = client.replies()[0]!;
+
+    for (let i = 0; i < 40; i += 1) {
+      client.serverSend(chatSend({ run_id: 'run-noisy', message_id: `msg-n-${i}`, message: 'chatter' }));
+    }
+
+    expect(relay.rememberedTurnsFor('run-noisy')).toBe(2);
+    expect(relay.rememberedTurnsFor('run-quiet')).toBe(1);
+
+    client.serverSend(chatSend({ run_id: 'run-quiet', message_id: 'msg-q', message: 'the important one' }));
+    expect(quiet.delivered).toEqual(['the important one']);
+    expect(client.replies().at(-1)).toEqual(original);
+  });
+
+  test('the run-bucket cap evicts the LEAST RECENTLY used run, not an actively chatting one', () => {
+    const sessions = Array.from({ length: 4 }, (_, i) => new RecordingSession(`run-${i}`));
+    const { client, relay } = makeRelay(registryOf(...sessions), { maxRememberedRuns: 2 });
+
+    client.serverSend(chatSend({ run_id: 'run-0', message_id: 'a' }));
+    client.serverSend(chatSend({ run_id: 'run-1', message_id: 'b' }));
+    // run-0 speaks again — it is now the most recent, so run-1 is the victim.
+    client.serverSend(chatSend({ run_id: 'run-0', message_id: 'c' }));
+    client.serverSend(chatSend({ run_id: 'run-2', message_id: 'd' }));
+
+    expect(relay.rememberedTurnsFor('run-0')).toBe(2);
+    expect(relay.rememberedTurnsFor('run-1')).toBe(0);
+    expect(relay.rememberedTurnsFor('run-2')).toBe(1);
+  });
+
+  test('at the in-flight cap the NEW turn is refused — an accepted one is never forgotten', () => {
+    const held: Array<() => void> = [];
+    const target = new RecordingSession(
+      'run-1',
+      (r) => new Promise<void>((resolve) => held.push(() => (r.done('done'), resolve())))
+    );
+    const { client, relay } = makeRelay(registryOf(target), { maxInFlightTurns: 2 });
+
+    client.serverSend(chatSend({ message_id: 'msg-1' }));
+    client.serverSend(chatSend({ message_id: 'msg-2' }));
+    client.serverSend(chatSend({ message_id: 'msg-3' }));
+
+    expect(relay.inFlightTurns).toBe(2);
+    expect(target.delivered).toHaveLength(2);
+    expect(client.replies()).toHaveLength(1);
+    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.tooManyTurns });
+
+    for (const settle of held) settle();
+    expect(relay.inFlightTurns).toBe(0);
+  });
+
+  test('a forgotten rejection is safely re-derived — it re-refuses and injects nothing', () => {
+    const target = new RecordingSession('run-1');
+    const { client } = makeRelay(registryOf(target), { maxRememberedRejections: 1 });
+
+    client.serverSend(chatSend({ run_id: 'run-nope', message_id: 'msg-1' }));
+    client.serverSend(chatSend({ run_id: 'run-nope', message_id: 'msg-2' })); // evicts msg-1
+
+    client.serverSend(chatSend({ run_id: 'run-nope', message_id: 'msg-1' }));
+
+    expect(target.delivered).toEqual([]);
+    expect(client.replies().at(-1)!.error).toMatchObject({ code: CHAT_ERROR_CODES.notOwned });
   });
 });
 
@@ -430,7 +632,7 @@ describe('jobChatRegistry (ownership over live executors)', () => {
     return { runId, chatTarget: target };
   }
 
-  function setup(sessions: ChatCapableSession[], deliverResult = true) {
+  function setup(sessions: ChatCapableSession[], deliverResult: PendingDeliveryOutcome = 'delivered') {
     const calls: Array<{ runId: string; questionId: string; text: string }> = [];
     const registry = jobChatRegistry({
       jobs: { activeSession: (runId) => sessions.find((s) => s.runId === runId) ?? null },
@@ -476,32 +678,48 @@ describe('jobChatRegistry (ownership over live executors)', () => {
     expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.notOwned });
   });
 
-  test('an owned but NOT-parked session refuses with session_unavailable', () => {
+  // review A3: three distinct refusals, three distinct codes — e9 renders a
+  // different affordance for each, and one shared code could express none.
+  test('an owned but NOT-parked session refuses with session_busy', () => {
     const { calls, client } = setup([session('run-1', null)]);
 
     client.serverSend(chatSend());
 
     expect(calls).toEqual([]);
-    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionUnavailable });
+    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionBusy });
   });
 
-  test('an APPROVAL-GATED park refuses chat — a gate must not be cleared by a chat turn', () => {
+  test('an APPROVAL-GATED park refuses chat with session_gated — a gate must not be cleared by a chat turn', () => {
     const { calls, client } = setup([session('run-1', { questionId: 'q-7', approvalGated: true })]);
 
     client.serverSend(chatSend({ message: 'yes, approve it' }));
 
     expect(calls).toEqual([]);
     const error = client.replies()[0]!.error as Record<string, unknown>;
-    expect(error.code).toBe(CHAT_ERROR_CODES.sessionUnavailable);
+    expect(error.code).toBe(CHAT_ERROR_CODES.sessionGated);
     expect(String(error.message)).toContain('approval');
   });
 
-  test('a park resolved between lookup and delivery loses the race cleanly', () => {
-    const { client } = setup([session('run-1', { questionId: 'q-7', approvalGated: false })], false);
+  test('a park resolved between lookup and delivery refuses with session_gone', () => {
+    const { client } = setup([session('run-1', { questionId: 'q-7', approvalGated: false })], 'not_pending');
 
     client.serverSend(chatSend());
 
-    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionUnavailable });
+    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.sessionGone });
+  });
+
+  test('a resume that failed is internal_error, distinct from the lost-race code', () => {
+    const { client } = setup([session('run-1', { questionId: 'q-7', approvalGated: false })], 'resume_failed');
+
+    client.serverSend(chatSend());
+
+    expect(client.replies()[0]!.error).toMatchObject({ code: CHAT_ERROR_CODES.internalError });
+  });
+
+  test('the three session refusals are all distinct codes, and none is the coarse legacy one', () => {
+    const codes = [CHAT_ERROR_CODES.sessionBusy, CHAT_ERROR_CODES.sessionGated, CHAT_ERROR_CODES.sessionGone];
+    expect(new Set(codes).size).toBe(3);
+    expect(codes).not.toContain('session_unavailable');
   });
 
   test('a registry-level run-id mismatch is refused rather than delivered', () => {
@@ -512,7 +730,7 @@ describe('jobChatRegistry (ownership over live executors)', () => {
       delivery: {
         deliverPending: (runId) => {
           calls.push(runId);
-          return true;
+          return 'delivered';
         },
       },
     });

@@ -335,7 +335,7 @@ describe('deliverPending (c4 chat delivery seam)', () => {
     const { relay, drive } = makeRelay();
     relay.surface(question('run-1', 'q-1'));
 
-    expect(relay.deliverPending('run-1', 'q-1', 'chat text')).toBe(true);
+    expect(relay.deliverPending('run-1', 'q-1', 'chat text')).toBe('delivered');
 
     expect(drive.calls).toEqual([{ runId: 'run-1', questionId: 'q-1', answerText: 'chat text' }]);
     expect(relay.hasPending('run-1', 'q-1')).toBe(false);
@@ -346,9 +346,9 @@ describe('deliverPending (c4 chat delivery seam)', () => {
     const { relay, drive } = makeRelay();
     relay.surface(question('run-1', 'q-1'));
 
-    expect(relay.deliverPending('run-1', 'q-OTHER', 'x')).toBe(false);
-    expect(relay.deliverPending('run-OTHER', 'q-1', 'x')).toBe(false);
-    expect(relay.deliverPending('run-2', 'q-2', 'x')).toBe(false);
+    expect(relay.deliverPending('run-1', 'q-OTHER', 'x')).toBe('not_pending');
+    expect(relay.deliverPending('run-OTHER', 'q-1', 'x')).toBe('not_pending');
+    expect(relay.deliverPending('run-2', 'q-2', 'x')).toBe('not_pending');
 
     expect(drive.calls).toEqual([]);
     expect(relay.hasPending('run-1', 'q-1')).toBe(true);
@@ -358,8 +358,8 @@ describe('deliverPending (c4 chat delivery seam)', () => {
     const { relay, drive, client } = makeRelay();
     relay.surface(question('run-1', 'q-1'));
 
-    expect(relay.deliverPending('run-1', 'q-1', 'chat first')).toBe(true);
-    expect(relay.deliverPending('run-1', 'q-1', 'chat again')).toBe(false);
+    expect(relay.deliverPending('run-1', 'q-1', 'chat first')).toBe('delivered');
+    expect(relay.deliverPending('run-1', 'q-1', 'chat again')).toBe('not_pending');
     client.serverSend(answerFrame('run-1', 'q-1', 'answer later', { id: 'corr-1' }));
 
     expect(drive.calls).toEqual([{ runId: 'run-1', questionId: 'q-1', answerText: 'chat first' }]);
@@ -370,7 +370,7 @@ describe('deliverPending (c4 chat delivery seam)', () => {
     relay.surface(question('run-1', 'q-1'));
 
     client.serverSend(answerFrame('run-1', 'q-1', 'answer first', { id: 'corr-1' }));
-    expect(relay.deliverPending('run-1', 'q-1', 'chat too late')).toBe(false);
+    expect(relay.deliverPending('run-1', 'q-1', 'chat too late')).toBe('not_pending');
 
     expect(drive.calls).toEqual([{ runId: 'run-1', questionId: 'q-1', answerText: 'answer first' }]);
   });
@@ -390,10 +390,41 @@ describe('deliverPending (c4 chat delivery seam)', () => {
     const { relay, logger } = makeRelay({ drive });
     relay.surface(question('run-1', 'q-1'));
 
-    expect(relay.deliverPending('run-1', 'q-1', 'chat text')).toBe(true);
+    // The resume STARTED, so `delivered` is the honest synchronous answer; the
+    // rejection is the caller's async problem (ChatRelay turns it into an
+    // internal_error terminal frame) and is logged here either way.
+    expect(relay.deliverPending('run-1', 'q-1', 'chat text')).toBe('delivered');
     await Promise.resolve();
     await Promise.resolve();
 
     expect(logger.joined()).toContain('resume blew up');
+  });
+
+  // review A8: a resume that throws must never be reported as a delivery.
+  test('a DriveSession that throws synchronously reports resume_failed, not delivered', () => {
+    const drive = new RecordingDrive(() => {
+      throw new Error('resume threw outright');
+    });
+    const { relay, logger } = makeRelay({ drive });
+    relay.surface(question('run-1', 'q-1'));
+
+    expect(relay.deliverPending('run-1', 'q-1', 'chat text')).toBe('resume_failed');
+    expect(logger.joined()).toContain('resume threw outright');
+    // The entry is consumed either way — once-only outranks retryability, so
+    // the question does not come back as pending (see the method doc).
+    expect(relay.hasPending('run-1', 'q-1')).toBe(false);
+    expect(relay.deliverPending('run-1', 'q-1', 'retry')).toBe('not_pending');
+  });
+
+  test('an answer frame whose resume throws is contained, not propagated to the dispatcher', () => {
+    const drive = new RecordingDrive(() => {
+      throw new Error('answer resume threw');
+    });
+    const { relay, client, logger } = makeRelay({ drive });
+    relay.surface(question('run-1', 'q-1'));
+
+    client.serverSend(answerFrame('run-1', 'q-1', 'ok', { id: 'corr-1' }));
+
+    expect(logger.joined()).toContain('answer resume threw');
   });
 });

@@ -67,23 +67,42 @@ export type { ChatReplyError, ChatReplyMessage, ChatSendMessage } from '@baizor/
  * a typo in a code string is a silent contract break for the cloud's d6/e9
  * handling, and there is no schema to catch it.
  *
- *   - `not_owned`           — the `chat_send` named a run this runner does not
- *                             own a live executor session for (07 T7). THE
- *                             security rejection.
- *   - `session_unavailable` — owned, but the session cannot take this turn
- *                             (not parked, parked behind an approval gate, or
- *                             the park was resolved from under us).
- *   - `message_too_large`   — the inbound text exceeded
- *                             {@link CHAT_MESSAGE_MAX_CHARS}.
- *   - `invalid_message`     — owned, but the frame failed the canonical parse
- *                             for some other reason.
- *   - `internal_error`      — an unexpected runner-side failure mid-turn.
+ *   - `not_owned`         — the `chat_send` named a run this runner does not
+ *                           own a live executor session for (07 T7). THE
+ *                           security rejection.
+ *   - `session_busy`      — owned, but the session is mid-turn and not parked,
+ *                           so it cannot take a chat turn right now.
+ *   - `session_gated`     — owned and parked, but behind an APPROVAL GATE,
+ *                           which chat must not clear (see
+ *                           `../jobs/chat-session.ts`).
+ *   - `session_gone`      — owned when we looked, but the park was resolved
+ *                           before the text could be delivered.
+ *   - `message_too_large` — the inbound text exceeded
+ *                           {@link CHAT_MESSAGE_MAX_CHARS}.
+ *   - `invalid_message`   — owned, but the frame failed the canonical parse
+ *                           for some other reason.
+ *   - `too_many_turns`    — the runner is already servicing its cap of
+ *                           concurrent turns; retryable.
+ *   - `internal_error`    — an unexpected runner-side failure mid-turn.
+ *
+ * NOTE FOR THE CLOUD (d6 / e9): the protocol's own doc names
+ * `session_unavailable` as one documented value, and this runner deliberately
+ * emits **three** codes in its place — `session_busy`, `session_gated` and
+ * `session_gone`. They are three genuinely different situations with three
+ * different affordances (wait and retry / go answer the approval / the moment
+ * has passed), and collapsing them leaves a UI unable to say which. Any
+ * receiver that wants the old coarse behaviour can treat the `session_*`
+ * prefix as one class; the split only ever adds information. This runner
+ * never emits the literal string `session_unavailable`.
  */
 export const CHAT_ERROR_CODES = {
   notOwned: 'not_owned',
-  sessionUnavailable: 'session_unavailable',
+  sessionBusy: 'session_busy',
+  sessionGated: 'session_gated',
+  sessionGone: 'session_gone',
   messageTooLarge: 'message_too_large',
   invalidMessage: 'invalid_message',
+  tooManyTurns: 'too_many_turns',
   internalError: 'internal_error',
 } as const;
 
@@ -150,6 +169,9 @@ export interface BuildChatReplyInput {
   ts: string;
   envelopeId?: string;
   error?: ChatReplyError;
+  /** Called when the outbound text had to be clamped, with how many
+   *  characters were dropped. The caller logs it; see {@link buildChatReplyFrame}. */
+  onTruncated?: (droppedChars: number) => void;
 }
 
 /**
@@ -161,16 +183,29 @@ export interface BuildChatReplyInput {
  * `done:true` chunk means the turn never terminates for the UI. Truncating is
  * the fail-visible choice; emitting an unparseable terminal frame is silence
  * wearing a frame's clothes.
+ *
+ * Truncation is MARKED, not silent (review A2). The clamped frame carries an
+ * additive `truncated: true` (the schema is `.passthrough()`, so it rides
+ * along on a same-major peer), and `onTruncated` fires so the runner log says
+ * so too. A flag rather than an appended "…" suffix on purpose: a suffix is
+ * indistinguishable from content the session actually produced, which is the
+ * wrong thing for a reader trying to decide whether they are looking at a
+ * whole answer.
  */
 export function buildChatReplyFrame(input: BuildChatReplyInput): ChatReplyMessage {
+  const dropped = Math.max(0, input.message.length - CHAT_MESSAGE_MAX_CHARS);
   const frame: ChatReplyMessage = {
     type: 'chat_reply',
     run_id: input.runId,
     message_id: input.messageId,
-    message: input.message.length > CHAT_MESSAGE_MAX_CHARS ? input.message.slice(0, CHAT_MESSAGE_MAX_CHARS) : input.message,
+    message: dropped > 0 ? input.message.slice(0, CHAT_MESSAGE_MAX_CHARS) : input.message,
     done: input.done,
     ts: input.ts,
   };
+  if (dropped > 0) {
+    frame.truncated = true;
+    input.onTruncated?.(dropped);
+  }
   if (input.envelopeId !== undefined) frame.id = input.envelopeId;
   if (input.error !== undefined) frame.error = input.error;
   return frame;

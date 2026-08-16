@@ -57,6 +57,7 @@
 
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
+import type { PendingDeliveryOutcome } from '../relay/bridge';
 import type { ChatReplySink, ChatSessionHandle, ChatSessionRegistry } from '../relay/chat';
 import { CHAT_ERROR_CODES } from '../relay/chat-wire';
 
@@ -87,12 +88,14 @@ export interface JobSessionSource {
 
 /**
  * The needs-input bridge's text-delivery seam (`../relay/bridge.ts`'s
- * `NeedsInputRelay.deliverPending`). Returns false when the named question is
- * no longer pending — the race guard for a park resolved by a real `answer`
- * between this registry's lookup and its delivery.
+ * `NeedsInputRelay.deliverPending`). Its three-way outcome distinguishes the
+ * race guard (`not_pending` — a park resolved by a real `answer` between this
+ * registry's lookup and its delivery) from a genuine runner-side failure
+ * (`resume_failed`), so each gets its own chat error code instead of one
+ * blurred answer.
  */
 export interface ChatDeliveryPort {
-  deliverPending(runId: string, questionId: string, text: string): boolean;
+  deliverPending(runId: string, questionId: string, text: string): PendingDeliveryOutcome;
 }
 
 export interface JobChatRegistryOptions {
@@ -129,28 +132,42 @@ export function jobChatRegistry(options: JobChatRegistryOptions): ChatSessionReg
       return {
         runId: session.runId,
         deliver(message: string, replies: ChatReplySink): void {
+          // Three refusals, three CODES (review A3). "Wait, it is thinking",
+          // "go and approve it", and "the moment has passed" are different
+          // things for a user to be told and different affordances for e9 to
+          // render; one shared `session_unavailable` could express none of
+          // them. See `../relay/chat-wire.ts` for the full code list.
           const target = session.chatTarget;
           if (target === null) {
             replies.fail(
-              CHAT_ERROR_CODES.sessionUnavailable,
-              "the run's executor session is not awaiting input; a chat turn can only be delivered to a parked session"
+              CHAT_ERROR_CODES.sessionBusy,
+              "the run's executor session is mid-turn; a chat turn can only be delivered to a session awaiting input"
             );
             return;
           }
           if (target.approvalGated) {
             replies.fail(
-              CHAT_ERROR_CODES.sessionUnavailable,
+              CHAT_ERROR_CODES.sessionGated,
               'the run is parked on an approval-gated question — it must be answered through the approval path, not chat'
             );
             return;
           }
           // The run id handed to the delivery port is the SESSION's, closed
           // over above — never a value read off the inbound frame.
-          if (!options.delivery.deliverPending(session.runId, target.questionId, message)) {
+          const outcome = options.delivery.deliverPending(session.runId, target.questionId, message);
+          if (outcome === 'not_pending') {
             replies.fail(
-              CHAT_ERROR_CODES.sessionUnavailable,
+              CHAT_ERROR_CODES.sessionGone,
               'the session resolved its pending question before the chat message could be delivered'
             );
+            return;
+          }
+          if (outcome === 'resume_failed') {
+            // The run did not resume. Distinct from the race above: nothing
+            // about the timing was ordinary, and an operator needs to look at
+            // the runner log rather than simply retry.
+            logger.error(`chat delivery for run ${session.runId} could not resume the session`);
+            replies.fail(CHAT_ERROR_CODES.internalError, 'the runner could not resume the session for this chat turn');
             return;
           }
           // The turn terminates with no content: this runner has no way to

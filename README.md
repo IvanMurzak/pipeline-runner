@@ -430,14 +430,29 @@ it:
 
 - **Only a session parked awaiting input can take a chat turn.** There is no
   way to inject text into a `pipeline drive` invocation that is mid-turn, so a
-  running session answers `error.code = "session_unavailable"`.
-- **A park behind an approval gate refuses chat.** Because delivery *is* the
-  answer path, letting a chat turn through would clear an approval whose whole
-  point is that a specific role must give it.
+  running session answers `error.code = "session_busy"`.
+- **A park behind an approval gate refuses chat** (`session_gated`). Because
+  delivery *is* the answer path, letting a chat turn through would clear an
+  approval whose whole point is that a specific role must give it.
+
+A delivered turn completes with an **empty** final chunk: the runner has no way
+to stream the session's own prose back over `chat_reply`, so that output
+continues to arrive on the existing event channel rather than being invented
+here. A clamped chunk is flagged `truncated: true` rather than silently cut.
+
+Error codes emitted: `not_owned`, `session_busy`, `session_gated`,
+`session_gone`, `message_too_large`, `invalid_message`, `too_many_turns`,
+`internal_error`. The three `session_*` codes replace the protocol's coarser
+`session_unavailable`, which this runner never emits — they are three
+different situations with three different fixes, and a UI that cannot tell
+them apart cannot offer the right one.
 
 `(run_id, message_id)` is the idempotency key: a redelivered send is never
 injected twice, and a turn that already terminated simply replays its stored
-final frame.
+final frame. That memory is split three ways — in-flight turns are never
+evicted, delivered turns are bucketed per run, and cheap rejections get their
+own small budget — so no amount of traffic for runs this runner does not own
+can flush the history of turns it actually delivered.
 
 ## Develop
 

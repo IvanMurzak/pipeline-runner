@@ -121,6 +121,18 @@ interface PendingQuestion {
   frame: NeedsInputMessage;
 }
 
+/**
+ * What {@link NeedsInputRelay.deliverPending} did with the text.
+ *
+ *   - `delivered`     — handed to the `DriveSession`; the run is resuming.
+ *   - `not_pending`   — (run_id, question_id) matched nothing awaiting an
+ *                       answer: STALE, SUPERSEDED, CROSS-RUN, or already
+ *                       resolved. Nothing was delivered and nothing consumed.
+ *   - `resume_failed` — the pending entry was consumed but the `DriveSession`
+ *                       threw synchronously, so the run did NOT resume.
+ */
+export type PendingDeliveryOutcome = 'delivered' | 'not_pending' | 'resume_failed';
+
 /** Composite key over (run_id, question_id) — JSON-encoded so neither field's
  *  contents can be mistaken for the separator. */
 function keyOf(runId: string, questionId: string): string {
@@ -273,24 +285,42 @@ export class NeedsInputRelay {
    * redelivered chat turn, or one of each — finds nothing pending and cannot
    * double-resume the run.
    *
-   * Returns false when (run_id, question_id) is not pending: STALE,
-   * SUPERSEDED, CROSS-RUN, or already resolved. Callers surface that as a
-   * failure rather than assuming delivery; nothing is queued or retried here.
+   * Reports a three-way {@link PendingDeliveryOutcome} rather than a boolean,
+   * because "the question was not pending" and "the resume threw" are
+   * different failures with different operator meanings — and a caller that
+   * surfaces one as the other is lying to a UI (review A8). In particular it
+   * never reports `delivered` for a `DriveSession` that threw synchronously:
+   * nothing reached the run in that case.
    *
    * SECURITY: this method performs NO authorization of its own and must not
    * be reached from an inbound frame directly. `onAnswer` gates it on the
    * pending-set match; the chat relay gates it on its ownership boundary
    * (07 T7) before a handle able to call it even exists.
    */
-  deliverPending(runId: string, questionId: string, text: string): boolean {
+  deliverPending(runId: string, questionId: string, text: string): PendingDeliveryOutcome {
     const key = keyOf(runId, questionId);
-    if (!this.pending.has(key)) return false;
+    if (!this.pending.has(key)) return 'not_pending';
     this.pending.delete(key);
-    this.deliver(runId, questionId, text);
-    return true;
+    return this.deliver(runId, questionId, text);
   }
 
-  private deliver(runId: string, questionId: string, answerText: string): void {
+  /**
+   * @returns `delivered` once the `DriveSession` has been handed the text
+   * without throwing SYNCHRONOUSLY, `resume_failed` when it threw.
+   *
+   * A REJECTED PROMISE cannot be reported here and is not pretended
+   * otherwise: by then the resume has already begun and this call has long
+   * returned, so it is logged (as it always was) and the caller's own async
+   * path owns it — for chat, `ChatRelay` catches the rejection off
+   * `ChatSessionHandle.deliver` and terminates the turn with `internal_error`.
+   *
+   * Neither failure restores the pending entry. That is deliberate: once the
+   * entry is gone, a retry could double-resume a run whose drive may already
+   * have been re-invoked, and once-only is the property worth keeping. The run
+   * stays parked and the failure is visible in the log and (for chat) on the
+   * wire, which is recoverable; a silent double-resume is not.
+   */
+  private deliver(runId: string, questionId: string, answerText: string): PendingDeliveryOutcome {
     try {
       const result = this.drive.resumeWithAnswer(runId, questionId, answerText);
       if (result != null && typeof (result as Promise<void>).then === 'function') {
@@ -298,8 +328,10 @@ export class NeedsInputRelay {
           this.logger.error(`drive resume for run ${runId} question ${questionId} failed: ${errMessage(err)}`);
         });
       }
+      return 'delivered';
     } catch (err) {
       this.logger.error(`drive resume for run ${runId} question ${questionId} threw: ${errMessage(err)}`);
+      return 'resume_failed';
     }
   }
 }
