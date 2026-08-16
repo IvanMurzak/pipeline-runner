@@ -191,6 +191,29 @@ export class JobManager {
     return this.active.size;
   }
 
+  /**
+   * c4 (P2.5 chat, 07 T7): THE OWNERSHIP LOOKUP for run-bound inbound frames
+   * — the single active executor for `runId`, or null when this runner owns
+   * no live session for that run.
+   *
+   * Exact id or nothing: no nearest match, no fallback, no prefix. The active
+   * map is keyed by job id and holds at most one executor per run (a lease
+   * for an already-active run is either an adoption of the SAME executor or
+   * declined), so the first match is the only match.
+   *
+   * QUARANTINED records are deliberately not reachable here, unlike in
+   * `handleCancel` above — a `cancel` disposes of a run this runner may still
+   * be holding leftovers for, whereas chat must land in a session that is
+   * genuinely executing. A quarantined run has an expired lease and no live
+   * process; there is nothing for a message to land in.
+   */
+  activeSession(runId: string): JobExecutor | null {
+    for (const job of this.active.values()) {
+      if (job.runId === runId) return job;
+    }
+    return null;
+  }
+
   get quarantinedCount(): number {
     return this.quarantined.size;
   }

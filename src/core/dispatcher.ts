@@ -39,6 +39,10 @@ export const RESERVED_UNHANDLED_TYPES = [
   'answer',
   'cancel',
   'upload_ack',
+  // c4: handled by `relay/chat.ts` on a fully-wired daemon connection; listed
+  // so a bare core (the `register` command's validation connection) logs it
+  // as "not handled yet" rather than "unknown".
+  'chat_send',
   'department.offer',
   'department.message',
   'department.cancel',

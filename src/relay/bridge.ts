@@ -29,6 +29,15 @@
  *                 (removed BEFORE delivery, so a duplicate finds nothing) and
  *                 hands the answer text to {@link DriveSession.resumeWithAnswer}.
  *
+ * c4 (P2.5 chat) adds a SECOND way in — {@link NeedsInputRelay.deliverPending}
+ * — used by the chat relay (`./chat.ts`) so a chat turn reaches a parked
+ * session through THIS bridge rather than through a channel of its own
+ * (design 02 M6: "reuses the relay bridge to the runner session ... avoids a
+ * second transport"). It is a delivery door, not an authorization one: the
+ * chat relay's ownership check (07 T7) runs before a caller able to reach it
+ * exists, and `onAnswer` above now resolves through the same method, so
+ * once-only delivery has a single implementation shared by both paths.
+ *
  * Secrets discipline: the runner never logs the answer TEXT or the answer
  * AUTHOR (`answered_by`) — only `run_id` + `question_id`, which are safe
  * correlation ids. All I/O (the client port, id generation) is injectable; the
@@ -247,11 +256,38 @@ export class NeedsInputRelay {
       );
     }
 
-    // Resolve exactly once: remove BEFORE delivery so a duplicate answer racing
-    // behind this one finds nothing pending (no double-resume).
-    this.pending.delete(key);
     this.logger.info(`answer routed for run ${runId} question ${questionId}`);
-    this.deliver(runId, questionId, answerText);
+    this.deliverPending(runId, questionId, answerText);
+  }
+
+  /**
+   * c4 (P2.5 chat): hand TEXT to a pending question's session from a path
+   * other than an inbound `answer` frame — today the chat relay
+   * (`./chat.ts` via `../jobs/chat-session.ts`), which must reach the
+   * executor session through the SAME bridge rather than opening a second
+   * one (M6: no second transport).
+   *
+   * This is also where `onAnswer` above resolves, so ONCE-ONLY delivery has
+   * exactly one implementation: the pending entry is removed BEFORE the
+   * `DriveSession` is called, so a duplicate racing behind — an answer, a
+   * redelivered chat turn, or one of each — finds nothing pending and cannot
+   * double-resume the run.
+   *
+   * Returns false when (run_id, question_id) is not pending: STALE,
+   * SUPERSEDED, CROSS-RUN, or already resolved. Callers surface that as a
+   * failure rather than assuming delivery; nothing is queued or retried here.
+   *
+   * SECURITY: this method performs NO authorization of its own and must not
+   * be reached from an inbound frame directly. `onAnswer` gates it on the
+   * pending-set match; the chat relay gates it on its ownership boundary
+   * (07 T7) before a handle able to call it even exists.
+   */
+  deliverPending(runId: string, questionId: string, text: string): boolean {
+    const key = keyOf(runId, questionId);
+    if (!this.pending.has(key)) return false;
+    this.pending.delete(key);
+    this.deliver(runId, questionId, text);
+    return true;
   }
 
   private deliver(runId: string, questionId: string, answerText: string): void {

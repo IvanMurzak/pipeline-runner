@@ -392,7 +392,7 @@ src/core/connection.ts   # the connection state machine tying it all together
 src/dispatch/            # task-dispatch pipeline resolution (`pipeline match`)
 src/jobs/                # lease -> accept -> workspace -> `pipeline drive`
 src/shipper/             # event shipper: tails run artifacts, batches, uploads
-src/relay/               # needs-input relay over the WSS channel
+src/relay/               # needs-input relay + the run-bound chat channel, one WSS channel
 src/service/             # OS service install/uninstall/status/start/stop/restart
                          #   (systemd/launchd/Windows) + inspect.ts: read the INSTALLED
                          #   definition (pinned home, service account)
@@ -408,11 +408,36 @@ The wire protocol comes from the published
 [`@baizor/pipeline-protocol`](https://www.npmjs.com/package/@baizor/pipeline-protocol)
 npm package (repo [`IvanMurzak/pipeline-protocol`](https://github.com/IvanMurzak/pipeline-protocol))
 — zod schemas + inferred TS types, additive-only within a protocol major.
-`src/core/wire.ts`, `src/jobs/wire.ts`, `src/relay/wire-relay.ts`, and
-`src/shipper/wire-ingest.ts` are thin re-export seams over it: they keep the
-runner's internal import paths stable and hold the few runner-local helpers
-(frame builders, deliberately tolerant inbound guards) the package does not
-provide.
+`src/core/wire.ts`, `src/jobs/wire.ts`, `src/relay/wire-relay.ts`,
+`src/relay/chat-wire.ts`, and `src/shipper/wire-ingest.ts` are thin re-export
+seams over it: they keep the runner's internal import paths stable and hold
+the few runner-local helpers (frame builders, deliberately tolerant inbound
+guards) the package does not provide.
+
+### The run-bound chat channel (`chat_send` / `chat_reply`)
+
+A registered runner declares `chat_capable: true` only when it has actually
+wired the chat relay, and the control plane gates sends on that flag. An
+inbound `chat_send` is accepted **only** for a run this runner is currently
+executing: the ownership check is the job manager's active-executor map, and
+a frame naming anything else gets a `chat_reply` carrying
+`error.code = "not_owned"` — never silence, and never a delivery.
+
+The message is fed into the run's executor session through the **same relay
+bridge an answer travels**, so there is no second transport and no
+chat-specific process. Two consequences are worth knowing before you rely on
+it:
+
+- **Only a session parked awaiting input can take a chat turn.** There is no
+  way to inject text into a `pipeline drive` invocation that is mid-turn, so a
+  running session answers `error.code = "session_unavailable"`.
+- **A park behind an approval gate refuses chat.** Because delivery *is* the
+  answer path, letting a chat turn through would clear an approval whose whole
+  point is that a specific role must give it.
+
+`(run_id, message_id)` is the idempotency key: a redelivered send is never
+injected twice, and a turn that already terminated simply replays its stored
+final frame.
 
 ## Develop
 

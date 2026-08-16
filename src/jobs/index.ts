@@ -34,3 +34,6 @@ export * from './run-state';
 // f4 (design 01 §Scale E13): the per-RUN isolated agent home — pooled machines
 // must not carry one tenant's memory or global config into another's run.
 export * from './agent-home';
+// c4 (P2.5 chat): the ownership-checked bridge between an inbound `chat_send`
+// and the run's live executor session (`../relay/chat.ts`'s registry port).
+export * from './chat-session';

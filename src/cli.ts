@@ -113,6 +113,7 @@ import {
   DEFAULT_RETENTION_SWEEP_INTERVAL_MS,
   fsRunStateStore,
   fsSubstrateProbe,
+  jobChatRegistry,
   JobStore,
   resolveRetentionPolicy,
   type JobManager,
@@ -122,7 +123,7 @@ import {
 // because `./jobs` exports a DIFFERENT interface of the same name (the
 // executor's synchronous-pull seam) — `01-current-architecture.md` §1.5
 // calls out the two-shapes collision this alias avoids at the import site.
-import { NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './relay';
+import { ChatRelay, NeedsInputRelay as NeedsInputRelayBridge, PullRelayAdapter } from './relay';
 // T1-15: service install/uninstall/status lives in ./service (its own module).
 // x24 added start/uninstall/restart there; x22 added `inspectInstalledService`,
 // the read-only look at the INSTALLED definition that `journal` uses to find a
@@ -501,6 +502,13 @@ function runStart(argv: string[] = []): void {
   // forward reference is safe (mirrors the `manager` pattern above).
   let relayBridge: NeedsInputRelayBridge;
 
+  // c4 (P2.5 chat): the handshake's `chat_capable` declaration, read at every
+  // REGISTER rather than captured now. It flips true only once the chat relay
+  // below is actually attached, so the flag can never claim a capability this
+  // process has not wired — `client.start()` happens after that point, so the
+  // very first register already tells the truth.
+  let chatWired = false;
+
   // c6: local drain flag — set by the graceful-shutdown routine below; the
   // manager's `draining()` reads it alongside the server's drain directive.
   let shuttingDown = false;
@@ -534,6 +542,8 @@ function runStart(argv: string[] = []): void {
     activeRunIds: () => manager?.activeRunIds() ?? [],
     runnerStatus: (): RunnerStatus => manager?.runnerStatus() ?? 'online',
     pausedUntil: () => manager?.pausedUntil() ?? null,
+    // c4: see `chatWired` above — declared truthfully, per connection.
+    chatCapable: () => chatWired,
     // c6: the heartbeat-tick record writer (04) — each beat renews every
     // active job record's `updated_at`, keeping a live runner's records
     // FRESH for the reconcile.
@@ -611,6 +621,27 @@ function runStart(argv: string[] = []): void {
     // f3: cursor-only cross-machine handoff (null ⇒ omitted ⇒ unchanged).
     ...(runStateDir === null ? {} : { runState: fsRunStateStore(shipperFs, runStateDir) }),
   });
+
+  // c4 (P2.5 chat, design 02 M6 / 07 T7): the run-bound chat channel. Built
+  // AFTER the job manager because its OWNERSHIP boundary is the manager's
+  // active-executor map — `activeSession(run_id)` is the whole authorization
+  // this runner performs, and a chat turn for anything else is refused with
+  // `not_owned` rather than routed anywhere. Built on the SAME `client` and
+  // delivered through the SAME `relayBridge` an `answer` travels (M6: one
+  // transport, one bridge, no chat-specific process). Still synchronous and
+  // still before `client.start()`, so no frame can race the wiring.
+  const chatRelay = new ChatRelay({
+    client,
+    sessions: jobChatRegistry({
+      jobs: { activeSession: (runId) => manager?.activeSession(runId) ?? null },
+      delivery: relayBridge,
+      logger: consoleLogger,
+    }),
+    logger: consoleLogger,
+  });
+  // Only NOW may this connection claim `chat_capable` — the relay exists and
+  // its handler is attached.
+  chatWired = true;
 
   // department-mesh (task d1): the adapter registry starts with
   // `jsonl-process` (the flagship). Runtime resolution is env-driven for now
@@ -759,6 +790,11 @@ function runStart(argv: string[] = []): void {
     // b1: the binding watcher's timers/handle go with it. It is created with
     // `persistent: false`, so this is tidiness rather than a hang fix.
     releaseLock: () => {
+      // c4: detach the chat handler with the rest of the local surface. The
+      // connection is already closed by `closeConnection` above, so this is
+      // tidiness — but a drain window must not leave a live route into a
+      // session the shutdown has just suspended.
+      chatRelay.stop();
       stopBindingWatch();
       // x21: close the loopback re-auth listener with everything else local.
       // It is already `unref`'d and closes itself at zero grants, so this is
