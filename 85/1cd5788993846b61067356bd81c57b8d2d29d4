@@ -1,0 +1,60 @@
+src/relay/chat-wire.ts
+  s_ed1b4ae4e5d986::t_0d2a2cff4dd6ce 172-174,186-193,196,201,205-208
+  s_ed1b4ae4e5d986::t_632b4c991193b4 70-96,100-102,105
+src/relay/bridge.ts
+  s_ed1b4ae4e5d986::t_2aa12232908240 288-293,300,302,304,307-323,331,334
+  s_ed1b4ae4e5d986::t_55a94ee5169444 124-135
+tests/chat-relay.test.ts
+  s_ed1b4ae4e5d986::t_edf7ee36a0b7d0 22
+  s_ed1b4ae4e5d986::t_56015566145b70 511-514
+  s_ed1b4ae4e5d986::t_5f421da99f87c5 474,481-510,516-624
+  s_ed1b4ae4e5d986::t_ad42b3cb73f5be 386-408
+  s_ed1b4ae4e5d986::t_56b6d22c1ab1b6 635
+  s_ed1b4ae4e5d986::t_a74f5ed788e8ce 681-683,689,692,699,703-704,708-722,733
+  s_ed1b4ae4e5d986::t_ee8bbe1529a938 242-266
+  s_ed1b4ae4e5d986::t_4d5c007a2cf3e4 13-19,86-91,99
+tests/relay.test.ts
+  s_ed1b4ae4e5d986::t_da2db66b23b4a3 393-396,402-429
+  s_ed1b4ae4e5d986::t_a45a042017cd63 338,349-351,361-362,373
+README.md
+  s_ed1b4ae4e5d986::t_c499079bc56e76 433-448,452-455
+src/jobs/chat-session.ts
+  s_ed1b4ae4e5d986::t_958c35cf72fa97 60
+  s_ed1b4ae4e5d986::t_6a8d910865e134 91-95,98
+  s_ed1b4ae4e5d986::t_75542a55122351 135-139,143-144,150,157-158,160,165-170
+  s_5b742bf37a2587::t_1f7e325d25830d 171-172
+src/relay/chat.ts
+  s_ed1b4ae4e5d986::t_1cb63816af4986 466
+  s_ed1b4ae4e5d986::t_3fc18779ee3ac7 469-483,485-512,514-525
+  s_ed1b4ae4e5d986::t_c5006ffd08a039 366,368,371,376-381,384-386
+  s_ed1b4ae4e5d986::t_8544f2b150d991 188-190,192-199,204-206,214-219,226-228,230-240,248-250,263-275
+  s_ed1b4ae4e5d986::t_920ae5eb19eb78 291-293,317-340,345-348,354
+  s_ed1b4ae4e5d986::t_95e7d76df417e2 63-102
+  s_ed1b4ae4e5d986::t_fa4f2c3a899bf4 395-399,401-405,416-420,424
+src/jobs/chat-session.test.ts
+  s_ed1b4ae4e5d986::t_feef3ce52017f2 248,261,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "851cd5788993846b61067356bd81c57b8d2d29d4",
+  "prompts": {},
+  "sessions": {
+    "s_5b742bf37a2587": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ba723765-770d-456d-823d-c53d8073ed95",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_ed1b4ae4e5d986": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d065bda2-94f7-45db-b8f4-2da50c81020b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
