@@ -253,7 +253,10 @@ describe('prepareWorkspace — default start-iteration resolver (cliStartIterati
 
   test("resolves the plan's entry step over the lexical rule (graph/target-family fixture)", async () => {
     const planJson = JSON.stringify({
-      steps: [{ rel: '00-entry/01-start.md' }, { rel: '01-helper.md' }],
+      steps: [
+        { rel: '00-entry/01-start.md', path: join(pipelineRoot, 'steps', '00-entry', '01-start.md') },
+        { rel: '01-helper.md', path: join(pipelineRoot, 'steps', '01-helper.md') },
+      ],
     });
     const exec = new FakeJobExec((_cmd, args) => (args[0] === 'plan' ? { code: 0, stdout: planJson, stderr: '' } : GIT_OK));
     const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined, pipelineBin: 'my-pipeline' }));
@@ -264,20 +267,188 @@ describe('prepareWorkspace — default start-iteration resolver (cliStartIterati
     expect(planCall?.args).toEqual(['plan', '--root', pipelineRoot, '--json']);
   });
 
-  test('falls back to the lexical rule when the CLI predates `plan` (unknown command)', async () => {
+  // CONTRACT CHANGE (g1/B1) — these two used to assert the lexical FALLBACK.
+  // They now assert a refusal, because the fallback is the D4-1 approval
+  // bypass: it cannot see a body-less gate, so it silently enters at the next
+  // step. See the `cliStartIterationResolver fails closed` block below for the
+  // gate-shaped repros; these keep the original fixtures so the change of
+  // posture on the ORIGINAL inputs is visible rather than implied.
+  test('a CLI that predates `plan` (unknown command) is refused, not degraded', async () => {
     const exec = new FakeJobExec((_cmd, args) =>
       args[0] === 'plan' ? { code: 2, stdout: '', stderr: "pipeline: unknown command 'plan'\n\nusage: ..." } : GIT_OK
     );
     const logger = new CaptureLogger();
-    const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined, logger }));
-
-    expect(ws.startIteration).toBe('steps/01-helper.md');
-    expect(logger.joined()).toContain('falling back to the lexical entry rule');
+    await expect(prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined, logger }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+    expect(logger.joined()).toContain('start-iteration resolution refused the job');
   });
 
-  test('falls back to the lexical rule on unparseable plan output', async () => {
+  test('unparseable plan output is refused, not degraded', async () => {
     const exec = new FakeJobExec((_cmd, args) => (args[0] === 'plan' ? { code: 0, stdout: 'not json', stderr: '' } : GIT_OK));
-    const ws = await prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined }));
-    expect(ws.startIteration).toBe('steps/01-helper.md');
+    await expect(prepareWorkspace(options(graphFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(JobError);
+  });
+});
+
+// ============================================================================
+// g1 / B1 — entry resolution is a SECURITY boundary when step 1 is a gate.
+//
+// The lexical fallback picks the lexically-first `steps/*.md`. A body-less
+// `type: gate` step has NO file under `steps/` at all — its plan path is the
+// SYNTHETIC `steps/<name>.md` (pipeline-cli `manifest-plan.ts` dispatchPath) —
+// so the lexical rule cannot see it and returns the NEXT step's body instead.
+//
+// The CLI then resolves that path perfectly well and dispatches that step. The
+// gate is never dispatched, no `approval` marker reaches the wire, and the
+// CLI-side g1 backstop cannot fire, because nothing was synthesized:
+// resolution succeeded — on the wrong step. That is D4-1's outcome (an
+// unapproved step executes) reached through the entry resolver rather than
+// through path synthesis.
+//
+// So this resolver must FAIL CLOSED. `prepareWorkspace` refusing the job is a
+// visible, recoverable failure; silently entering the pipeline one step past
+// its approval gate is not.
+// ============================================================================
+describe('cliStartIterationResolver fails closed (g1/B1)', () => {
+  const dir = join(ROOT, 'job-1');
+  const pipelineRoot = join(dir, '.pipeline', 'release');
+
+  /** D4-1's production shape: a manifest whose FIRST step is a body-less gate,
+   *  followed by a normal agent step. Only the agent step has a file under
+   *  `steps/` — which is exactly what makes the lexical rule skip the gate. */
+  function gateFirstFs(): FakeJobFs {
+    const fs = new FakeJobFs();
+    fs.existing.add(pipelineRoot);
+    fs.listings.set(join(pipelineRoot, 'steps'), ['02-ship.md']);
+    return fs;
+  }
+
+  /** The plan the CLI reports for that pipeline — the gate first, carrying its
+   *  synthetic path. */
+  const gateFirstPlan = JSON.stringify({
+    steps: [
+      { step_id: 'approve-deploy', type: 'gate', rel: 'approve-deploy.md', path: join(pipelineRoot, 'steps', 'approve-deploy.md') },
+      { step_id: 'ship', type: 'agent', rel: '02-ship.md', path: join(pipelineRoot, 'steps', '02-ship.md') },
+    ],
+  });
+
+  const planFails = (result: { code: number | null; stdout: string; stderr: string }) =>
+    new FakeJobExec((_cmd, args) => (args[0] === 'plan' ? result : GIT_OK));
+
+  test('a NON-ZERO plan exit never silently selects a different entry step', async () => {
+    // The exact bypass: pre-fix this resolved to 'steps/02-ship.md' and the run
+    // began one step past its approval gate.
+    const exec = planFails({ code: 1, stdout: gateFirstPlan, stderr: 'plan errors: ...' });
+    await expect(prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+  });
+
+  test('a plan carrying hard ERRORS is refused even though its JSON parses', async () => {
+    // `pipeline plan` exits 1 on plan errors but still prints a usable-looking
+    // plan. The exit code was never consulted, so the entry was taken anyway.
+    const exec = planFails({ code: 1, stdout: gateFirstPlan, stderr: '' });
+    await expect(
+      prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined })),
+    ).rejects.toThrow(/plan/i);
+  });
+
+  test('unparseable plan output is refused, not degraded to the lexical rule', async () => {
+    const exec = planFails({ code: 0, stdout: 'not json', stderr: '' });
+    await expect(prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+  });
+
+  test('a CLI that predates `plan` is refused too — it also predates the g1 gate fix', async () => {
+    // The old rationale kept a compat fallback here. It cannot be salvaged: a
+    // CLI too old to have `plan --json` is also too old to have g1's gate
+    // resolution, so a gate pipeline is unsafe on it either way. Degrading
+    // preserved a silently-wrong configuration, not a working one.
+    const exec = planFails({ code: 2, stdout: '', stderr: "pipeline: unknown command 'plan'\n\nusage: ..." });
+    await expect(prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+  });
+
+  test('a missing `pipeline` binary is refused', async () => {
+    const exec = planFails({ code: 127, stdout: '', stderr: '' });
+    await expect(prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+  });
+
+  test('an empty plan is refused', async () => {
+    const exec = planFails({ code: 0, stdout: JSON.stringify({ steps: [] }), stderr: '' });
+    await expect(prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(
+      JobError,
+    );
+  });
+
+  test('the HAPPY path still resolves the gate itself as the entry', async () => {
+    // Fail-closed must not mean fail-always: a healthy plan whose first step is
+    // a body-less gate still enters AT the gate, on its synthetic path.
+    const exec = planFails({ code: 0, stdout: gateFirstPlan, stderr: '' });
+    const ws = await prepareWorkspace(options(gateFirstFs(), exec, { resolveStartIteration: undefined }));
+    expect(ws.startIteration).toBe('steps/approve-deploy.md');
+  });
+});
+
+// ============================================================================
+// g1 / A6(a) — the entry is derived from the plan's own `path`, not from
+// `steps/${rel}`.
+//
+// `rel` is only steps/-relative when the body lives under `steps/`
+// (pipeline-cli `manifest-plan.ts` relLabel strips the prefix only then), so
+// prefixing it unconditionally named a path that exists in NEITHER tree for a
+// body declared anywhere else. `path` is absolute and unambiguous.
+// ============================================================================
+describe('entry resolution derives from the plan step path (g1/A6a)', () => {
+  const dir = join(ROOT, 'job-1');
+  const pipelineRoot = join(dir, '.pipeline', 'release');
+
+  function fsFor(): FakeJobFs {
+    const fs = new FakeJobFs();
+    fs.existing.add(pipelineRoot);
+    fs.listings.set(join(pipelineRoot, 'steps'), ['01-helper.md']);
+    return fs;
+  }
+
+  async function entryFor(first: Record<string, unknown>): Promise<string> {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'plan' ? { code: 0, stdout: JSON.stringify({ steps: [first] }), stderr: '' } : GIT_OK,
+    );
+    const ws = await prepareWorkspace(options(fsFor(), exec, { resolveStartIteration: undefined }));
+    return ws.startIteration;
+  }
+
+  // The three shapes where the OLD rule was already correct must stay
+  // byte-identical — this change may only differ where the old rule was wrong.
+  test('a body under steps/ is unchanged', async () => {
+    expect(await entryFor({ rel: '01-plan.md', path: join(pipelineRoot, 'steps', '01-plan.md') })).toBe('steps/01-plan.md');
+  });
+
+  test('a nested body under steps/ is unchanged', async () => {
+    expect(await entryFor({ rel: '00-entry/01-start.md', path: join(pipelineRoot, 'steps', '00-entry', '01-start.md') })).toBe(
+      'steps/00-entry/01-start.md',
+    );
+  });
+
+  test('a synthetic (body-less / multi-body) step path is unchanged', async () => {
+    expect(await entryFor({ rel: 'compose.md', path: join(pipelineRoot, 'steps', 'compose.md') })).toBe('steps/compose.md');
+  });
+
+  // The shape the old rule got wrong.
+  test('a body OUTSIDE steps/ resolves to its real path, not steps/<root-relative>', async () => {
+    expect(await entryFor({ rel: 'prompts/foo.md', path: join(pipelineRoot, 'prompts', 'foo.md') })).toBe('prompts/foo.md');
+  });
+
+  test('a step path outside the pipeline root is refused rather than guessed at', async () => {
+    const exec = new FakeJobExec((_cmd, args) =>
+      args[0] === 'plan'
+        ? { code: 0, stdout: JSON.stringify({ steps: [{ rel: 'x.md', path: join(dir, 'elsewhere', 'x.md') }] }), stderr: '' }
+        : GIT_OK,
+    );
+    await expect(prepareWorkspace(options(fsFor(), exec, { resolveStartIteration: undefined }))).rejects.toBeInstanceOf(JobError);
   });
 });

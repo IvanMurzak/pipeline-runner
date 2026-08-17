@@ -255,7 +255,24 @@ describe('attachJobExecution', () => {
   test('composes over an AgentClient-shaped surface (dispatcher + send)', async () => {
     const dispatcher = new Dispatcher();
     const sink = new FrameSink();
-    const exec = new FakeJobExec((cmd) => (cmd === 'git' ? GIT_OK : DRIVE_COMPLETED));
+    // This is the one test here that does NOT inject `resolveStartIteration`,
+    // so it exercises the REAL `cliStartIterationResolver` — which since
+    // g1/B1 refuses the job rather than degrading to the lexical rule when
+    // `pipeline plan --json` gives it nothing usable. So `plan` gets a real
+    // answer instead of falling through to the drive stub.
+    const exec = new FakeJobExec((cmd, args) =>
+      cmd === 'git'
+        ? GIT_OK
+        : args[0] === 'plan'
+          ? {
+              code: 0,
+              stdout: JSON.stringify({
+                steps: [{ rel: '01-plan.md', path: join(ROOT, 'job-1', '.pipeline', 'release', 'steps', '01-plan.md') }],
+              }),
+              stderr: '',
+            }
+          : DRIVE_COMPLETED,
+    );
     const fs = new FakeJobFs();
     seedJob(fs, 'job-1');
     const manager = attachJobExecution(
