@@ -33,6 +33,84 @@
  *     (`{ text: QUESTION_PLACEHOLDER, question_id? }`) so the server's strict
  *     parse — and its awaiting-input derivation — still works while zero
  *     authored content leaves the machine.
+ *     PLUS a NARROWING PROJECTION of the approval-gate marker —
+ *     `approval.required_role` and nothing else — see the section below.
+ *
+ * ── THE APPROVAL-GATE PROJECTION (D4-2) ─────────────────────────────────────
+ *
+ * A GATE PARK MUST STILL READ AS A GATE AT THE DEFAULT TIER.
+ *
+ * The placeholder above used to replace the WHOLE question object, and
+ * `approval` went with it. The cloud derives `awaiting_kind` from the PRESENCE
+ * of `question.approval` (`pipeline-protocol`'s `deriveRunState`/`hasApproval`
+ * — presence, never content), so every default-tier runner reported a gate park
+ * as `needs-input` while an `events`-tier runner reported the same park as
+ * `needs-approval`. Measured, not theorised: the `d4` dispatched-runner e2e
+ * caught run `3fa4c005…` wrong at `metadata` against `3a1c2d24…` right at
+ * `events`. ENFORCEMENT WAS NEVER AFFECTED — the server's role check reads
+ * server-verified relay data, not telemetry — but the violet "waiting on a
+ * human" grouping is the product's core attention signal, and it was dark.
+ *
+ * THE FIX IS A NARROWING PROJECTION, NOT A `keep`. Only `required_role` is
+ * projected, and only after it VALIDATES:
+ *
+ *   in  { required_role: 'owner', reason: 'the diff touches billing.ts' }
+ *   out { required_role: 'owner' }
+ *
+ * A plain `keep` was rejected deliberately (r4 ledger item 4). `ApprovalSchema`
+ * is `.passthrough()`, so a marker legitimately carries whatever fields a newer
+ * peer adds — free text (`reason`) included. Keeping the object would have
+ * shipped authored content from inside the very field the placeholder exists to
+ * strip. The projected leaf's value space is a CLOSED 4-MEMBER ENUM
+ * ({@link APPROVAL_REQUIRED_ROLES}), which is why this is disclosure-free in a
+ * way "keep the approval object" could never be.
+ *
+ * IT VALIDATES ITSELF, HERE, AND IT FAILS CLOSED. `approval` is drive-supplied
+ * and typed `unknown` all the way down the runner's park path on purpose
+ * (`../jobs/drive.ts`'s `DriveQuestion`): the single validation authority for
+ * the RELAY path is `ApprovalSchema` at the frame boundary
+ * (`../relay/wire-relay.ts`'s `validateQuestionApproval`). The SHIPPER is a
+ * different path with a different reader, and it cannot borrow that authority —
+ * this file takes no import beyond `node:crypto` (see the SG4 section's note on
+ * the pinned import list, and note that a copy of this file lives INSIDE
+ * `pipeline-protocol`, where importing the package would be circular). So
+ * {@link projectApprovalGate} re-derives the same decision from the same closed
+ * role enum, structurally: not a record ⇒ dropped; no OWN `required_role` ⇒
+ * dropped; not a string ⇒ dropped; not an enum member ⇒ dropped. A dropped
+ * marker leaves the placeholder byte-identical to a plain question's, which is
+ * the same fail-closed choice the frame boundary makes and for the same reason
+ * — "no gate" is visible and recoverable, an unvalidated marker is neither.
+ *
+ * THE OWN-PROPERTY CHECK IS LOAD-BEARING. `{ __proto__: { required_role:
+ * 'owner' } }` written as an object literal SETS the prototype, so a plain
+ * `value.required_role` read would have inherited `'owner'` and fabricated a
+ * gate out of an object that has no such field. `hasOwnProperty` is what makes
+ * the projection read only what the payload actually carries.
+ *
+ * IT APPLIES TO BOTH `'question'`-RULED ENTRIES, `awaiting_input.question` AND
+ * `department.input_required.question`. Departments do not have their own
+ * question shape to reason about separately: `DeptQuestionSchema` is a
+ * RE-EXPORT of the same `QuestionSchema` ("UNCHANGED — no parallel shape",
+ * protocol `department/task.ts`), `approval` field included. Nothing consumes a
+ * department gate today — the runner's own department `Question`
+ * (`../department/adapter.ts`) does not even declare the field, and the cloud
+ * derivation keys on `awaiting_input` — so this branch is a provable no-op in
+ * practice (a covering test asserts it). It is written as ONE RULE anyway,
+ * because the step-identity section below records what the alternative costs:
+ * that bug was fixed as "the RULE, not the two entries `i1` happened to
+ * observe", and a trust boundary whose two identical shapes quietly behave
+ * differently is the hardest kind of divergence to notice.
+ *
+ * ⚠ THE PROTOCOL COPY DOES NOT CARRY THIS YET. `pipeline-protocol`'s
+ * `src/privacy/privacy.ts` — the filter the CLI ships through, via its
+ * exact-pinned dependency — still placeholders `approval` away, so a gate park
+ * from a LOCAL `pipeline drive` run is still `needs-input` at the metadata
+ * tier. This file is deliberately ahead: `g2` is scoped to the runner and
+ * forbidden from touching the protocol. The divergence is not silent — the
+ * parent monorepo's `scripts/check-privacy-filter-drift.mjs` carries it as an
+ * explicitly hash-pinned, self-expiring KNOWN DIVERGENCE row that prints on
+ * every CI run and goes red the moment either side moves. Porting this section
+ * into the protocol copy and deleting that row is the follow-up.
  *
  * Step identity (`iteration_path`, `step_name` — `step_id` before schema v5 —
  * `script_path`, pipeline/branch names, tool names) is metadata: it is pipeline
@@ -166,6 +244,31 @@ export const MESSAGE_PARTS_PLACEHOLDER = '[message content stripped: privacy tie
 
 /** `summary` fields are truncated to this many characters at metadata tier. */
 export const SUMMARY_MAX_CHARS = 256;
+
+/**
+ * The ONLY `approval.required_role` values the metadata-tier projection will
+ * emit (D4-2 — see this module's header). A literal, closed, 4-member enum, in
+ * the protocol's own order (owner > admin > member > viewer).
+ *
+ * IT IS A COPY, AND IT IS A COPY ON PURPOSE. The authority is
+ * `@baizor/pipeline-protocol`'s `APPROVAL_ROLES` (`src/common/question.ts`),
+ * which `ApprovalSchema` enumerates and which the relay parses against at the
+ * frame boundary. This file cannot import it: its import list is PINNED to
+ * `node:crypto` alone by the protocol package's conformance test ("a second
+ * import is a new data path into the trust boundary"), and — decisively — a
+ * copy of this filter LIVES INSIDE that package, where importing it would be
+ * circular. So the value space is restated here, LITERALLY, the same way every
+ * allowlist in this file is restated literally: reading this file is meant to
+ * be enough to know what ships.
+ *
+ * THE COPY IS PINNED RATHER THAN TRUSTED. The parent monorepo's cross-tree
+ * suite parses BOTH trees and fails if this array and the protocol's
+ * `APPROVAL_ROLES` stop agreeing — the one place both are checked out at once.
+ * A role the protocol adds and this array lacks does not LEAK anything; it
+ * degrades that gate to `needs-input`, which is the fail-closed direction. The
+ * pin exists so that degradation is loud instead of silent.
+ */
+export const APPROVAL_REQUIRED_ROLES = ['owner', 'admin', 'member', 'viewer'] as const;
 
 /**
  * Resolve the effective tier FAIL-CLOSED: an explicit valid tier wins, else a
@@ -728,6 +831,10 @@ const DATA_ALLOWLISTS: Record<string, Record<string, FieldRule>> = {
   // identity by this file's own header, both are already `keep` on the three
   // `iteration.*` types, and both go through the SG4 value scrub like every
   // other leaf. `question` stays CONTENT (placeholdered), unchanged.
+  // D4-2 amends only what the placeholder CARRIES: the `'question'` rule now
+  // also projects `approval.required_role` (validated, narrowed to that one
+  // leaf) so a gate park still derives `needs-approval` at this tier. The
+  // question's own text/context/options are as stripped as they ever were.
   awaiting_input: {
     run_id: 'keep',
     iteration: 'keep',
@@ -846,6 +953,54 @@ export interface PrivacyFilterOptions {
   accountNames?: readonly string[];
 }
 
+/**
+ * THE NARROWING PROJECTION (D4-2 — see this module's header for why it exists
+ * and why it is not a `keep`).
+ *
+ * Takes the RAW, drive-supplied `question.approval` and returns the ONLY thing
+ * the metadata tier will ever say about it: `{ required_role }`, and only when
+ * the marker is genuinely one. Returns `undefined` for everything else, so the
+ * caller adds no key at all and the placeholder stays byte-identical to a plain
+ * question's.
+ *
+ * FOUR GATES, ALL FAIL-CLOSED, IN THIS ORDER:
+ *
+ *   1. `isRecord` — rejects `true`, `'owner'`, `42`, `null`, `undefined`, `[…]`
+ *      (arrays included, explicitly: `typeof [] === 'object'`), and functions.
+ *      The protocol's marker is an OBJECT, and its history includes a boolean
+ *      trap that read a real gate as falsy, so shape is checked, never truth.
+ *   2. `hasOwnProperty` — the ONLY reason `{ __proto__: { required_role:
+ *      'owner' } }` (an object literal, which really does set the prototype)
+ *      does not fabricate a gate from a field the payload never carried. A bare
+ *      `value.required_role` read walks the prototype chain; this does not.
+ *      Written `Object.prototype.hasOwnProperty.call` rather than
+ *      `value.hasOwnProperty` so a null-prototype or shadowed object is handled
+ *      too.
+ *   3. `typeof === 'string'` — a nested object, array or number is not a role.
+ *   4. Enum membership — the decisive one. Because {@link
+ *      APPROVAL_REQUIRED_ROLES} is closed and content-free, NO caller-authored
+ *      byte can reach the wire through this leaf: a path, an OS account name, a
+ *      token, a question fragment, anything secret-shaped is simply not one of
+ *      four literals. The SG4 value scrub still runs over the result afterwards
+ *      (it walks every string leaf of the filtered payload, at any depth) — it
+ *      is a no-op on these four by construction, and it is left in place rather
+ *      than reasoned around.
+ *
+ * The returned object is a FRESH literal holding one primitive. Nothing from
+ * the input is spread, aliased or referenced, so `ApprovalSchema`'s
+ * `.passthrough()` siblings — `reason` and whatever a future peer adds — cannot
+ * ride along even by accident. That is the whole difference between a
+ * projection and a keep.
+ */
+function projectApprovalGate(value: unknown): { required_role: string } | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(value, 'required_role')) return undefined;
+  const role = value.required_role;
+  if (typeof role !== 'string') return undefined;
+  if (!(APPROVAL_REQUIRED_ROLES as readonly string[]).includes(role)) return undefined;
+  return { required_role: role };
+}
+
 function applyRule(rule: FieldRule, value: unknown, salt: string): unknown {
   switch (rule) {
     case 'keep':
@@ -863,6 +1018,11 @@ function applyRule(rule: FieldRule, value: unknown, salt: string): unknown {
       if (typeof value.question_id === 'string' && value.question_id.length > 0) {
         placeholder.question_id = value.question_id;
       }
+      // D4-2: the ONE field the gate badge needs, projected — never the marker
+      // itself. `undefined` (absent, null, or any shape that fails the four
+      // gates) adds no key, leaving this byte-identical to a plain question.
+      const approval = projectApprovalGate(value.approval);
+      if (approval !== undefined) placeholder.approval = approval;
       return placeholder;
     }
     case 'message_parts': {
