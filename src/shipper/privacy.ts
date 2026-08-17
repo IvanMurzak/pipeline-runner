@@ -261,12 +261,24 @@ export const SUMMARY_MAX_CHARS = 256;
  * allowlist in this file is restated literally: reading this file is meant to
  * be enough to know what ships.
  *
- * THE COPY IS PINNED RATHER THAN TRUSTED. The parent monorepo's cross-tree
- * suite parses BOTH trees and fails if this array and the protocol's
- * `APPROVAL_ROLES` stop agreeing — the one place both are checked out at once.
- * A role the protocol adds and this array lacks does not LEAK anything; it
- * degrades that gate to `needs-input`, which is the fail-closed direction. The
- * pin exists so that degradation is loud instead of silent.
+ * THE COPY IS PINNED RATHER THAN TRUSTED — BY A TEST, IN THIS REPO, AGAINST THE
+ * REAL PACKAGE. `tests/shipper-privacy-approval-gate.test.ts` imports
+ * `APPROVAL_ROLES` and `ApprovalSchema` from the exact-pinned
+ * `@baizor/pipeline-protocol` dependency and fails if this array and the
+ * authority stop agreeing — both as a list and BEHAVIOURALLY, asserting that
+ * the set of roles `ApprovalSchema` accepts is exactly the set this projection
+ * emits. The test tree can do what this module cannot: the `node:crypto` pin is
+ * a conformance check over THIS MODULE's own import list, not over the repo, so
+ * a test importing the package costs the trust boundary nothing.
+ *
+ * WHY THE PIN IS NOT OPTIONAL, EVEN THOUGH THE FAILURE IS "SAFE". A role the
+ * protocol adds and this array lacks does not LEAK anything — the unknown role
+ * is dropped and the gate degrades to `needs-input`. That is fail-closed for
+ * DISCLOSURE, and it is NOT fail-closed for the badge path, which is the whole
+ * subject of D4-2: a fifth role would silently reopen this exact defect for
+ * every gate that uses it, with every check in both repos green. Hence a test
+ * that consults the authority instead of a second hand-written literal, which
+ * would only ever restate this array to itself.
  */
 export const APPROVAL_REQUIRED_ROLES = ['owner', 'admin', 'member', 'viewer'] as const;
 

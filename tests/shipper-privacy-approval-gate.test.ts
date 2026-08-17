@@ -32,6 +32,7 @@ import {
   QUESTION_PLACEHOLDER,
   SG4_PATH_RE,
 } from '../src/shipper/privacy';
+import { APPROVAL_ROLES, ApprovalSchema } from '@baizor/pipeline-protocol';
 import { journalEvent } from './_shipper-helpers';
 
 /** Every string leaf of a payload, with its location — mirrors the same two
@@ -74,6 +75,10 @@ const NESTED_QID = 'qq-nested';
  *  failure rather than a detail. */
 const PLAIN = { text: QUESTION_PLACEHOLDER } as const;
 
+/** The same, for a question that DOES carry the nested identity — what a
+ *  `gateQuestion(...)` whose marker was dropped must filter to. */
+const PLAIN_WITH_QID = { text: QUESTION_PLACEHOLDER, question_id: NESTED_QID } as const;
+
 /** Filter one `awaiting_input` park at the metadata tier and hand back the
  *  filtered `question`. */
 function filterQuestion(question: unknown, type = 'awaiting_input'): unknown {
@@ -114,6 +119,56 @@ function projected(role: string) {
   return { text: QUESTION_PLACEHOLDER, question_id: NESTED_QID, approval: { required_role: role } };
 }
 
+describe('D4-2 PIN: the projection enum tracks the protocol authority', () => {
+  // THE POINT OF THIS BLOCK. `APPROVAL_REQUIRED_ROLES` is a hand-written copy of
+  // `@baizor/pipeline-protocol`'s `APPROVAL_ROLES`, because `privacy.ts` may not
+  // import anything but `node:crypto`. A copy nobody compares is a copy that
+  // diverges silently — so these tests consult the REAL PACKAGE, not a second
+  // literal. Asserting the array against another hand-written list (which is
+  // what an earlier revision of this suite did) proves only that the array
+  // equals itself.
+  //
+  // The failure it exists to catch: the protocol adds a fifth role, the relay's
+  // `ApprovalSchema` validates it at the frame boundary, and `projectApprovalGate`
+  // DROPS it — so that gate reports `needs-input` again. Fail-closed for
+  // disclosure, wide open for the badge path, which is all of D4-2.
+
+  test('list pin: the projection enum IS the protocol enum, order included', () => {
+    expect([...APPROVAL_REQUIRED_ROLES]).toEqual([...APPROVAL_ROLES]);
+  });
+
+  test('behavioural pin: every role ApprovalSchema ACCEPTS, the projection PROJECTS', () => {
+    // The direction that matters. A role added upstream fails here even if
+    // someone forgets to update the list assertion above.
+    for (const role of APPROVAL_ROLES) {
+      expect(ApprovalSchema.safeParse({ required_role: role }).success, `schema accepts ${role}`).toBe(true);
+      expect(filterQuestion(gateQuestion(role)), `projection emits ${role}`).toEqual(projected(role));
+    }
+  });
+
+  test('behavioural pin: every role ApprovalSchema REJECTS, the projection DROPS', () => {
+    // The other direction: the projection must not be more permissive than the
+    // authority either, or the shipper would assert a gate the relay refused.
+    for (const bad of ['superuser', 'Owner', 'OWNER', '', ' owner', 'owner ', 'billing_admin']) {
+      expect(ApprovalSchema.safeParse({ required_role: bad }).success, `schema rejects ${bad}`).toBe(false);
+      expect(filterQuestion(gateQuestion(bad)), `projection drops ${bad}`).toEqual(PLAIN_WITH_QID);
+    }
+  });
+
+  test("the projected object is exactly what ApprovalSchema would have produced for that leaf", () => {
+    // Closes the loop with the relay's own authority: what the metadata tier
+    // ships is a strict narrowing of what the frame boundary validates.
+    for (const role of APPROVAL_ROLES) {
+      const parsed = ApprovalSchema.parse({ required_role: role, reason: 'SECRET_REASON_ignored' });
+      const shipped = (filterQuestion(gateQuestion(role, { reason: 'SECRET_REASON_ignored' })) as {
+        approval: Record<string, unknown>;
+      }).approval;
+      expect(shipped).toEqual({ required_role: parsed.required_role });
+      expect(Object.keys(shipped)).toEqual(['required_role']);
+    }
+  });
+});
+
 describe('D4-2: a valid gate projects required_role, and ONLY required_role', () => {
   test('the whole point: a metadata-tier gate park carries the gate marker', () => {
     expect(filterQuestion(gateQuestion('owner'))).toEqual(projected('owner'));
@@ -141,6 +196,24 @@ describe('D4-2: a valid gate projects required_role, and ONLY required_role', ()
   test('a projected gate still leaks none of the question itself', () => {
     const wire = filterWire(gateQuestion('owner', { reason: SECRETS.approvalReason }));
     for (const secret of Object.values(SECRETS)) expect(wire).not.toContain(secret);
+  });
+
+  test('KEY ORDER: the filtered question serializes exactly as expected', () => {
+    // `toEqual` is order-insensitive, and what actually goes on the wire is
+    // JSON. Key order is allowlist-iteration order, so assert the bytes.
+    expect(JSON.stringify(filterQuestion(gateQuestion('owner')))).toBe(
+      `{"text":"${QUESTION_PLACEHOLDER}","question_id":"${NESTED_QID}","approval":{"required_role":"owner"}}`,
+    );
+    expect(JSON.stringify(filterQuestion({ text: SECRETS.questionText, question_id: NESTED_QID }))).toBe(
+      `{"text":"${QUESTION_PLACEHOLDER}","question_id":"${NESTED_QID}"}`,
+    );
+    // The projection is appended LAST, so a dropped marker leaves the byte
+    // sequence of a plain question untouched rather than merely an equal object.
+    expect(Object.keys(filterQuestion(gateQuestion('viewer')) as object)).toEqual([
+      'text',
+      'question_id',
+      'approval',
+    ]);
   });
 
   test('the projected leaf is a fresh object, not an alias of the input', () => {
@@ -241,6 +314,58 @@ describe('D4-2 adversarial: every hostile shape is DROPPED, not projected', () =
       }
       expect(wire, `${label} leaked the question text`).not.toContain(SECRETS.questionText);
     }
+  });
+
+  test('dropped: an ACCESSOR whose getter returns a valid role', () => {
+    // An own property can be a getter rather than a data property.
+    // `hasOwnProperty` is true for it, so the own-check passes and the getter
+    // RUNS — the enum check is what stops it. Asserted because a value that
+    // arrives by invocation rather than by storage is the case a
+    // shape-inspection guard is most likely to have overlooked.
+    let reads = 0;
+    const accessor = {} as Record<string, unknown>;
+    Object.defineProperty(accessor, 'required_role', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads++;
+        // Alternates: a checker that validated once and re-read to project
+        // would emit the second value.
+        return reads === 1 ? 'owner' : 'SECRET_SMUGGLED_ON_SECOND_READ';
+      },
+    });
+
+    const out = filterQuestion({ text: SECRETS.questionText, approval: accessor });
+    // The projection is allowed to accept this — the getter's first value IS a
+    // valid role — but it must project THAT value, never a later one.
+    expect(JSON.stringify(out)).not.toContain('SECRET_SMUGGLED_ON_SECOND_READ');
+    expect(reads).toBe(1); // read exactly once: no validate-then-re-read gap
+    expect(out).toEqual({ ...PLAIN, approval: { required_role: 'owner' } });
+  });
+
+  test('dropped: an accessor whose getter throws is not swallowed into a gate', () => {
+    const hostile = {} as Record<string, unknown>;
+    Object.defineProperty(hostile, 'required_role', {
+      enumerable: true,
+      get() {
+        throw new Error('SECRET_THROWN_FROM_GETTER');
+      },
+    });
+    // Whatever the policy, it must not be "a gate". Today the throw propagates
+    // to the caller (the shipper's own error handling), which is fail-closed:
+    // nothing is shipped at all. Pinned so a future try/catch cannot quietly
+    // turn it into a projected gate.
+    expect(() => filterQuestion({ text: SECRETS.questionText, approval: hostile })).toThrow(
+      'SECRET_THROWN_FROM_GETTER',
+    );
+  });
+
+  test('dropped: a boxed String role (object, not primitive)', () => {
+    // `typeof new String('owner') === 'object'`, so the string check rejects it
+    // even though `==` and `.includes` on the primitive would have matched.
+    expect(
+      filterQuestion({ text: SECRETS.questionText, approval: { required_role: new String('owner') } }),
+    ).toEqual(PLAIN);
   });
 
   test('dropped: __proto__-keyed object literal (prototype-chain fabrication)', () => {
