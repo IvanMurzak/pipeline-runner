@@ -164,7 +164,15 @@ describe('JobExecutor — c4 default hash/plan seams reach prepareWorkspace', ()
     const exec = new FakeJobExec((cmd, args) => {
       if (cmd === 'git') return GIT_OK;
       if (args[0] === 'hash') return { code: 0, stdout: JSON.stringify({ content_hash: 'sha256:abc' }), stderr: '' };
-      if (args[0] === 'plan') return { code: 0, stdout: JSON.stringify({ steps: [{ rel: '01-plan.md' }] }), stderr: '' };
+      // `path` (absolute) is what entry resolution reads since g1/A6a — `rel`
+      // alone cannot say whether the body lives under `steps/`. Kept alongside
+      // it because `pipeline plan --json` emits the whole Plan, both fields.
+      if (args[0] === 'plan')
+        return {
+          code: 0,
+          stdout: JSON.stringify({ steps: [{ rel: '01-plan.md', path: join(PIPELINE_ROOT, 'steps', '01-plan.md') }] }),
+          stderr: '',
+        };
       return DRIVE_COMPLETED;
     });
     const lease = makeLease({ pipeline_ref: { ...makeLease().pipeline_ref, content_hash: 'sha256:abc' } });

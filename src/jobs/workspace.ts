@@ -36,7 +36,7 @@
  * unchanged.
  */
 
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import { TASK_PIPELINE_UNRESOLVED, type PipelineRef } from './wire';
@@ -107,10 +107,27 @@ export function pipelineRootRel(pipeline: string): string {
 }
 
 /**
- * Default entry-iteration resolution: the lexically-first `steps/*.md` (step
- * files carry ordering prefixes, e.g. `01-plan.md`). A pipeline-manifest-aware
- * resolver (computePlan lives in pipeline-cli, not this package) can be
- * injected via `resolveStartIteration` — FOLLOW-UP once shared.
+ * The lexically-first `steps/*.md` — v1's entry rule, kept ONLY as an
+ * explicitly-injectable `resolveStartIteration` for tests and callers that
+ * genuinely want it.
+ *
+ * NO LONGER AN AUTOMATIC FALLBACK (g1/B1). It used to be what
+ * {@link cliStartIterationResolver} degraded to whenever `pipeline plan --json`
+ * did not yield an entry, on the recorded judgement that "start-iteration
+ * resolution is a correctness concern, not a security boundary". **D4-1
+ * disproved that on production.** When step 1 is a `type: gate`, choosing a
+ * different entry step IS an approval bypass — and this rule cannot even see a
+ * gate: a body-less gate has no file under `steps/` at all (its plan path is
+ * the SYNTHETIC `steps/<name>.md`, pipeline-cli `manifest-plan.ts`
+ * dispatchPath), so it silently returns the NEXT step's body and the run
+ * begins one step past its own approval gate. The CLI cannot catch that — the
+ * path it receives resolves perfectly, to the wrong step.
+ *
+ * It is also not authoritative under a v2 manifest for ordinary reasons:
+ * declaration order is not filename order, and a multi-body step has no single
+ * file. `computePlan` is the only authority, which is why the default resolver
+ * shells `pipeline plan --json` and now REFUSES the job rather than guessing
+ * when that fails.
  */
 export const defaultResolveStartIteration: StartIterationResolver = (pipelineRootAbs, fs) => {
   const names = fs
@@ -204,12 +221,24 @@ export interface CliPlanResolverOptions {
   logger?: Logger;
 }
 
-/** The entry step's `steps/`-relative path from `pipeline plan --json`
- *  stdout (`plan.steps[0].rel` — the SAME field `pipeline next`'s own init
- *  and `pipeline-ui`'s launcher use as a run's entry point). Null when the
- *  output carries no usable entry (unparseable JSON, no `steps` array, or an
- *  empty plan). */
-function parsePlanEntryRel(stdout: string): string | null {
+/**
+ * The entry step's PIPELINE-ROOT-RELATIVE path from `pipeline plan --json`
+ * stdout, derived from `plan.steps[0].path`. Null when the output carries no
+ * usable entry (unparseable JSON, no `steps` array, an empty plan, a missing
+ * `path`, or a `path` outside the pipeline root).
+ *
+ * DERIVED FROM `path`, NOT `rel` (g1/A6a). `rel` is the iteration tree's row
+ * key, and pipeline-cli's `relLabel` strips the `steps/` prefix ONLY when the
+ * body actually lives under `steps/` — so `steps/${rel}` was right for the
+ * common shapes and silently wrong for a body declared anywhere else
+ * (`body: prompts/foo.md` became `steps/prompts/foo.md`, a path in neither
+ * tree). `path` is absolute and unambiguous, so no prefix has to be guessed.
+ *
+ * The result is byte-identical to the old rule for every shape the old rule
+ * got right — a body under `steps/`, a nested one, and a synthetic
+ * (body-less/multi-body) step path — and differs only where it was wrong.
+ */
+function parsePlanEntry(stdout: string, pipelineRootAbs: string): string | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -221,8 +250,14 @@ function parsePlanEntryRel(stdout: string): string | null {
   if (!Array.isArray(steps) || steps.length === 0) return null;
   const first: unknown = steps[0];
   if (typeof first !== 'object' || first === null || Array.isArray(first)) return null;
-  const rel = (first as Record<string, unknown>).rel;
-  return typeof rel === 'string' && rel.length > 0 ? rel : null;
+  const path = (first as Record<string, unknown>).path;
+  if (typeof path !== 'string' || path.length === 0) return null;
+  const rel = relative(pipelineRootAbs, path).split(/[\\/]/).join('/');
+  // A `..` escape or an absolute result means the plan's entry is not inside
+  // the root we checked out. Refusing beats sending the CLI a path that names
+  // something outside the workspace.
+  if (rel.length === 0 || rel.startsWith('../') || isAbsolute(rel)) return null;
+  return rel;
 }
 
 /**
@@ -231,26 +266,57 @@ function parsePlanEntryRel(stdout: string): string | null {
  * shells the SAME `pipelineBin` drive uses — `pipeline plan --root <abs>
  * --json` (`computePlan` is the single authority for step ordering, graph
  * entry, and target families) — and takes the plan's first enumerated step.
- * Output the CLI cannot be trusted to have supplied correctly (predates the
- * command, unparseable JSON, no steps) falls back to the flat lexical rule
- * (`defaultResolveStartIteration`) — start-iteration resolution is a
- * correctness concern, not a security boundary, so graceful degradation to
- * the historical behavior beats failing prep outright.
+ *
+ * FAILS CLOSED (g1/B1). Anything that leaves it without a trustworthy entry —
+ * a NON-ZERO exit (including exit 1, which is how `pipeline plan` reports hard
+ * plan ERRORS while still printing a plausible plan), an unsupported command,
+ * a missing binary, unparseable output, an empty plan, or an entry outside the
+ * pipeline root — throws `JobError` and the job never starts.
+ *
+ * It used to degrade to `defaultResolveStartIteration` instead, on the
+ * recorded judgement that "start-iteration resolution is a correctness
+ * concern, not a security boundary". **D4-1 disproved that on production**:
+ * when step 1 is a `type: gate`, entering the pipeline at a different step is
+ * an approval bypass, and the lexical rule cannot even see a body-less gate
+ * (no file under `steps/`), so it returns the NEXT step's body. The CLI-side
+ * g1 backstop cannot catch it either — nothing is synthesized, because
+ * resolution succeeds; it just succeeds on the wrong step.
+ *
+ * The compat case cannot be salvaged by narrowing the fallback, so it is not
+ * kept: a CLI too old to have `plan --json` is also too old to have g1's gate
+ * resolution, so a gate pipeline is unsafe on it regardless. Degrading there
+ * preserved a silently-wrong configuration rather than a working one.
+ *
+ * This also puts the resolver on the same footing as its sibling
+ * `cliContentHashVerifier`, which already consults `result.code` and throws:
+ * two checks that both decide whether a job may run should not disagree about
+ * whether a CLI failure is tolerable.
  */
 export function cliStartIterationResolver(options: CliPlanResolverOptions): StartIterationResolver {
   const bin = options.pipelineBin ?? 'pipeline';
   const logger = options.logger ?? nullLogger;
-  return async (pipelineRootAbs, fs) => {
+  return async (pipelineRootAbs) => {
     const result = await options.exec.run(bin, ['plan', '--root', pipelineRootAbs, '--json']);
-    const rel = isUnsupportedCommand(result) ? null : parsePlanEntryRel(result.stdout);
-    if (rel === null) {
-      logger.warn(
-        `pipeline plan unavailable or unusable for start-iteration resolution (exit ${result.code ?? 'none'})` +
-          `${execDetail(result)} — falling back to the lexical entry rule`
+    const entry = isUnsupportedCommand(result) || result.code !== 0 ? null : parsePlanEntry(result.stdout, pipelineRootAbs);
+    const why = isUnsupportedCommand(result)
+      ? 'this `pipeline` CLI does not support `plan --json` (too old, or the binary is missing)'
+      : result.code !== 0
+        ? `\`pipeline plan\` failed (exit ${result.code ?? 'none'})`
+        : entry === null
+          ? '`pipeline plan --json` produced no usable entry step'
+          : null;
+    if (why !== null) {
+      // Logged as well as thrown: the throw reaches the operator through the
+      // job's failure, the log reaches whoever is watching the daemon.
+      logger.warn(`start-iteration resolution refused the job: ${why}${execDetail(result)}`);
+      throw new JobError(
+        `cannot resolve the pipeline's entry step: ${why}${execDetail(result)} — refusing to start. ` +
+          `Entry resolution is not guessed: a pipeline whose first step is an approval gate would ` +
+          `otherwise begin one step past it. Fix the pipeline (\`pipeline plan --root <root> --json\`) ` +
+          `or upgrade the CLI, then re-dispatch.`
       );
-      return defaultResolveStartIteration(pipelineRootAbs, fs);
     }
-    return `steps/${rel}`;
+    return entry;
   };
 }
 
