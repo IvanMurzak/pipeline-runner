@@ -127,6 +127,32 @@ export interface RuntimeConfig {
    *  `DepartmentManager.resolveStuckAfterMs`. */
   stuckAfterSeconds?: number;
   lifecycle?: RuntimeLifecycle;
+  /**
+   * OPERATOR-DECLARED permission posture for this department, put on the
+   * spawn line by the adapter that understands it (`claude-code`'s
+   * `--permission-mode`). Absent means the adapter's own default — see
+   * `./claude-code.ts`'s `DEFAULT_PERMISSION_MODE` for why that default is
+   * `bypassPermissions` and why the department REPO cannot supply this.
+   *
+   * Kept as a plain string here on purpose: this module is adapter-agnostic,
+   * and the set of legal values belongs to the adapter. An unrecognised value
+   * is REFUSED at spawn rather than dropped — dropping it would silently fall
+   * back to a default that is WIDER than what the operator asked for, which
+   * inverts this file's "dropping a field can only narrow" rule.
+   */
+  permissionMode?: string;
+  /** OPERATOR-DECLARED extra `--allowedTools` entries for this department,
+   *  appended to the receiver tools the adapter already allows. The narrow
+   *  alternative to `permissionMode: 'bypassPermissions'`: unlike a project
+   *  `permissions.allow` block it is NOT suppressed in an untrusted
+   *  workspace, because it travels on the spawn line. */
+  allowedTools?: string[];
+  /** OPERATOR-OWNED settings document (a path) handed to the session via
+   *  `--settings`. This is how a department gets a full policy — allow/deny
+   *  rules, not just a mode — on a machine where the checkout is untrusted
+   *  and its own `.claude/settings.json` is therefore ignored. It is written
+   *  by whoever binds the department, never by the department's repo. */
+  settingsFile?: string;
   /** `container` adapter only (task d8, see the section above) — read-only-
    *  root/explicit-mounts/egress-allowlist spec. Every other adapter ignores
    *  this field entirely. */

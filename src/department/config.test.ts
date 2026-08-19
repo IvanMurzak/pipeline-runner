@@ -62,6 +62,52 @@ describe('parseDepartmentRuntimesEnv', () => {
     expect(map.get('d')?.parkExpirySeconds).toBeUndefined();
   });
 
+  // The operator-declared permission posture. Note the asymmetry with every
+  // other optional field above: those are DROPPED when malformed because
+  // dropping can only narrow. `permissionMode` is passed through as written
+  // instead, because dropping it falls back to `bypassPermissions` — WIDER
+  // than whatever the operator was trying to spell — so the refusal has to
+  // happen in the adapter, which owns the vocabulary, not here.
+  describe('permission posture', () => {
+    test('permissionMode, allowedTools and settingsFile parse', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({
+          d: {
+            adapterId: 'claude-code',
+            command: 'claude',
+            permissionMode: 'plan',
+            allowedTools: ['Bash', 'WebFetch'],
+            settingsFile: '/srv/policy.json',
+          },
+        })
+      );
+      expect(map.get('d')?.permissionMode).toBe('plan');
+      expect(map.get('d')?.allowedTools).toEqual(['Bash', 'WebFetch']);
+      expect(map.get('d')?.settingsFile).toBe('/srv/policy.json');
+    });
+
+    test('an unknown permissionMode is PASSED THROUGH, not dropped — the adapter refuses it', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({ d: { adapterId: 'claude-code', command: 'claude', permissionMode: 'acceptEdit' } })
+      );
+      expect(map.get('d')?.permissionMode).toBe('acceptEdit');
+    });
+
+    test('non-string allowedTools entries are filtered out', () => {
+      const map = parseDepartmentRuntimesEnv(
+        JSON.stringify({ d: { adapterId: 'claude-code', command: 'claude', allowedTools: ['Bash', 7, '', null] } })
+      );
+      expect(map.get('d')?.allowedTools).toEqual(['Bash']);
+    });
+
+    test('absent posture fields stay absent — the adapter default applies', () => {
+      const map = parseDepartmentRuntimesEnv(JSON.stringify({ d: { adapterId: 'claude-code', command: 'claude' } }));
+      expect(map.get('d')?.permissionMode).toBeUndefined();
+      expect(map.get('d')?.allowedTools).toBeUndefined();
+      expect(map.get('d')?.settingsFile).toBeUndefined();
+    });
+  });
+
   // department-mesh d8: an `adapterId: "container"` entry carries its
   // sandbox spec under `container` — parsed via `./container.ts`'s
   // `narrowContainerSpec`.

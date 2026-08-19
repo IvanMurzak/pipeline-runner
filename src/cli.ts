@@ -35,7 +35,15 @@
  *       workspace root, isolating it from every other home on the host.
  *
  *   bind --department <id> --command <cmd> [--adapter <id>] [--arg <a>]...
- *        [--cwd <path>] [--lifecycle <l>] [--spec <json>] [--home <path>]
+ *        [--cwd <path>] [--lifecycle <l>] [--permission-mode <m>]
+ *        [--allow-tool <t>]... [--settings-file <path>] [--spec <json>]
+ *        [--home <path>]
+ *       The three permission flags are the OPERATOR's declaration of what this
+ *       department may do, and they travel on the spawn line — the only
+ *       channel that survives a checkout the operator has never opened
+ *       interactively (a project `permissions.allow` block is ignored
+ *       wholesale in an untrusted workspace). A department's own repo can ask
+ *       for a posture; it cannot grant itself one.
  *   unbind --department <id> [--home <path>]
  *   bindings [--json] [--home <path>]
  *       simplified-onboarding b1 (design 05 §5 step 6, D14): the LOCAL
@@ -154,7 +162,7 @@ import {
 // MCP connection, because everything it reports it reports by calling a
 // receiver tool. Registered exactly like the other three: reachable only by a
 // department whose resolved `RuntimeConfig.adapterId === 'claude-code'`.
-import { ClaudeCodeAdapter } from './department/claude-code';
+import { CLAUDE_PERMISSION_MODES, ClaudeCodeAdapter, DEFAULT_PERMISSION_MODE } from './department/claude-code';
 // department-mesh d8 (D17): the `container` isolation-tier adapter — an
 // ADDITIONAL entry in the manager's adapter registry, resolved by
 // `RuntimeConfig.adapterId` exactly like `jsonl-process`; a department only
@@ -213,6 +221,7 @@ function usage(): never {
       '  start [--home <path>]',
       '  bind --department <id> --command <cmd> [--adapter <id>] [--arg <a>]...',
       '       [--cwd <path>] [--lifecycle <per-task|per-context|daemon>]',
+      '       [--permission-mode <mode>] [--allow-tool <tool>]... [--settings-file <path>]',
       '       [--spec <json>] [--home <path>]',
       '  unbind --department <id> [--home <path>]',
       '  bindings [--json] [--home <path>]',
@@ -881,6 +890,9 @@ function runBind(argv: string[]): void {
       arg: { type: 'string', multiple: true },
       cwd: { type: 'string' },
       lifecycle: { type: 'string' },
+      'permission-mode': { type: 'string' },
+      'allow-tool': { type: 'string', multiple: true },
+      'settings-file': { type: 'string' },
       spec: { type: 'string' },
       home: { type: 'string' },
     },
@@ -908,6 +920,24 @@ function runBind(argv: string[]): void {
   if (values.arg !== undefined) spec.args = values.arg;
   if (values.cwd !== undefined) spec.cwd = values.cwd;
   if (values.lifecycle !== undefined) spec.lifecycle = values.lifecycle;
+  // The operator's permission declaration. Validated HERE, at the moment it is
+  // typed, because this is the only point where a human is present to read the
+  // list of legal values; the adapter's own check exists for a binding file
+  // edited by hand and can only refuse at spawn, long after the mistake.
+  const permissionMode = values['permission-mode'];
+  if (permissionMode !== undefined) {
+    if (!(CLAUDE_PERMISSION_MODES as readonly string[]).includes(permissionMode)) {
+      fail(
+        `--permission-mode '${permissionMode}' is not one claude accepts.
+` +
+          `  Valid: ${CLAUDE_PERMISSION_MODES.join(', ')}. Omit the flag for the default, '${DEFAULT_PERMISSION_MODE}'.`
+      );
+    }
+    spec.permissionMode = permissionMode;
+  }
+  const allowTools = values['allow-tool'];
+  if (allowTools !== undefined && allowTools.length > 0) spec.allowedTools = allowTools;
+  if (values['settings-file'] !== undefined) spec.settingsFile = values['settings-file'];
   if (typeof spec.command !== 'string' || spec.command.length === 0) {
     fail('--command <cmd> is required (or a `command` field in --spec)');
   }
@@ -940,6 +970,14 @@ function runBind(argv: string[]): void {
     throw err;
   }
   console.log(`[pipeline-runner] bound ${values.department} -> ${stored.adapterId}: ${stored.command} (${store.path})`);
+  // Say the posture out loud, including when it is the default. A permission
+  // grant that is never printed is one nobody audits — and the default is
+  // `bypassPermissions`, which is precisely the one worth seeing.
+  console.log(
+    `[pipeline-runner] permissions: ${stored.permissionMode ?? `${DEFAULT_PERMISSION_MODE} (default)`}` +
+      (stored.allowedTools !== undefined ? `, +allowedTools: ${stored.allowedTools.join(', ')}` : '') +
+      (stored.settingsFile !== undefined ? `, --settings ${stored.settingsFile}` : '')
+  );
   // The store narrows rather than rejects on optional fields (dropping one can
   // only narrow what runs) — but a silently dropped flag is a lie, so say it.
   if (values.lifecycle !== undefined && stored.lifecycle === undefined) {
