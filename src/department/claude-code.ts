@@ -738,6 +738,31 @@ function metadataValue(raw: unknown): string | null {
  * sent it, and the one thing a department session must not get wrong: that the
  * runner observes only that the session ended, so a result nobody called
  * `task.complete` with is a result nobody receives.
+ *
+ * ── Why the lifecycle is spelled out too ───────────────────────────────────
+ *
+ * The rule above ("end with `task.complete` or `task.fail`") is not actionable
+ * on its own, and a live task proved it. A department session was given a
+ * multi-part work order, fanned it out — its own progress note read
+ * "Implementation and fact-finding are both running in isolated background
+ * workers" — sent a substantial interim report through `task.send_message`,
+ * closed it with "answers follow with the deploy confirmation", and ended its
+ * turn. There is no turn after that one: this adapter is `per-task` (`send()`
+ * refuses a second `task.start` in as many words), so the process was
+ * disposed with the delegated work still running and the terminal report never
+ * made. {@link BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON} caught it, which is
+ * the guard working exactly as designed — the sender was spared a `completed`
+ * whose summary was the session's own account of what it was still waiting
+ * for.
+ *
+ * But the session had broken no rule it was told. It was told WHICH tools end
+ * a task; it was never told that ending its turn ends the session, so
+ * delegating and planning a follow-up turn is not a thing this runtime can do.
+ * That is not discoverable from inside the session — nothing in the transcript
+ * distinguishes "my turn ended" from "my turn ended and I am gone" — so it
+ * belongs here, with the other facts about WHERE the session is running, and
+ * it has to name the two supported shapes rather than only forbid the third.
+ * A prohibition with no alternative just moves the failure.
  */
 export function buildSessionContext(task: DeptTaskSpec, serverName: string = DEPARTMENT_MCP_SERVER_NAME): string {
   // The first INBOUND message — same predicate, and the same reason, as
@@ -768,7 +793,21 @@ export function buildSessionContext(task: DeptTaskSpec, serverName: string = DEP
     'this session ended — anything you do not report through a tool call reaches nobody:',
     `- ${tool('task.update_progress')} while you work;`,
     `- ${tool('task.send_message')} to talk to the sender, ${tool('task.request_input')} to ask them something;`,
-    `- end with exactly one of ${tool('task.complete')} or ${tool('task.fail')}.`
+    `- end with exactly one of ${tool('task.complete')} or ${tool('task.fail')}.`,
+    '',
+    // x31's other half. See this function's doc for the production failure
+    // that showed the rule above is unusable without this one.
+    'ENDING YOUR TURN ENDS THIS SESSION. There is no later turn: this runtime is per-task, the',
+    'process is disposed at your result, and nothing can hand you a second one. So work you have',
+    'delegated to background tasks, subagents or detached processes is ABANDONED the moment you',
+    'stop, and a turn that ends that way is reported as a FAILURE, not a completion — the runner',
+    'cannot call a session that stopped mid-flight a success just because the process exited 0.',
+    'Two ways to run long work, and no third:',
+    `- do it within this turn — poll it, await it, and call ${tool('task.complete')} once it is genuinely done; or`,
+    `- if you need something from the sender first, park with ${tool('task.request_input')}, which suspends`,
+    '  the task deliberately and resumes it with their answer.',
+    `Reporting progress or a partial answer does NOT hold the session open: ${tool('task.update_progress')}`,
+    `and ${tool('task.send_message')} are one-way, and the turn still ends when you stop.`
   );
   return lines.join('\n');
 }
