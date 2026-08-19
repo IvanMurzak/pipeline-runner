@@ -28,6 +28,8 @@ import {
   buildPromptLines,
   buildSessionContext,
   ClaudeCodeAdapter,
+  DEFAULT_PERMISSION_MODE,
+  resolveDepartmentPermissionMode,
   DEPARTMENT_MCP_SERVER_NAME,
   EXECUTION_ID_PATTERN,
   BACKGROUND_WORK_OUTSTANDING_FAILURE_REASON,
@@ -128,7 +130,7 @@ function initFrame(status = 'connected', serverName = DEPARTMENT_MCP_SERVER_NAME
     session_id: 'sess-1',
     cwd: '/srv/departments/save-system',
     mcp_servers: [{ name: serverName, status }],
-    permissionMode: 'acceptEdits',
+    permissionMode: 'bypassPermissions',
   };
 }
 
@@ -166,10 +168,55 @@ describe('the argv (verified against `claude --help`, v2.1.220)', () => {
 
   test('states a permission mode and the department-only setting scopes (07 §8)', () => {
     const args = buildClaudeArgs({ sessionContext: 'ctx' });
-    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    // `bypassPermissions`, not `acceptEdits`: a `--print` session has no
+    // approver, so anything the mode does not pre-approve is DENIED rather
+    // than asked about — and the repo's own `permissions.allow` cannot make up
+    // the difference, because it is suppressed entirely in a workspace the
+    // operator never trusted. See DEFAULT_PERMISSION_MODE's doc.
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('bypassPermissions');
+    expect(DEFAULT_PERMISSION_MODE).toBe('bypassPermissions');
     // The department folder's own settings, not the operator's personal ones.
     expect(args[args.indexOf('--setting-sources') + 1]).toBe('project,local');
+    // Still the MODE flag, never the blunt one — `--permission-mode` is
+    // overridable per department, `--dangerously-skip-permissions` is not.
     expect(args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  test('a department-declared permissionMode overrides the default', () => {
+    expect(resolveDepartmentPermissionMode({ permissionMode: 'plan' }, DEFAULT_PERMISSION_MODE)).toBe('plan');
+    expect(resolveDepartmentPermissionMode({}, DEFAULT_PERMISSION_MODE)).toBe(DEFAULT_PERMISSION_MODE);
+  });
+
+  test('an unrecognised permissionMode is REFUSED, never silently widened to the default', () => {
+    // The whole point: the default is the widest posture there is, so falling
+    // back on a typo would grant more than the binding asked for.
+    expect(() => resolveDepartmentPermissionMode({ permissionMode: 'acceptEdit' }, DEFAULT_PERMISSION_MODE)).toThrow(
+      RuntimeAdapterError
+    );
+    expect(() => resolveDepartmentPermissionMode({ permissionMode: 'acceptEdit' }, DEFAULT_PERMISSION_MODE)).toThrow(
+      /acceptEdit/
+    );
+  });
+
+  test('department-declared allowedTools extend the ONE --allowedTools list', () => {
+    const args = buildClaudeArgs({ sessionContext: 'ctx', extraAllowedTools: ['Bash', 'WebFetch'] });
+    // One occurrence, not two: the option is variadic, so a second one would
+    // replace the receiver tools rather than add to them.
+    expect(args.filter((a) => a === '--allowedTools')).toHaveLength(1);
+    const allowed = (args[args.indexOf('--allowedTools') + 1] ?? '').split(',');
+    expect(allowed).toContain('Bash');
+    expect(allowed).toContain('WebFetch');
+    // The receiver tools are still there — the department's entries extend
+    // them, they do not replace them.
+    expect(allowed.some((t) => t.startsWith('mcp__'))).toBe(true);
+  });
+
+  test('a department-declared settingsFile is passed as --settings (the untrusted-workspace channel)', () => {
+    const args = buildClaudeArgs({ sessionContext: 'ctx', settingsFile: '/srv/policy.json' });
+    expect(args[args.indexOf('--settings') + 1]).toBe('/srv/policy.json');
+    // Absent by default — a department that declares no policy document gets
+    // no flag, not an empty one.
+    expect(buildClaudeArgs({ sessionContext: 'ctx' })).not.toContain('--settings');
   });
 
   test('never passes --strict-mcp-config (D28) — it would disable the department\'s own servers', () => {

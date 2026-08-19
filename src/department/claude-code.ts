@@ -516,13 +516,36 @@ export const CLAUDE_PERMISSION_MODES = ['acceptEdits', 'auto', 'bypassPermission
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number];
 
 /**
- * Stated, not inherited (07 §8). `acceptEdits` is the honest middle: a
- * department session is expected to work in its own folder, and `manual`
- * would deny every edit in a session that has no one to ask — but it is NOT
- * `bypassPermissions`, so the department folder's own `permissions` block
- * still governs everything outside that.
+ * Stated, not inherited (07 §8) — and stated as `bypassPermissions`, the
+ * operator-declared default for every department session.
+ *
+ * It used to be `acceptEdits`, "the honest middle". That middle does not
+ * exist in this process. A department session runs under `--print` with no
+ * interactive approver, so every call the mode does not pre-approve is not
+ * ASKED about — it is DENIED, silently, mid-task. `acceptEdits` pre-approves
+ * edits and nothing else: `git commit`, `bun test`, a deploy, a `WebFetch`
+ * all died on a prompt nobody could answer, and the department reported
+ * itself blocked instead of doing the work.
+ *
+ * The other half of the old reasoning — "the department folder's own
+ * `permissions` block still governs" — does not hold either. Project-scoped
+ * `permissions.allow` entries are IGNORED WITH A WARNING in a workspace that
+ * has not been trusted (`hasTrustDialogAccepted` in the operator's
+ * `~/.claude.json`), so on a freshly cloned checkout, a headless VPS or a CI
+ * box the repo's own policy silently does not apply at all. Nothing
+ * delivered on the SPAWN LINE (`--permission-mode`, `--settings`,
+ * `--allowedTools`) is gated that way.
+ *
+ * That asymmetry is the whole argument: the posture a department runs under
+ * has to come from the operator's spawn line, because it is the only channel
+ * that works on a machine the operator has just provisioned. A narrower
+ * posture stays expressible and still wins — per department, via
+ * `RuntimeConfig.permissionMode` / `allowedTools` / `settingsFile`
+ * (`pipeline-runner bind --permission-mode … --allow-tool …`). What is gone
+ * is the SILENT narrowing that looked like a safe default and behaved like an
+ * outage.
  */
-export const DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'acceptEdits';
+export const DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'bypassPermissions';
 
 /** `--setting-sources`: the department's own scopes, not the operator's
  *  personal one (07 §8). `null` omits the flag entirely. */
@@ -687,6 +710,12 @@ export interface ClaudeArgsOptions {
   serverName?: string;
   permissionMode?: ClaudePermissionMode;
   settingSources?: string | null;
+  /** `RuntimeConfig.allowedTools` — appended to the receiver tools in the ONE
+   *  `--allowedTools` list this builder emits. */
+  extraAllowedTools?: string[];
+  /** `RuntimeConfig.settingsFile` — the operator's policy document, passed as
+   *  `--settings`. */
+  settingsFile?: string;
   headersHelper?: string;
   sessionContext: string;
   /** `RuntimeConfig.args`, appended verbatim (model, `--add-dir`, …). Every
@@ -694,6 +723,36 @@ export interface ClaudeArgsOptions {
    *  builder emits (`--mcp-config`, `--allowedTools`) stop at the next `--`,
    *  so a BARE word here would be swallowed by the allow-list. */
   extraArgs?: string[];
+}
+
+/**
+ * The permission mode THIS department runs under: its own operator-declared
+ * `RuntimeConfig.permissionMode` when it has one, else the adapter-wide
+ * {@link DEFAULT_PERMISSION_MODE}.
+ *
+ * An unrecognised value is a REFUSAL, never a fallback. `narrowRuntimeConfig`
+ * passes the string through unvalidated on purpose — it is adapter-agnostic
+ * and does not own this vocabulary — so this is the first place that can
+ * judge it, and the honest judgement is "stop". Falling back would hand the
+ * session the DEFAULT, which is `bypassPermissions`: strictly WIDER than any
+ * narrower posture the operator was trying to spell, so a single typo would
+ * quietly grant more than the binding asks for. One loud error on one
+ * department is cheaper than a silent over-grant nobody reads.
+ */
+export function resolveDepartmentPermissionMode(
+  runtime: Pick<RuntimeConfig, 'permissionMode'>,
+  fallback: ClaudePermissionMode,
+): ClaudePermissionMode {
+  const declared = runtime.permissionMode;
+  if (declared === undefined) return fallback;
+  if ((CLAUDE_PERMISSION_MODES as readonly string[]).includes(declared)) {
+    return declared as ClaudePermissionMode;
+  }
+  throw new RuntimeAdapterError(
+    `claude-code: this department is bound with permissionMode '${declared}', which claude does not accept ` +
+      `(valid: ${CLAUDE_PERMISSION_MODES.join(', ')}). Re-bind it with a valid mode — refusing rather than ` +
+      `falling back to '${fallback}', which would grant MORE than the binding asks for.`
+  );
 }
 
 export function buildClaudeArgs(options: ClaudeArgsOptions): string[] {
@@ -716,7 +775,19 @@ export function buildClaudeArgs(options: ClaudeArgsOptions): string[] {
     options.headersHelper === undefined ? { serverName } : { serverName, headersHelper: options.headersHelper }
   );
   args.push('--mcp-config', mcpConfig);
-  args.push('--allowedTools', receiverToolNames(serverName).join(','));
+  // ONE `--allowedTools`, receiver tools first and the department's own
+  // entries after. It has to be one flag: the option is variadic, so a second
+  // occurrence does not merge with the first — it replaces it, and the list
+  // that loses is whichever came earlier.
+  args.push('--allowedTools', [...receiverToolNames(serverName), ...(options.extraAllowedTools ?? [])].join(','));
+  // The operator's policy document. Deliberately NOT the department repo's own
+  // `.claude/settings.json`: that file is suppressed wholesale in a workspace
+  // the operator has not trusted, and a department is routinely a fresh clone
+  // on a machine nobody has ever opened interactively. `--settings` is not
+  // gated that way, which is the entire reason policy travels this channel.
+  if (options.settingsFile !== undefined && options.settingsFile.length > 0) {
+    args.push('--settings', options.settingsFile);
+  }
   args.push(...(options.extraArgs ?? []));
   return args;
 }
@@ -1378,8 +1449,13 @@ export class ClaudeCodeAdapter implements EngineModule {
     const headersHelper = this.resolveHeadersHelper(invocation);
     const args = buildClaudeArgs({
       serverName: this.serverName,
-      permissionMode: this.permissionMode,
+      // Per-department first, adapter default second — and a bad value throws
+      // here, BEFORE anything is spawned, rather than running the session
+      // wider than the binding asked for.
+      permissionMode: resolveDepartmentPermissionMode(runtime, this.permissionMode),
       settingSources: this.settingSources,
+      ...(runtime.allowedTools !== undefined ? { extraAllowedTools: runtime.allowedTools } : {}),
+      ...(runtime.settingsFile !== undefined ? { settingsFile: runtime.settingsFile } : {}),
       ...(headersHelper !== undefined ? { headersHelper } : {}),
       sessionContext: buildSessionContext(task, this.serverName),
       ...(runtime.args !== undefined ? { extraArgs: runtime.args } : {}),

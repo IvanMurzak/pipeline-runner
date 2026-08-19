@@ -115,6 +115,21 @@ export function narrowRuntimeConfig(raw: unknown): RuntimeConfig | null {
   if (typeof r.lifecycle === 'string' && (LIFECYCLES as readonly string[]).includes(r.lifecycle)) {
     config.lifecycle = r.lifecycle as RuntimeLifecycle;
   }
+  // The operator-declared permission posture (see `RuntimeConfig`). Kept as
+  // written — NOT validated against the adapter's value set, which this
+  // adapter-agnostic module has no business knowing. A bad value is refused at
+  // spawn by the adapter that owns the vocabulary; dropping it here would fall
+  // back to a WIDER default and quietly grant more than the operator asked for.
+  if (typeof r.permissionMode === 'string' && r.permissionMode.length > 0) {
+    config.permissionMode = r.permissionMode;
+  }
+  if (Array.isArray(r.allowedTools)) {
+    const tools = r.allowedTools.filter((t): t is string => typeof t === 'string' && t.length > 0);
+    if (tools.length > 0) config.allowedTools = tools;
+  }
+  if (typeof r.settingsFile === 'string' && r.settingsFile.length > 0) {
+    config.settingsFile = r.settingsFile;
+  }
   if (r.container !== undefined) {
     const containerSpec = narrowContainerSpec(r.container);
     if (containerSpec !== undefined) config.container = containerSpec;
