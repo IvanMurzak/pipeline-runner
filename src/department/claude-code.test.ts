@@ -263,6 +263,31 @@ describe('the argv (verified against `claude --help`, v2.1.220)', () => {
     expect(context).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_fail`);
     expect(context).toContain('reaches nobody');
   });
+
+  // The other half of x31, and the reason that guard kept firing on sessions
+  // that had broken no rule they were told: knowing WHICH tools end a task is
+  // not enough if you do not know that ending your turn ends the session.
+  test('the session context says the turn IS the session — the fact x31 fires on', () => {
+    const context = buildSessionContext(makeTaskSpec());
+    expect(context).toContain('ENDING YOUR TURN ENDS THIS SESSION');
+    // Named consequence, not a vague warning: delegated work is abandoned, and
+    // the runner reports that as a failure rather than a completion.
+    expect(context).toContain('background tasks');
+    expect(context).toContain('ABANDONED');
+    expect(context).toMatch(/reported as a FAILURE/);
+  });
+
+  test('it names the two SUPPORTED shapes, not just the forbidden one', () => {
+    // A prohibition with no alternative moves the failure instead of removing
+    // it — the session still has long work to run and no sanctioned way to.
+    const context = buildSessionContext(makeTaskSpec());
+    expect(context).toContain('do it within this turn');
+    expect(context).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_request_input`);
+    // And it closes the near miss the live failure actually took: an interim
+    // report is one-way and does NOT hold the session open.
+    expect(context).toContain(`mcp__${DEPARTMENT_MCP_SERVER_NAME}__task_send_message`);
+    expect(context).toMatch(/does NOT hold the session open/);
+  });
 });
 
 describe('the --mcp-config payload (D23)', () => {
