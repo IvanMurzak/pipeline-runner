@@ -9,6 +9,7 @@ import {
   cliTaskPipelineResolver,
   pipelinePathFromManifest,
   PIPELINES_DIR_REL,
+  taskText,
 } from './matcher';
 
 const CHECKOUT = join('/w', 'job-1');
@@ -29,6 +30,39 @@ describe('dispatch — task query', () => {
 
   test('no labels ⇒ no hint line', () => {
     expect(buildTaskQuery(makeTask({ labels: [] }))).toBe('Ship the release\nCut a release for the api service');
+  });
+});
+
+// concept-parity f1b: `taskText` is the composition the runner DELIVERS
+// (`--task` → `.runtime/<run>/task.md` → `${run.task}`). It is the same
+// function `buildTaskQuery` builds on, which is the whole point: the text a
+// lease is matched on and the text its steps read cannot drift apart.
+describe('dispatch — task text (the delivered statement, f1b)', () => {
+  test('is title + newline + body — the query WITHOUT the labels hint line', () => {
+    expect(taskText(makeTask())).toBe('Ship the release\nCut a release for the api service');
+  });
+
+  test('the query is exactly the text plus the hint line — one composition, not two', () => {
+    const task = makeTask();
+    expect(buildTaskQuery(task)).toBe(`${taskText(task)}\nrelease`);
+  });
+
+  test('with no labels the two are identical', () => {
+    const task = makeTask({ labels: [] });
+    expect(buildTaskQuery(task)).toBe(taskText(task));
+  });
+
+  test('an empty body leaves just the title (trimmed, no trailing newline)', () => {
+    expect(taskText(makeTask({ body: '' }))).toBe('Ship the release');
+  });
+
+  test('a whitespace-only task trims to empty — the runner drops it rather than emitting `--task ""`', () => {
+    expect(taskText(makeTask({ title: '  ', body: '\n\t' }))).toBe('');
+  });
+
+  test('interior newlines and metacharacters are preserved verbatim (only the ends are trimmed)', () => {
+    const body = 'Line two = two\nLine three; echo $(id)  ';
+    expect(taskText(makeTask({ title: '  A title', body }))).toBe('A title\nLine two = two\nLine three; echo $(id)');
   });
 });
 

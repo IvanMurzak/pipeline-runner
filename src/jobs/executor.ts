@@ -71,7 +71,10 @@ import type { Logger } from '../core/log';
 import { nullLogger } from '../core/log';
 import type { WireFrame } from '../core/wire';
 // T2-05 ADDITIVE: the task-dispatch pipeline-resolution seam + its default.
-import { cliTaskPipelineResolver, type TaskPipelineResolver } from '../dispatch/matcher';
+// concept-parity f1b: `taskText` is the SHARED composition the BM25 matcher
+// scores — reused (never re-implemented) so the delivered `--task` and the
+// matched query are the same string.
+import { cliTaskPipelineResolver, taskText, type TaskPipelineResolver } from '../dispatch/matcher';
 // f4: the per-RUN isolated agent home (pooled-machine cross-tenant isolation).
 import { agentHomeEnv, agentHomesRootFor, disposeAgentHome, provisionAgentHome } from './agent-home';
 import {
@@ -470,9 +473,21 @@ export class JobExecutor {
     this.setState('preparing');
 
     // T2-05 ADDITIVE: task-dispatch coherence — the `@task` sentinel is only
-    // meaningful WITH a task payload (presence rule: `task` ⇔ sentinel). A
-    // sentinel lease without one has nothing to match on: fail actionably
-    // before wasting a checkout. Fixed-pipeline leases never hit this.
+    // meaningful WITH a task payload. The rule is ONE-WAY:
+    //
+    //     sentinel ⇒ task          (guarded here; a sentinel lease with
+    //                               nothing to match on fails actionably,
+    //                               before a checkout is wasted)
+    //     task ⇒ sentinel          NOT TRUE — do not guard it.
+    //
+    // It was an equivalence until concept-parity f2: cloud now sends `task`
+    // on a NAMED-pipeline lease too, so the user's task statement reaches the
+    // steps of a pipeline they picked themselves. Rejecting a task on a named
+    // pipeline would reject precisely the feature being shipped.
+    //
+    // What stays gated on the sentinel is RESOLUTION, not the payload — see
+    // `resolvePipeline` below: a named-pipeline lease carrying a task must
+    // never BM25-resolve. It drives the pipeline it was given, with `--task`.
     const task = lease.task;
     if (task === undefined && lease.pipeline_ref.pipeline === TASK_PIPELINE_UNRESOLVED) {
       const reason = `lease pipeline is the task sentinel '${TASK_PIPELINE_UNRESOLVED}' but the lease carries no task payload`;
@@ -547,6 +562,14 @@ export class JobExecutor {
       runId: lease.run_id,
       ...(overrides?.model ? { defaultModel: overrides.model } : {}),
       ...(overrides?.effort ? { defaultEffort: overrides.effort } : {}),
+      // concept-parity f1b: the lease's task statement, delivered as `--task`
+      // on EVERY invocation. Composed by the matcher's own `taskText`, so the
+      // text this run is matched on (sentinel leases) and the text its steps
+      // read back through `${run.task}` are the same string by construction.
+      // Threaded on BOTH lease shapes — sentinel AND named pipeline — because
+      // after f2 a fixed-pipeline lease carries a task too; the sentinel only
+      // decides whether `resolvePipeline` above runs.
+      ...(task !== undefined ? { task: taskText(task) } : {}),
       // env-variables d1: the lease's frozen `PP_*` map — `--var` on the START
       // invocation ONLY (buildDriveArgs enforces this structurally).
       ...(lease.variables !== undefined ? { variables: lease.variables } : {}),
@@ -703,6 +726,19 @@ export class JobExecutor {
       runId: lease.run_id,
       ...(overrides?.model ? { defaultModel: overrides.model } : {}),
       ...(overrides?.effort ? { defaultEffort: overrides.effort } : {}),
+      // concept-parity f1b: the task rides a resume too — unlike `variables`
+      // below, and for the opposite reason (see `DriveTarget.task`).
+      //
+      // The record does not persist the task, so a reconcile FRESH resume
+      // (`manager.ts#leaseFromRecord`, which synthesizes a lease from the
+      // record) arrives here with `lease.task` undefined and emits no flag.
+      // That is correct, not a hole: this path re-enters the RECORDED
+      // checkout, where the CLI's own `.runtime/<run>/task-ref.json` still
+      // names the task file it wrote on the start invocation, and drive falls
+      // back to it. The path that genuinely needs the flag is the FRESH
+      // workspace — f3's cross-machine adoption — and that one runs through
+      // `start()` above, where the real lease is in hand.
+      ...(lease.task !== undefined ? { task: taskText(lease.task) } : {}),
       // NEVER variables on a resume: frozen at init (D11), structurally
       // dropped by buildDriveArgs for non-start modes anyway.
     };
