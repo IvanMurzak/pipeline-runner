@@ -237,6 +237,137 @@ describe('buildDriveArgs', () => {
       ]);
     });
   });
+
+  // concept-parity f1b: the lease's TASK STATEMENT rides as `--task <text>`.
+  // Run-level like --default-model/--default-effort/--executor, NOT start-only
+  // like --var: the CLI rewrites `.runtime/<run>/task.md` and re-persists
+  // `task-ref.json` idempotently, and a resume that adopts a FRESH workspace
+  // (f3 cross-machine handoff) has no persisted ref to fall back on.
+  describe('lease task (concept-parity f1b)', () => {
+    const TASK = 'Ship 0.16.0\nCut the release for the api service and post the notes';
+
+    test('a START invocation emits --task as TWO argv elements, before the mode flags', () => {
+      expect(buildDriveArgs({ ...TARGET, task: TASK }, { kind: 'start', startIteration: 'steps/01-plan.md' })).toEqual([
+        'drive',
+        '--root',
+        '/ws/.pipeline/release',
+        '--run-id',
+        'run-1',
+        '--task',
+        TASK,
+        '--start',
+        'steps/01-plan.md',
+        '--json',
+      ]);
+    });
+
+    test('a PLAIN RESUME still carries --task (unlike --var, which is frozen at start)', () => {
+      expect(buildDriveArgs({ ...TARGET, task: TASK }, { kind: 'resume' })).toEqual([
+        'drive',
+        '--root',
+        '/ws/.pipeline/release',
+        '--run-id',
+        'run-1',
+        '--task',
+        TASK,
+        '--resume',
+        '--json',
+      ]);
+    });
+
+    test('an ANSWER invocation still carries --task', () => {
+      expect(
+        buildDriveArgs({ ...TARGET, task: TASK }, { kind: 'answer', startIteration: 'steps/02-deploy.md', answer: 'yes' })
+      ).toEqual([
+        'drive',
+        '--root',
+        '/ws/.pipeline/release',
+        '--run-id',
+        'run-1',
+        '--task',
+        TASK,
+        '--resume',
+        '--start',
+        'steps/02-deploy.md',
+        '--answer',
+        'yes',
+        '--json',
+      ]);
+    });
+
+    test('an ABSENT task is byte-identical to before the field existed (regression, all three modes)', () => {
+      for (const mode of [
+        { kind: 'start', startIteration: 'steps/01-plan.md' },
+        { kind: 'resume' },
+        { kind: 'answer', startIteration: 'steps/02-deploy.md', answer: 'yes' },
+      ] as const) {
+        expect(buildDriveArgs({ ...TARGET, task: undefined }, mode)).toEqual(buildDriveArgs(TARGET, mode));
+        expect(buildDriveArgs({ ...TARGET, task: undefined }, mode)).not.toContain('--task');
+      }
+    });
+
+    test('an EMPTY / whitespace-only task emits NOTHING — `--task ""` is a CLI exit-2 usage error', () => {
+      const noFlag = buildDriveArgs(TARGET, { kind: 'start', startIteration: 'steps/01-plan.md' });
+      for (const blank of ['', '   ', '\n', ' \t\n ']) {
+        expect(buildDriveArgs({ ...TARGET, task: blank }, { kind: 'start', startIteration: 'steps/01-plan.md' })).toEqual(
+          noFlag
+        );
+      }
+    });
+
+    test('blank is the OPPOSITE rule to `--var NAME=`: one is dropped, the other rides through', () => {
+      const args = buildDriveArgs(
+        { ...TARGET, task: '   ', variables: { PP_EMPTY: '' } },
+        { kind: 'start', startIteration: 'steps/01-plan.md' }
+      );
+      expect(args).not.toContain('--task'); // blank task ⇒ no flag (exit-2 guard)
+      expect(args).toContain('--var');
+      expect(args[args.indexOf('--var') + 1]).toBe('PP_EMPTY='); // blank var ⇒ emitted verbatim (D1)
+    });
+
+    test('a multi-line value with spaces, `=` and shell metacharacters stays ONE argv element', () => {
+      const nasty = 'Fix "$(whoami)" && rm -rf /\nKEY=value; echo `id` | tee /tmp/x  # done';
+      const args = buildDriveArgs({ ...TARGET, task: nasty }, { kind: 'start', startIteration: 'steps/01-plan.md' });
+      const i = args.indexOf('--task');
+      expect(i).toBeGreaterThanOrEqual(0);
+      expect(args[i + 1]).toBe(nasty); // verbatim: no shell, no joining, no re-splitting
+      expect(args.filter((a) => a === '--task')).toHaveLength(1);
+      expect(args.filter((a) => a.includes('\n'))).toEqual([nasty]); // the newline never split an element
+    });
+
+    test('leading/trailing whitespace is trimmed off the delivered value (same rule as --default-model)', () => {
+      const args = buildDriveArgs({ ...TARGET, task: `  ${TASK}\n\n` }, { kind: 'resume' });
+      expect(args[args.indexOf('--task') + 1]).toBe(TASK);
+    });
+
+    test('task composes with the execution overrides, the executor pin AND variables', () => {
+      expect(
+        buildDriveArgs(
+          { ...TARGET, defaultModel: 'opus', defaultEffort: 'high', executor: 'claude-sdk', task: TASK, variables: { PP_SERVICE: 'payments' } },
+          { kind: 'start', startIteration: 'steps/01-plan.md' }
+        )
+      ).toEqual([
+        'drive',
+        '--root',
+        '/ws/.pipeline/release',
+        '--run-id',
+        'run-1',
+        '--default-model',
+        'opus',
+        '--default-effort',
+        'high',
+        '--executor',
+        'claude-sdk',
+        '--task',
+        TASK,
+        '--start',
+        'steps/01-plan.md',
+        '--var',
+        'PP_SERVICE=payments',
+        '--json',
+      ]);
+    });
+  });
 });
 
 describe('parseDriveFinalJson', () => {

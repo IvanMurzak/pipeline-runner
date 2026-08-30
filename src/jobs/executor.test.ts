@@ -14,6 +14,7 @@ import {
   GIT_OK,
   makeLease,
   makeRecord,
+  makeTask,
 } from './_helpers';
 import type { JobRecord } from './job-store';
 import { JobError, type JobExecResult } from './types';
@@ -419,6 +420,144 @@ describe('JobExecutor — lease variables (env-variables d1)', () => {
       'PP_SERVICE=payments',
       '--json',
     ]);
+  });
+});
+
+// ── concept-parity f1b ──────────────────────────────────────────────────────
+// The lease's `task` reaches the CLI as `--task`. Before this, the runner read
+// `lease.task` only to CHOOSE a pipeline (sentinel leases) and threw the text
+// away — a run that looked successful while discarding the user's input. These
+// leases are FIXED-pipeline (`makeLease`, `pipeline: 'release'`), which is the
+// post-f2 wire shape: a named pipeline carrying a task.
+describe('JobExecutor — the lease task (concept-parity f1b)', () => {
+  const TASK_TEXT = 'Ship the release\nCut a release for the api service';
+
+  /** `makeTask()`'s title/body, composed by the matcher's `taskText`. */
+  function taskLease(overrides: Parameters<typeof makeTask>[0] = {}) {
+    return makeLease({ task: makeTask(overrides) });
+  }
+
+  test('a FIXED-pipeline lease carrying a task drives with --task (title + body, no labels line)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED], { lease: taskLease() });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(1);
+    expect(drive[0]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--task',
+      TASK_TEXT,
+      '--start',
+      'steps/01-plan.md',
+      '--json',
+    ]);
+    // The fixture's `labels: ['release']` is a BM25 hint — it is NOT delivered
+    // as the trailing hint line `buildTaskQuery` appends for scoring.
+    expect(drive[0]!.args[drive[0]!.args.indexOf('--task') + 1]!.endsWith('\nrelease')).toBe(false);
+  });
+
+  test('the task rides the ANSWER resume too (unlike --var, which is start-only)', async () => {
+    const world = makeWorld([driveAwaiting(), DRIVE_COMPLETED], {
+      lease: taskLease(),
+      needsInput: { onQuestion: () => 'host-a' },
+    });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+
+    const drive = world.exec.of('pipeline');
+    expect(drive).toHaveLength(2);
+    expect(drive[1]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--task',
+      TASK_TEXT,
+      '--resume',
+      '--start',
+      'steps/02-deploy.md',
+      '--answer',
+      'host-a',
+      '--json',
+    ]);
+  });
+
+  test('a lease WITHOUT a task drives byte-identically to before the field existed (regression)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED]); // makeLease() default carries no `task`
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).not.toContain('--task');
+    expect(world.exec.of('pipeline')[0]!.args).toEqual([
+      'drive',
+      '--root',
+      PIPELINE_ROOT,
+      '--run-id',
+      'run-1',
+      '--start',
+      'steps/01-plan.md',
+      '--json',
+    ]);
+  });
+
+  test('a blank task never reaches the CLI (it would be an exit-2 usage error)', async () => {
+    const world = makeWorld([DRIVE_COMPLETED], { lease: taskLease({ title: '  ', body: '\n' }) });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+    expect(world.exec.of('pipeline')[0]!.args).not.toContain('--task');
+  });
+
+  test('the delivered text is the matcher composition, not a second one (multi-line, verbatim)', async () => {
+    const body = 'Line one\nLine two = two\nLine three; echo $(id)';
+    const world = makeWorld([DRIVE_COMPLETED], { lease: taskLease({ title: 'A title', body }) });
+    await world.executor.start();
+    const args = world.exec.of('pipeline')[0]!.args;
+    expect(args[args.indexOf('--task') + 1]).toBe(`A title\n${body}`);
+    expect(args.filter((a) => a === '--task')).toHaveLength(1);
+  });
+
+  test('an ADOPTION resume delivers the task from the real lease it was re-offered with', async () => {
+    const record = makeRecord({
+      job_id: 'job-1',
+      run_id: 'run-1',
+      checkout_dir: join('/w', 'job-old'),
+      pipeline_root: join('/w', 'job-old', '.pipeline', 'release'),
+      start_iteration: 'steps/01-plan.md',
+    });
+    const world = makeWorld([DRIVE_COMPLETED], { lease: taskLease(), resume: { record, announce: true } });
+    const result = await world.executor.start();
+    expect(result.ok).toBe(true);
+    expect(world.exec.of('pipeline')[0]!.args).toEqual([
+      'drive',
+      '--root',
+      record.pipeline_root!,
+      '--run-id',
+      'run-1',
+      '--task',
+      TASK_TEXT,
+      '--resume',
+      '--json',
+    ]);
+  });
+
+  test('a reconcile FRESH resume emits no --task — the record persists none, and the CLI has its own task-ref', async () => {
+    // `manager.ts#leaseFromRecord` synthesizes a task-less lease; the recorded
+    // checkout still holds `.runtime/<run>/task-ref.json` from the start
+    // invocation, so drive falls back to it rather than running task-less.
+    const record = makeRecord({
+      job_id: 'job-1',
+      run_id: 'run-1',
+      checkout_dir: join('/w', 'job-old'),
+      pipeline_root: join('/w', 'job-old', '.pipeline', 'release'),
+      start_iteration: 'steps/01-plan.md',
+    });
+    const world = makeWorld([DRIVE_COMPLETED], { resume: { record, announce: false } });
+    await world.executor.start();
+    expect(world.exec.of('pipeline')[0]!.args).not.toContain('--task');
   });
 });
 

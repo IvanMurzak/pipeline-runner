@@ -59,14 +59,36 @@ export type TaskPipelineResolver = (input: TaskDispatchInput) => Promise<TaskPip
 export const PIPELINES_DIR_REL = '.pipeline';
 
 /**
- * The BM25 query for a task: `title + "\n" + body` (the protocol contract),
- * with `labels` appended as one trailing line of hint terms when present —
- * the protocol declares task labels "routing/BM25 hints", and extra query
- * terms are exactly how BM25 consumes hints (absent from every manifest they
- * score zero and change nothing).
+ * A task's STATEMENT: `title + "\n" + body`, trimmed — the protocol contract
+ * for what a task says, and the shared half of the BM25 query below.
+ *
+ * f1b factored this out of `buildTaskQuery` rather than duplicating it in
+ * `../jobs/executor.ts`, so the text a lease is MATCHED on and the text
+ * DELIVERED to the run (`--task`, `.runtime/<run>/task.md`, `${run.task}`)
+ * cannot drift apart: one composition, two consumers.
+ *
+ * `labels` are deliberately NOT part of it — see `buildTaskQuery`.
+ */
+export function taskText(task: LeaseTask): string {
+  return `${task.title}\n${task.body}`.trim();
+}
+
+/**
+ * The BM25 query for a task: `taskText` (`title + "\n" + body`), with
+ * `labels` appended as one trailing line of hint terms when present — the
+ * protocol declares task labels "routing/BM25 hints", and extra query terms
+ * are exactly how BM25 consumes hints (absent from every manifest they score
+ * zero and change nothing).
+ *
+ * f1b: that trailing line is a SCORING device, not part of what the task
+ * says, which is why delivery uses `taskText` and not this. Appended to a
+ * delivered `task.md` the labels would arrive as a bare final line of words
+ * with no syntax and no provenance — indistinguishable, to the step reading
+ * `${run.task}`, from a sentence the author wrote. A hint that is invisible
+ * to a manifest must stay invisible to a step.
  */
 export function buildTaskQuery(task: LeaseTask): string {
-  const text = `${task.title}\n${task.body}`.trim();
+  const text = taskText(task);
   return task.labels.length > 0 ? `${text}\n${task.labels.join(' ')}` : text;
 }
 

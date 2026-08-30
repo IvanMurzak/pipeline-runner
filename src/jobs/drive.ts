@@ -81,6 +81,35 @@ export interface DriveTarget {
    *  Absent/blank ⇒ no flag, so a non-hosted run's argv is byte-identical to
    *  before this field existed. */
   executor?: string;
+  /** concept-parity f1b — the run's TASK STATEMENT, delivered as `--task
+   *  <text>`. The task **text** (`../dispatch/matcher.ts#taskText`, i.e.
+   *  `title + "\n" + body`), never the `LeaseTask` object: this is the
+   *  argument of a CLI flag, and the same composition the BM25 matcher scores
+   *  so the text matched on and the text delivered cannot diverge.
+   *
+   *  What it maps to CLI-side: `pipeline drive --task` writes it to
+   *  `.runtime/<run>/task.md` and records the path in `task-ref.json`, which
+   *  is what `${run.task}` reads back inside a step (pipeline-cli
+   *  `src/commands/drive.ts` "Task delivery", `src/commands/next.ts`
+   *  `readTaskText`). This package does NOT write either file — it passes a
+   *  flag; the CLI owns the persistence.
+   *
+   *  Rides EVERY invocation (start / resume / answer), like defaultModel,
+   *  defaultEffort and executor above and UNLIKE `variables` below. The
+   *  START-only rule exists because the CLI rejects a repeated `--var` on an
+   *  already-frozen resume with an exit-2 usage error; `--task` has no such
+   *  rule — the CLI rewrites `task.md` and re-persists `task-ref.json`
+   *  idempotently. And a resume that adopts a FRESH workspace (f3's
+   *  cross-machine handoff) has no persisted `task-ref.json` to fall back on,
+   *  so copying the `variables` pattern here would silently drop the task on
+   *  exactly the re-entry paths that need it most.
+   *
+   *  Absent/blank ⇒ no flag: `--task` with an empty or whitespace-only value
+   *  is a usage error (exit 2) BEFORE any step runs, so a blank value must
+   *  produce argv byte-identical to no task at all. That is the OPPOSITE of
+   *  the `--var NAME=` rule below, where an empty value is a legitimate
+   *  distinct value and rides through unfiltered. */
+  task?: string;
   /** env-variables design (task b1/d1) — the lease's frozen `PP_*` map
    *  (`lease.variables`). Mapped to one `--var NAME=value` flag per entry —
    *  but, unlike `defaultModel`/`defaultEffort` above, ONLY on the START
@@ -106,6 +135,14 @@ export function buildDriveArgs(target: DriveTarget, mode: DriveMode): string[] {
   // hosted `standalone` run cannot decay into `claude-cli` on re-entry.
   const executor = target.executor?.trim();
   if (executor) args.push('--executor', executor);
+  // concept-parity f1b: the task statement, same run-level treatment again —
+  // start, resume AND answer, deliberately NOT inside `case 'start'` below.
+  // TWO argv elements, never shell-joined and never re-split, so a multi-line
+  // statement containing spaces, `=` or shell metacharacters arrives as ONE
+  // argument. Blank/whitespace is dropped rather than forwarded: the CLI
+  // treats an empty `--task` as a usage error (exit 2) before any step runs.
+  const task = target.task?.trim();
+  if (task) args.push('--task', task);
   switch (mode.kind) {
     case 'start':
       args.push('--start', mode.startIteration);

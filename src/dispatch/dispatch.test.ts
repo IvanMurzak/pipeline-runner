@@ -34,6 +34,10 @@ const RELEASE_ROOT = join(PIPELINES_DIR, 'release');
 const RELEASE_MANIFEST = join(RELEASE_ROOT, 'PIPELINE.md');
 
 const TASK_QUERY = 'Ship the release\nCut a release for the api service\nrelease';
+/** f1b: what `--task` DELIVERS — `title + "\n" + body`, WITHOUT the trailing
+ *  `labels` hint line the BM25 query above appends. The two differ by exactly
+ *  that line, and this pair is the pin on that. */
+const TASK_TEXT = 'Ship the release\nCut a release for the api service';
 
 /** An fs pre-seeded so the RESOLVED pipeline's prep succeeds. */
 function readyFs(): FakeJobFs {
@@ -95,7 +99,9 @@ describe('task dispatch — happy path (task → match → resolve → drive)', 
     expect(match.opts.cwd).toBe(DIR);
 
     // Drive runs the RESOLVED pipeline root — identity reaches the server via
-    // the normal event/run_status path, no new frames.
+    // the normal event/run_status path, no new frames. f1b: and it DELIVERS
+    // the task text it matched on, so `${run.task}` resolves inside a step
+    // instead of the run silently throwing the user's input away.
     const drive = exec.calls[5]!;
     expect(drive.args).toEqual([
       'drive',
@@ -103,10 +109,16 @@ describe('task dispatch — happy path (task → match → resolve → drive)', 
       RELEASE_ROOT,
       '--run-id',
       'run-1',
+      '--task',
+      TASK_TEXT,
       '--start',
       'steps/01-plan.md',
       '--json',
     ]);
+    // The delivered text and the matched query are the SAME composition, one
+    // trailing hint line apart — never two independent compositions.
+    expect(TASK_QUERY.startsWith(TASK_TEXT)).toBe(true);
+    expect(TASK_QUERY.slice(TASK_TEXT.length)).toBe('\nrelease');
     expect(sink.frames).toEqual([
       { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'started' },
       { type: 'run_status', run_id: 'run-1', job_id: 'job-1', phase: 'completed', outcome: 'completed' },
@@ -214,6 +226,49 @@ describe('task dispatch — the resolution seam', () => {
       '--json',
     ]);
     expect(sink.ofType('run_status').map((f) => f.phase)).toEqual(['started', 'completed']);
+  });
+});
+
+// concept-parity f1b/f2: `task` and the `@task` sentinel are no longer
+// equivalent on the wire. The surviving implication is one-way — sentinel ⇒
+// task — and the sentinel is what gates RESOLUTION, not the payload.
+describe('task dispatch — a NAMED pipeline carrying a task (post-f2 wire)', () => {
+  test('drives the pipeline it was GIVEN, delivers --task, and never BM25-resolves', async () => {
+    const exec = new FakeJobExec((cmd) => (cmd === 'git' ? GIT_OK : DRIVE_COMPLETED));
+    const { executor, sink } = makeExecutor(exec, {
+      lease: makeLease({ task: makeTask() }),
+      resolveTaskPipeline: () => {
+        throw new Error('a NAMED-pipeline lease must never reach the dispatch matcher');
+      },
+    });
+    const result = await executor.start();
+
+    expect(result).toEqual({ job_id: 'job-1', run_id: 'run-1', ok: true, outcome: 'completed' });
+    const kinds = exec.calls.map((c) => (c.cmd === 'git' ? 'git' : c.args[0]));
+    expect(kinds).toEqual(['git', 'git', 'git', 'git', 'drive']); // no `match` spawn
+    expect(exec.calls[4]!.args).toEqual([
+      'drive',
+      '--root',
+      RELEASE_ROOT,
+      '--run-id',
+      'run-1',
+      '--task',
+      TASK_TEXT,
+      '--start',
+      'steps/01-plan.md',
+      '--json',
+    ]);
+    expect(sink.ofType('run_status').map((f) => f.phase)).toEqual(['started', 'completed']);
+  });
+
+  test('the coherence guard stays ONE-WAY: it rejects a task-less SENTINEL, never a task-carrying NAMED pipeline', async () => {
+    // Converse direction — allowed (above). Forward direction — still refused:
+    const exec = dispatchExec(matchOutput([]), []);
+    const { executor } = makeExecutor(exec, { lease: makeTaskLease({}, { task: undefined }) });
+    const result = await executor.start();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('carries no task payload');
+    expect(exec.calls).toEqual([]);
   });
 });
 
