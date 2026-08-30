@@ -1,0 +1,21 @@
+src/core/config.ts
+  s_b2fdbf3e878420::t_5ef04539c8f1c2 51-60,62-68
+tsconfig.json
+  s_b2fdbf3e878420::t_5c7b2a4f105edd 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "0a25e4f9dfa3dc0466e5bf2f9cc826987e802428",
+  "prompts": {},
+  "sessions": {
+    "s_b2fdbf3e878420": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_b2fdbf3e878420",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

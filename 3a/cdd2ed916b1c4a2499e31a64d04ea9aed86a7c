@@ -1,0 +1,19 @@
+src/shipper/shipper.ts
+  s_06997979c0ad33::t_85ae933e4d434e 400-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "3acdd2ed916b1c4a2499e31a64d04ea9aed86a7c",
+  "prompts": {},
+  "sessions": {
+    "s_06997979c0ad33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_06997979c0ad33",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

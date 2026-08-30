@@ -1,0 +1,29 @@
+tests/shipper-privacy-approval-gate.test.ts
+  s_418580f97e29c2::t_effa8f0338d98a 33,36-54
+  s_418580f97e29c2::t_93654fe9e5aa4c 67-75
+  s_418580f97e29c2::t_2c5fdfb41a54f4 106,109-114
+  s_418580f97e29c2::t_aa67babedf4beb 1-32,34-35,55-66,76-105,107-108,115-402
+src/shipper/privacy.ts
+  s_418580f97e29c2::t_14bcad0584a491 249-272
+  s_418580f97e29c2::t_9e11f7b6afa050 38-113
+  s_418580f97e29c2::t_a1965f7816acde 834-837
+  s_418580f97e29c2::t_ac691ee806dfdb 1021-1025
+  s_418580f97e29c2::t_91885cd5f94e5d 36-37
+  s_418580f97e29c2::t_53ba3bc5f68d0c 248,956-1003
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "8d31f0b6842e0f66ae911515504c5a040031824b",
+  "prompts": {},
+  "sessions": {
+    "s_418580f97e29c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1f6f89f-af06-4edb-8f78-bfa0ba9a382c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

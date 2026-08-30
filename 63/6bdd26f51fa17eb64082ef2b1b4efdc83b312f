@@ -1,0 +1,19 @@
+src/department/claude-code.ts
+  s_30bbbdc578b296::t_aaba6a1c729ce3 60-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "636bdd26f51fa17eb64082ef2b1b4efdc83b312f",
+  "prompts": {},
+  "sessions": {
+    "s_30bbbdc578b296": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_30bbbdc578b296",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

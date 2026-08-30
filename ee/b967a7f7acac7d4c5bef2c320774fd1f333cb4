@@ -1,0 +1,35 @@
+README.md
+  s_8fbca58aa1015e::t_315dde4d928685 50-100
+src/service/index.ts
+  s_8fbca58aa1015e::t_4c1b291a9ae6f9 48,51
+src/service/launchd.ts
+  s_8fbca58aa1015e::t_1eb7079a88cb2c 6-13,125-128
+src/service/systemd.ts
+  s_8fbca58aa1015e::t_ad2b9c662bc173 6-13,30-32,121-142,153
+src/service/windows.ts
+  s_8fbca58aa1015e::t_250003e3e736cb 15-22,38-41,82-103,120-122,146-163,176,178
+tests/service.launchd.test.ts
+  s_8fbca58aa1015e::t_62edffc596e9b3 88-96
+tests/service.orchestration.test.ts
+  s_8fbca58aa1015e::t_c0b9d8d91b13c7 101-103
+tests/service.systemd.test.ts
+  s_8fbca58aa1015e::t_8bc9c1825f4d6f 70,80,100-132
+tests/service.windows.test.ts
+  s_8fbca58aa1015e::t_a28471bb74a151 6,77-95,97,104-105,109,112-113,128-143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "eeb967a7f7acac7d4c5bef2c320774fd1f333cb4",
+  "prompts": {},
+  "sessions": {
+    "s_8fbca58aa1015e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_8fbca58aa1015e",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

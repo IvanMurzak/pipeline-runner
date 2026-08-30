@@ -1,0 +1,41 @@
+README.md
+  s_e4d33a1d5f97a1::t_e38aecd671a144 23,27-33,37,49-50,57-89
+src/cli.ts
+  s_e4d33a1d5f97a1::t_8a81bfe87231f3 6-7,11,18-28,51-54,94-97,112-125,136-137,140,145-147,160-161,172-183,210-214,265-313,489-494,498-501,574-576
+src/core/config.ts
+  s_e4d33a1d5f97a1::t_07421b65e148ef 4-5,12,15-32,72,75-82,95-115,140-145,215-221,224-228,276-286,292-294
+src/core/connection.ts
+  s_e4d33a1d5f97a1::t_f58ef61db582c7 27-40,46,52-53,99-102,115,129-131,141-142,250-256,261-299,377-380,383-399,407-419
+src/core/mesh-oauth.ts
+  s_e4d33a1d5f97a1::t_329ccc08349e3e 2-3,5-8,10-39,48-49,52-55,60,70,81-89,97-98,106-136,142-149,153,163-166,175,192-212,214-217,219-222,226-228,231-256,260,263,267,269-270,272,274,288,293,295-299,302,313-360
+src/core/register-credential.ts
+  s_e4d33a1d5f97a1::t_6dc213ad8d7c2a 1-287
+src/core/register.ts
+  s_e4d33a1d5f97a1::t_83c3b4785f690e 17-24,35-39,41-45,49,87-90,92-96,99
+src/index.ts
+  s_e4d33a1d5f97a1::t_781e2f698da7ba 16-17
+tests/config.test.ts
+  s_e4d33a1d5f97a1::t_a02cf278f3ab31 16,22-25,84-129,179-206
+tests/connection.test.ts
+  s_e4d33a1d5f97a1::t_39a7219893a3fa 4-5,10-14,365-542,573-618
+tests/register-credential.test.ts
+  s_e4d33a1d5f97a1::t_95bb81be73f06b 1-479
+tests/register.test.ts
+  s_e4d33a1d5f97a1::t_f0f73485edb9f5 43-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "c612e4373a7ab59c005cfee91954af5c47a80382",
+  "prompts": {},
+  "sessions": {
+    "s_e4d33a1d5f97a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_e4d33a1d5f97a1",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

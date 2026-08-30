@@ -1,0 +1,41 @@
+src/jobs/executor.ts
+  s_0437b8a8fbb7aa::t_5603a951fc6442 81-84
+  s_0437b8a8fbb7aa::t_2ac4070ea519ed 371-376,381
+src/jobs/_helpers.ts
+  s_0437b8a8fbb7aa::t_c1447db3afcf1e 165-172,179
+src/relay/adapter.ts
+  s_0437b8a8fbb7aa::t_d46ebf1fc75d4e 1-146
+src/relay/index.ts
+  s_0437b8a8fbb7aa::t_27bfe85446caea 5-10,15
+src/relay/adapter.test.ts
+  s_0437b8a8fbb7aa::t_99068f7e3bb991 1-202
+src/jobs/drive.ts
+  s_0437b8a8fbb7aa::t_1ece8f57a88335 116-119
+  s_0437b8a8fbb7aa::t_22cb81e7615adb 200
+  s_0437b8a8fbb7aa::t_dca0d8049a8853 11,14-17
+src/cli.ts
+  s_0437b8a8fbb7aa::t_badee263d0017c 27-32
+  s_0437b8a8fbb7aa::t_15ffe259d4d66c 139-143,158,165-175,195-197
+  s_0437b8a8fbb7aa::t_de2192174f9c7a 151-157
+src/jobs/drive.test.ts
+  s_0437b8a8fbb7aa::t_37b8921eea3e76 291,297-311
+src/jobs/executor.test.ts
+  s_0437b8a8fbb7aa::t_d1b6996bf0b685 386,403,428-442
+  s_0437b8a8fbb7aa::t_c447e39d08d052 443-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ce237a22343b386b5999b72de5217381d0cfb622",
+  "prompts": {},
+  "sessions": {
+    "s_0437b8a8fbb7aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aca23227-fb01-4357-947a-d2d68329d5df",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+src/department/execution-token-manager.test.ts
+  s_66d947293761a1::t_cdfbfd6b320e66 158-192
+src/department/execution-token-manager.ts
+  s_66d947293761a1::t_abd076016befca 146-157,161-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "24c4425a7a0fd49d2cd202245aa72bc959eff19b",
+  "prompts": {},
+  "sessions": {
+    "s_66d947293761a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_66d947293761a1",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

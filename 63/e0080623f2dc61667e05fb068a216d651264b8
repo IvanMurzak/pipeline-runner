@@ -1,0 +1,43 @@
+src/department/claude-code.ts
+  s_7214d873e0c1d9::t_c7b518fe89c9b9 118,691-695
+src/department/container.test.ts
+  s_4c764335d27b70::t_c38270597f3380 30-35,186,194-196,198-202,213-263
+src/department/container.ts
+  s_4c764335d27b70::t_72b8d73c3b3122 56-60,115,177-178,187-215,261-263,265,268-277,304,480-482,561,573-590
+src/department/engine.test.ts
+  s_4c764335d27b70::t_1eb0eaf82c00d0 29,123-127,131-150,223-225
+src/department/engine.ts
+  s_4c764335d27b70::t_e37d74a107f7d0 86,254-273,357-361,384-386,393,400-402,409,441-459
+src/department/jsonl-process.ts
+  s_7214d873e0c1d9::t_eefa4707783ad1 66,359-361
+src/department/manager.isolation.test.ts
+  s_4c764335d27b70::t_aa8b1f9a2b0408 1-201
+src/department/manager.ts
+  s_4c764335d27b70::t_84d16286c1ea3a 214,370-405,647-667,672-745
+src/department/pipeline-drive.ts
+  s_7214d873e0c1d9::t_c743b9fae89149 182,325-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "63e0080623f2dc61667e05fb068a216d651264b8",
+  "prompts": {},
+  "sessions": {
+    "s_4c764335d27b70": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae6d3be3de76d87b2",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_7214d873e0c1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0bf50eec13341139",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

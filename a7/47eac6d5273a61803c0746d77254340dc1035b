@@ -1,0 +1,72 @@
+src/department/events.ts
+  s_ddab4fcf9dfea4::t_24fb24ccbb5945 1-110
+src/department/jsonl-process.real.test.ts
+  s_ddab4fcf9dfea4::t_84a89d0980d806 1-52
+src/shipper/privacy.ts
+  s_ddab4fcf9dfea4::t_11cfd2389658a0 216-231
+  s_ddab4fcf9dfea4::t_4c54022a13cb25 62-67
+  s_ddab4fcf9dfea4::t_561b3bb3fc4c2b 104,117-121
+  s_ddab4fcf9dfea4::t_0611b29f55760d 322-328
+src/department/config.test.ts
+  s_ddab4fcf9dfea4::t_1acfd42c1b0884 1-51
+tests/shipper-privacy-department.test.ts
+  s_ddab4fcf9dfea4::t_44c3122049e830 1-114
+src/department/config.ts
+  s_ddab4fcf9dfea4::t_4d132c01bbaec1 1-72
+src/department/_test-helpers.ts
+  s_ddab4fcf9dfea4::t_12193ca9825a08 180-184,201,218-221,224-238
+  s_ddab4fcf9dfea4::t_dae63729e964c6 1-179,185-200,202-217,222-223,239-262
+src/department/jsonl-process.test.ts
+  s_ddab4fcf9dfea4::t_8343e551fa2b82 11
+  s_ddab4fcf9dfea4::t_44e00e0043f2e8 1-10,12-23,41-139,144-151,155-166,170-375
+  s_ddab4fcf9dfea4::t_6bfe6d1b5d4274 24-40
+  s_ddab4fcf9dfea4::t_7156e706e7adae 140-143,152-154,167-169
+src/department/adapter.ts
+  s_ddab4fcf9dfea4::t_a22cf32ac0ec74 1-172
+src/department/manager.test.ts
+  s_ddab4fcf9dfea4::t_2040a36ca3aac7 14
+  s_ddab4fcf9dfea4::t_c567ec16b8d72e 1-12,15-260
+  s_ddab4fcf9dfea4::t_c0b02180455872 13
+  s_ddab4fcf9dfea4::t_63f20cc25d6228 261-297,299-305,307-311,322-327,329-333,335-341,343,345-349
+  s_ddab4fcf9dfea4::t_d4ef8e58c46249 298,306,321,328,334,342,344
+  s_ddab4fcf9dfea4::t_34bd265507e900 312-320
+src/core/dispatcher.ts
+  s_ddab4fcf9dfea4::t_5ad04064970d38 23-46
+src/department/fixtures/scripted-runtime.ts
+  s_ddab4fcf9dfea4::t_9cc4d4aaa3e0ab 1-54
+src/jobs/types.test.ts
+  s_ddab4fcf9dfea4::t_6b5b0d51670bef 1-12,14-15,17-101
+  s_ddab4fcf9dfea4::t_91447549dd1f84 13,16
+src/jobs/types.ts
+  s_ddab4fcf9dfea4::t_ab2d59497e2a9a 16-29
+  s_ddab4fcf9dfea4::t_14408a2a0febb7 141-283
+src/department/manager.ts
+  s_ddab4fcf9dfea4::t_7c6bfec71dfeba 326
+  s_ddab4fcf9dfea4::t_5c190735c0f962 538,542
+  s_ddab4fcf9dfea4::t_034db0b6435250 1-325,327-537,539-541,543-544
+src/cli.ts
+  s_ddab4fcf9dfea4::t_4b58b7ee4d6cd6 48-55
+  s_ddab4fcf9dfea4::t_8940c072f68137 248-260,262-263,265-273
+  s_ddab4fcf9dfea4::t_5fc1d223e69985 261,264
+src/department/jsonl-process.ts
+  s_ddab4fcf9dfea4::t_fcb6d12771c0a2 341,358
+  s_ddab4fcf9dfea4::t_ddd35b17408fca 1-340,342-357,359-415,423-430,432,435-451,519,544-545,548,571-576
+  s_ddab4fcf9dfea4::t_88e022e6d34418 517
+  s_ddab4fcf9dfea4::t_3fb8891fad758a 416-422,431,433-434,452-516,518,520-543,546-547,549-570
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "a747eac6d5273a61803c0746d77254340dc1035b",
+  "prompts": {},
+  "sessions": {
+    "s_ddab4fcf9dfea4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72ad2e76-6d1b-4b13-a97d-6977aca140cf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

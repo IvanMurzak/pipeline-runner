@@ -1,0 +1,21 @@
+src/relay/bridge.ts
+  s_16a8295a67c12e::t_4c8843511fce1e 216-229
+tests/relay.test.ts
+  s_16a8295a67c12e::t_86f2b11ca7f36f 167-173,175-176,178-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7c525b7db2f1ba83518ca135373f0d4a5e3a9339",
+  "prompts": {},
+  "sessions": {
+    "s_16a8295a67c12e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_16a8295a67c12e",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,74 @@
+tests/service.named-instance.test.ts
+  s_ddab4fcf9dfea4::t_e5d635fa27379a 1-188
+src/service/plan.ts
+  s_ddab4fcf9dfea4::t_3846d6cf38bdc4 165-172,176,178
+  s_ddab4fcf9dfea4::t_6c4218c3638c08 111-119,127-133,136,141-143
+  s_ddab4fcf9dfea4::t_5dc67717f0f2bc 7-17
+  s_ddab4fcf9dfea4::t_03804ba3b2c7a0 57-91
+tests/config.test.ts
+  s_ddab4fcf9dfea4::t_399b8c99d5a64c 3,13,15
+  s_ddab4fcf9dfea4::t_240315d148dc39 95-117
+  s_ddab4fcf9dfea4::t_ce15785687a2fb 155-187
+tests/capabilities.test.ts
+  s_ddab4fcf9dfea4::t_fe8bec5cb33a8f 1-83
+tests/register.test.ts
+  s_ddab4fcf9dfea4::t_4d0a49de5d0b63 48-75
+  s_ddab4fcf9dfea4::t_b598b06064907a 2
+tests/home.test.ts
+  s_ddab4fcf9dfea4::t_86c8a5d846b019 203-205,207-210,217-218
+  s_ddab4fcf9dfea4::t_fe5824db81a785 195-202,206,211-216,219-249
+  s_ddab4fcf9dfea4::t_36e88612a685a4 1-2,4-13,15-192
+  s_ddab4fcf9dfea4::t_0ab98fbebf701f 3,14,193-194
+src/jobs/shutdown.ts
+  s_ddab4fcf9dfea4::t_76f778f1f33ba0 49-52
+  s_ddab4fcf9dfea4::t_5ff3609299b9e9 88-94
+  s_ddab4fcf9dfea4::t_8298d81152293d 12-16
+src/core/register.ts
+  s_ddab4fcf9dfea4::t_d5f2480346c09e 41-45
+  s_ddab4fcf9dfea4::t_523dedc8e40844 12-16
+src/core/config.ts
+  s_ddab4fcf9dfea4::t_319c11d3a61dd6 237
+  s_ddab4fcf9dfea4::t_0c34705111dd47 143-147
+  s_ddab4fcf9dfea4::t_bb46f94a9fd66b 21-28,33-34,42-54
+  s_ddab4fcf9dfea4::t_13e6df76d7541f 89-93
+  s_ddab4fcf9dfea4::t_3543e1093554c0 55
+src/core/home.ts
+  s_ddab4fcf9dfea4::t_0e07c420be98e4 1-223
+src/jobs/shutdown.test.ts
+  s_ddab4fcf9dfea4::t_7339a1b4696e54 51-88
+src/service/index.ts
+  s_ddab4fcf9dfea4::t_8d3e84e06fe9c5 140,146-152,157-167,176,181,187,191,194
+src/shipper/fs.ts
+  s_ddab4fcf9dfea4::t_b12ba4bfb850c6 151-155
+  s_ddab4fcf9dfea4::t_006bacb982ac6b 15-18,23
+src/cli.ts
+  s_ddab4fcf9dfea4::t_749f4defd47224 84-86,88
+  s_ddab4fcf9dfea4::t_1f2396ef0afb01 394
+  s_ddab4fcf9dfea4::t_700beee8e1cd3d 107,128-132
+  s_ddab4fcf9dfea4::t_4e3c4b7a61220b 170-194,197-200
+  s_ddab4fcf9dfea4::t_c5399553a23b23 295-298
+  s_ddab4fcf9dfea4::t_c7acdebc553332 8,11-12,14-20
+  s_ddab4fcf9dfea4::t_9586fc5ad60bb4 27,30-34
+  s_ddab4fcf9dfea4::t_4d1f55d74ed39e 28
+  s_ddab4fcf9dfea4::t_c5bce2e5d385f9 367-370
+tests/shipper-fs.test.ts
+  s_ddab4fcf9dfea4::t_38beabf7660f71 1-60
+src/core/capabilities.ts
+  s_ddab4fcf9dfea4::t_749022d11c117f 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "1f1de6e66cac3240c32eac4e7e847eb8d2e31d56",
+  "prompts": {},
+  "sessions": {
+    "s_ddab4fcf9dfea4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "72ad2e76-6d1b-4b13-a97d-6977aca140cf",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

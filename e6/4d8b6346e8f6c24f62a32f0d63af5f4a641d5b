@@ -1,0 +1,71 @@
+src/department/config.test.ts
+  s_4cebbe5743659f::t_41a924bc43e3ba 134,145
+src/department/pipeline-drive.test.ts
+  s_4cebbe5743659f::t_f5884cb1f9c3dd 51,99,119,250,905,912
+src/dispatch/dispatch.test.ts
+  s_364be739bc892c::t_8018cd0d184473 32,114,177,265
+src/dispatch/matcher.test.ts
+  s_364be739bc892c::t_8011dad21f701b 15,52,57,75,85,97
+src/dispatch/matcher.ts
+  s_364be739bc892c::t_3701b25b726c9d 41,59,141,149
+src/jobs/_helpers.ts
+  s_364be739bc892c::t_5dddb7f0cbe8ae 211
+src/jobs/drive.test.ts
+  s_364be739bc892c::t_c1d35b4719b4c9 10,17,30,42,65,82,96,115,149,176,189,205,227
+src/jobs/executor.test.ts
+  s_364be739bc892c::t_4114aa5e1a821e 32,656
+src/jobs/manager.test.ts
+  s_364be739bc892c::t_79db8e9ccc6c6c 30,301
+src/jobs/reconcile.test.ts
+  s_4cebbe5743659f::t_4613d320681e6a 80-81
+src/jobs/shipper-lifecycle.test.ts
+  s_4cebbe5743659f::t_e81cc0fc0c9ff2 30,41,43,59
+src/jobs/shipper-lifecycle.ts
+  s_4cebbe5743659f::t_407c0439641573 63,67,69
+src/jobs/workspace.test.ts
+  s_364be739bc892c::t_e0136e4e41f467 17,55-56,97,161,188,240
+src/jobs/workspace.ts
+  s_364be739bc892c::t_76b8d2c9ee81ca 100,106
+src/relay/adapter.test.ts
+  s_4cebbe5743659f::t_d800d7e8db9778 25
+src/shipper/shipper.ts
+  s_364be739bc892c::t_0c7997650f76ab 83
+src/shipper/stats.ts
+  s_364be739bc892c::t_bfe6723aead900 6,223-224
+tests/jobstate-integration.test.ts
+  s_4cebbe5743659f::t_e969e11102f181 59,162
+tests/shipper-spool.test.ts
+  s_364be739bc892c::t_81aacedc2fd47a 13
+tests/shipper-stats.test.ts
+  s_364be739bc892c::t_fefb9c73d1e00d 11,73-74,76-77
+tests/shipper-tail.test.ts
+  s_364be739bc892c::t_f5f5f515db9c96 10
+tests/shipper-watcher.test.ts
+  s_4cebbe5743659f::t_fff837bc988abe 28,30
+tests/shipper.test.ts
+  s_364be739bc892c::t_c0a0b2a13b03d7 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "e64d8b6346e8f6c24f62a32f0d63af5f4a641d5b",
+  "prompts": {},
+  "sessions": {
+    "s_364be739bc892c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b8f91f54-742b-4579-9e3a-eeb38012be81",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_4cebbe5743659f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fc6d3-15e6-7ee2-9b93-87a1eb2dffe6",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

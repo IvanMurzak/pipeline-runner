@@ -1,0 +1,48 @@
+src/relay/wire-relay.ts
+  s_364be739bc892c::t_36d7d7aa4187de 2-5,7-18,20-23,26,29,31,33-35,37,41-43,67-79
+src/jobs/wire.ts
+  s_364be739bc892c::t_5470dc734b3f44 2-5,7-18,20-23,25-29,32-33,36,38,40-48,50,53-60,63,66
+  s_7058b72229a5ce::t_f7c5f345aaf7f9 67
+README.md
+  s_364be739bc892c::t_02aade732b2d18 80-88
+bun.lock
+  s_364be739bc892c::t_a008d2753fc261 7-9,17-18,28-29
+package.json
+  s_364be739bc892c::t_b8b335e1259f9e 24-26
+src/core/wire.ts
+  s_b899ca3d0e837d::t_59a0b1fca2df92 2-5,7-19,21-25,28-55,58-62,64,70-72,75,78,80,83,85,88-98
+src/shipper/wire-ingest.ts
+  s_364be739bc892c::t_52660b3b5ad846 2-5,7-8,10-11,13-14,16,19,36-42,45-48,54-59,70-75,77,82-84,86,89-90,93,98-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "e84ffcc4d57baab1621e2cba04b4bb4e22d8dfa2",
+  "prompts": {},
+  "sessions": {
+    "s_364be739bc892c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b8f91f54-742b-4579-9e3a-eeb38012be81",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_7058b72229a5ce": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27f72a19-24c8-455b-8094-547169868d62",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_b899ca3d0e837d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf4cf357-6db5-4b31-aed0-27730e6286c4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

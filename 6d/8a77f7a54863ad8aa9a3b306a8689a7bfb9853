@@ -1,0 +1,23 @@
+src/department/claude-code.test.ts
+  s_b9a9a5dfd360a4::t_df97f0107bc87c 33-34,45-46,1111-1359
+src/department/claude-code.ts
+  s_b9a9a5dfd360a4::t_42f5d900b7e7af 49-62,165-211,277-289,340-364,531-537,753-780,995-1009,1061-1063,1078,1497-1510,1528,1547-1552,1556-1558,1581-1583,1630-1656
+src/department/manager.stuck.test.ts
+  s_b9a9a5dfd360a4::t_acd0f258e6148c 259-278
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "6d8a77f7a54863ad8aa9a3b306a8689a7bfb9853",
+  "prompts": {},
+  "sessions": {
+    "s_b9a9a5dfd360a4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_b9a9a5dfd360a4",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

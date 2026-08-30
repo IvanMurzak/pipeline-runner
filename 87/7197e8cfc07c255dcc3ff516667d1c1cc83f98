@@ -1,0 +1,22 @@
+tests/shipper-privacy.test.ts
+  s_92ae3535621749::t_b0c4c7ee7be508 47-49,54-56,366-373,375,382,387,716-859
+src/shipper/privacy.ts
+  s_92ae3535621749::t_ed8e85011150a2 85-140,485-573,626,637,651-670,682,694-705,712,723-739,797-801
+  s_92ae3535621749::t_f8873276990366 811
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "877197e8cfc07c255dcc3ff516667d1c1cc83f98",
+  "prompts": {},
+  "sessions": {
+    "s_92ae3535621749": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9e796e49e2a6c9f0",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

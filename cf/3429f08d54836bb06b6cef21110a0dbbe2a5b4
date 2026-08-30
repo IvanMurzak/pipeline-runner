@@ -1,0 +1,27 @@
+src/cli.ts
+  s_9914b0abf7550c::t_1edf5487e51e84 76-82,370-380,389
+src/department/fixtures/mcp-client-runtime.ts
+  s_9914b0abf7550c::t_2697d9289359d5 1-77
+src/department/manager-mesh-oauth.real.test.ts
+  s_9914b0abf7550c::t_e1e32e2ba730ba 1-202
+src/department/manager-mesh-oauth.test.ts
+  s_9914b0abf7550c::t_098689d0891fea 1-263
+src/department/manager.ts
+  s_9914b0abf7550c::t_c1b28d7816ecf2 131-144,203-207,432-442,473-476,618-630,633-647,649,669-692,756-759
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "cf3429f08d54836bb06b6cef21110a0dbbe2a5b4",
+  "prompts": {},
+  "sessions": {
+    "s_9914b0abf7550c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_9914b0abf7550c",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

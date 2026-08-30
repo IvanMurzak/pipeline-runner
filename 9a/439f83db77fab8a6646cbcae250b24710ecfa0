@@ -1,0 +1,51 @@
+src/department/container.test.ts
+  s_7214d873e0c1d9::t_26c8870b216212 69
+src/department/engine.test.ts
+  s_7214d873e0c1d9::t_d0c6b484e23b28 266,298
+src/department/jsonl-process.real.test.ts
+  s_7214d873e0c1d9::t_5d78794611827b 28
+src/department/pipeline-drive.test.ts
+  s_7214d873e0c1d9::t_20e86f2bbf6930 41
+src/cli.ts
+  s_7214d873e0c1d9::t_40ae1129d1b011 129,625-631,647-650,660,699-703
+src/department/_test-helpers.ts
+  s_7214d873e0c1d9::t_aaa86520232882 163-165
+src/department/adapter.ts
+  s_7214d873e0c1d9::t_05183c35eb1d58 242-262
+src/department/claude-code.test.ts
+  s_7214d873e0c1d9::t_b36c214e82cc53 27,32,44-50,55-61,96,98,247-399
+src/department/claude-code.ts
+  s_7214d873e0c1d9::t_5062b84d29e02e 62-80,115-116,139-148,256-259,261-264,267-335,785-787,801-803,807-850,900-902,907
+src/department/engine.ts
+  s_7214d873e0c1d9::t_fdb681d710ac68 282-312,316,324-349
+src/department/execution-token-endpoint.test.ts
+  s_7214d873e0c1d9::t_24e3903aad2fe5 1-287
+src/department/execution-token-endpoint.ts
+  s_7214d873e0c1d9::t_7df08c561641bc 1-349
+src/department/manager-mesh-oauth.test.ts
+  s_7214d873e0c1d9::t_55a7af7f42f5ac 25,28,90-112,114-119,138,140-150,304-414
+src/department/manager.ts
+  s_7214d873e0c1d9::t_97e484a36b2b23 214-222,230,251-255,325-338,841-844,1093-1096,1129-1136,1149-1175,1299-1302
+src/department/mcp-headers-helper.real.test.ts
+  s_7214d873e0c1d9::t_4addc77849132f 1-330
+src/department/mcp-headers-helper.test.ts
+  s_7214d873e0c1d9::t_9a3352f15ebee4 1-141
+src/department/mcp-headers-helper.ts
+  s_7214d873e0c1d9::t_b4c2bd36eae37e 1-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "9a439f83db77fab8a6646cbcae250b24710ecfa0",
+  "prompts": {},
+  "sessions": {
+    "s_7214d873e0c1d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0bf50eec13341139",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

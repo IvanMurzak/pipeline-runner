@@ -1,0 +1,23 @@
+src/department/manager.stuck.test.ts
+  s_5dece677d9ead0::t_7826e67d413163 309-332
+src/department/pipeline-drive.test.ts
+  s_5dece677d9ead0::t_83f648092b2b65 19-22,25,28-47,151,160,170,181-184,194,210,230,261-265,289,303,326-329,359,372,422,484,493-496,505,511-531,538,541,543-549,551,652-655,674,695-879
+src/department/pipeline-drive.ts
+  s_5dece677d9ead0::t_0554f7a7648329 150-226,268-280,648-661
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "79e74c0eb32dde672685bad1a0e57d1b7beb2b18",
+  "prompts": {},
+  "sessions": {
+    "s_5dece677d9ead0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "457084f9-0cda-4b72-a083-45a218fe3cd8",
+        "model": "unknown"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

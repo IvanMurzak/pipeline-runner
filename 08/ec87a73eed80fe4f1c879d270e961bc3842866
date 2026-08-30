@@ -1,0 +1,54 @@
+src/service/update.ts
+  s_28b17c5df8630a::t_e631077b4ca8c8 135,138-155
+  s_28b17c5df8630a::t_6756a1af2cce7a 1-134,136-137,156-181
+src/cli.ts
+  s_28b17c5df8630a::t_b1a707d9a4ea5e 129
+  s_28b17c5df8630a::t_42c25a66b35828 1104-1106
+  s_28b17c5df8630a::t_ebfa42767e6673 1022-1064
+  s_28b17c5df8630a::t_5fb252805d52e4 219-224
+src/service/index.ts
+  s_28b17c5df8630a::t_13bcc709a17949 113
+  s_28b17c5df8630a::t_c0fb005ccab0c8 63-76,78,85,89
+  s_28b17c5df8630a::t_53fc5f23969d9d 101-103
+  s_28b17c5df8630a::t_abe70aaa84079b 23
+src/service/update.test.ts
+  s_28b17c5df8630a::t_f7b556095f1ce8 1-40,49-137,152-161
+  s_28b17c5df8630a::t_aabe89fac2b2c2 138-151
+  s_28b17c5df8630a::t_eedd3077068bf4 41-48
+src/service/windows-task.ts
+  s_28b17c5df8630a::t_ad3fbc63b72ef2 1-48,52-142,144-152,154-159,161-164,209-221,234,237-239,242-243,249-251,256,261-263,272,276-278,286,289,291,304-306,314,317,319,321-323,331,334-335,337,348-349
+  s_28b17c5df8630a::t_e7834a1c086f23 49-50,165-208,222-233,235-236,240-241,244-248,252-255,257-260,264-271,273-275,279-285,287-288,290,292-303,307-313,315-316,318,320,324-330,332-333,336,338-347
+  s_28b17c5df8630a::t_9fdf0c0e9a26ae 51,143,153,160
+tests/service.windows.test.ts
+  s_28b17c5df8630a::t_50a6caa28ded61 30-36
+tests/service.lifecycle.test.ts
+  s_28b17c5df8630a::t_d10401b0cbbda5 45
+tests/service.named-instance.test.ts
+  s_28b17c5df8630a::t_d10401b0cbbda5 166,181,185
+tests/service.orchestration.test.ts
+  s_28b17c5df8630a::t_dbd137b43ea13c 27-32
+  s_28b17c5df8630a::t_d10401b0cbbda5 98
+src/service/windows.ts
+  s_28b17c5df8630a::t_d8d0e17cf0373d 146-183,185-189,192-194
+package.json
+  s_28b17c5df8630a::t_d1d0d85a6296b8 3
+src/service/windows-task.test.ts
+  s_28b17c5df8630a::t_a68b5c44c9ca58 36
+  s_28b17c5df8630a::t_8b9a18de8011d3 1-35,37-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.19",
+  "base_commit_sha": "08ec87a73eed80fe4f1c879d270e961bc3842866",
+  "prompts": {},
+  "sessions": {
+    "s_28b17c5df8630a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f040af7-0aa5-4bf6-ae01-201ebcc16edd",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

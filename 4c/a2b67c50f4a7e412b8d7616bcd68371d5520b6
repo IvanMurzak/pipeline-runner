@@ -1,0 +1,41 @@
+src/jobs/_helpers.ts
+  s_ed1b4ae4e5d986::t_18d082c5a641a8 173-185
+package.json
+  s_ed1b4ae4e5d986::t_9b4f802950245b 33
+src/jobs/drive.ts
+  s_ed1b4ae4e5d986::t_76d6370747ac11 152-161,165
+  s_ed1b4ae4e5d986::t_444c4b8bdcb4ed 223-227,229
+src/jobs/executor.ts
+  s_ed1b4ae4e5d986::t_c6bd4eb8f81d55 107
+  s_ed1b4ae4e5d986::t_e141d084ff14be 928-935
+src/jobs/drive.test.ts
+  s_ed1b4ae4e5d986::t_f4564eb1c8d939 279,286,291-293
+  s_ed1b4ae4e5d986::t_167610efde67fa 294-295
+src/jobs/executor.test.ts
+  s_ed1b4ae4e5d986::t_b4bda67c696012 6
+  s_ed1b4ae4e5d986::t_84928262ece00f 424-447
+src/department/pipeline-drive.ts
+  s_ed1b4ae4e5d986::t_4b973d9796b7b0 736-747,754
+  s_ed1b4ae4e5d986::t_2f9d1185fe202d 755
+src/jobs/wire.ts
+  s_ed1b4ae4e5d986::t_e3471565049b70 24-29
+  s_ed1b4ae4e5d986::t_dbc0eb9b0677d0 50
+bun.lock
+  s_ed1b4ae4e5d986::t_f9a8608caf96d7 8,17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4ca2b67c50f4a7e412b8d7616bcd68371d5520b6",
+  "prompts": {},
+  "sessions": {
+    "s_ed1b4ae4e5d986": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d065bda2-94f7-45db-b8f4-2da50c81020b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

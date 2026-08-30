@@ -1,0 +1,19 @@
+package.json
+  s_ff92dde2e71a12::t_5d47930ce1fd16 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "613d15de6b2a6bb667aca22430e7de1e8e9c5bf5",
+  "prompts": {},
+  "sessions": {
+    "s_ff92dde2e71a12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "69b4a37a-d88f-47f8-a20a-d4d9fb0d68b7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

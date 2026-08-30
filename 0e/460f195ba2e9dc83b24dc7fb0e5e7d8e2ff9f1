@@ -1,0 +1,38 @@
+src/jobs/drive.ts
+  s_ed1b4ae4e5d986::t_4fe98db108a2ee 12-16
+  s_ed1b4ae4e5d986::t_a19ac8a277b76d 143-167,178
+  s_ed1b4ae4e5d986::t_a1bc19ed7621f4 228-242,248
+src/jobs/executor.ts
+  s_ed1b4ae4e5d986::t_25a4116b1872bf 82
+  s_ed1b4ae4e5d986::t_37cfb944ddd88b 141-145
+src/jobs/job-store.ts
+  s_ed1b4ae4e5d986::t_e32d00d3ff109d 54-61
+  s_ed1b4ae4e5d986::t_2c722d7425a93e 37
+src/relay/wire-relay.ts
+  s_ed1b4ae4e5d986::t_112c1a703dceb2 110-117
+  s_ed1b4ae4e5d986::t_8fd2de3c7e1cb3 14-20
+  s_ed1b4ae4e5d986::t_6c52bd07edd38d 30,37,43-109,118-122,127-135,140-142,149
+src/relay/bridge.ts
+  s_ed1b4ae4e5d986::t_d54f23fb60b64a 45
+  s_ed1b4ae4e5d986::t_bde62e887ddf61 76-80,84
+  s_ed1b4ae4e5d986::t_0d8ab12451ee5e 160-174
+tests/approval-gate.test.ts
+  s_ed1b4ae4e5d986::t_f588293abf2229 272-275,279
+  s_ed1b4ae4e5d986::t_1eb13a2a9d275e 1-271,276-278,280-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0e460f195ba2e9dc83b24dc7fb0e5e7d8e2ff9f1",
+  "prompts": {},
+  "sessions": {
+    "s_ed1b4ae4e5d986": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d065bda2-94f7-45db-b8f4-2da50c81020b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}

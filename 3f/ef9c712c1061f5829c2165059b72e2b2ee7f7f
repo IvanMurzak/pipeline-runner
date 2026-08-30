@@ -1,0 +1,183 @@
+.gitattributes
+  s_7a3458111ba12d::t_9e9501b155479c 1
+.github/workflows/ci.yml
+  s_7a3458111ba12d::t_bb33acf00568b6 1-44
+.gitignore
+  s_7a3458111ba12d::t_ae125afed2f573 1-3
+LICENSE
+  s_7a3458111ba12d::t_5ad44b956f7d3a 1-21
+README.md
+  s_7a3458111ba12d::t_45d89d8b69488e 1-96
+bun.lock
+  s_7a3458111ba12d::t_3f575eb4660812 1-24
+package.json
+  s_8c19f166a0a4cd::t_d5167c25d496fd 1-25
+src/core/backoff.ts
+  s_7a3458111ba12d::t_faba4cfdd25c21 1-42
+src/core/clock.ts
+  s_7a3458111ba12d::t_6951a346ae3a90 1-18
+src/core/connection.ts
+  s_7a3458111ba12d::t_eba74a9aa0766e 1-337
+src/core/dispatcher.ts
+  s_7a3458111ba12d::t_748448e4723ea9 1-65
+src/core/heartbeat.ts
+  s_7a3458111ba12d::t_6fad773363ebdd 1-152
+src/core/log.ts
+  s_7a3458111ba12d::t_f74eeac617f4ae 1-30
+src/core/transport.ts
+  s_7a3458111ba12d::t_31dcdcd460e185 1-239
+src/dispatch/dispatch.test.ts
+  s_7a3458111ba12d::t_7914eeb457f174 1-270
+src/dispatch/index.ts
+  s_7a3458111ba12d::t_aa8486db9522a1 1-14
+src/dispatch/matcher.test.ts
+  s_7a3458111ba12d::t_35a50374216eb3 1-153
+src/dispatch/matcher.ts
+  s_7a3458111ba12d::t_e41cab41de8efb 1-184
+src/index.ts
+  s_7a3458111ba12d::t_8497b2cf076afe 1-18
+src/jobs/_helpers.ts
+  s_7a3458111ba12d::t_1f4d7467397c8a 1-187
+src/jobs/drive.test.ts
+  s_7a3458111ba12d::t_4931896c2ef39c 1-254
+src/jobs/drive.ts
+  s_7a3458111ba12d::t_83255a5456a1a4 1-213
+src/jobs/executor.test.ts
+  s_7a3458111ba12d::t_b1e01523bf58f1 1-429
+src/jobs/executor.ts
+  s_7a3458111ba12d::t_86598da6fcecaf 1-435
+src/jobs/index.ts
+  s_7a3458111ba12d::t_bc7e11ffe29ef0 1-18
+src/jobs/manager.test.ts
+  s_7a3458111ba12d::t_430c30d1ea3991 1-234
+src/jobs/manager.ts
+  s_7a3458111ba12d::t_1c5e5675ef4aa8 1-226
+src/jobs/types.ts
+  s_7a3458111ba12d::t_40f6eb76149806 1-124
+src/jobs/wire.test.ts
+  s_7a3458111ba12d::t_90cb7b9f9894d4 1-189
+src/jobs/wire.ts
+  s_7a3458111ba12d::t_51be8f52ab76fd 1-280
+src/jobs/workspace.test.ts
+  s_7a3458111ba12d::t_f3a19812498c3d 1-174
+src/jobs/workspace.ts
+  s_7a3458111ba12d::t_134b34ee3c8481 1-186
+src/relay/bridge.ts
+  s_7a3458111ba12d::t_ec42f382673bc3 1-245
+src/relay/index.ts
+  s_7a3458111ba12d::t_415cf9d76e447b 1-10
+src/relay/wire-relay.ts
+  s_7a3458111ba12d::t_eeea3ff4089229 1-141
+src/service/index.ts
+  s_7a3458111ba12d::t_d6ebe4dc735d24 1-189
+src/service/launchd.ts
+  s_7a3458111ba12d::t_056da2bd158fbd 1-191
+src/service/plan.ts
+  s_7a3458111ba12d::t_5e09ddc674e666 1-162
+src/service/systemd.ts
+  s_7a3458111ba12d::t_80a3feebd7f46c 1-191
+src/service/types.ts
+  s_7a3458111ba12d::t_f008f10f5c3c1c 1-148
+src/service/windows.ts
+  s_7a3458111ba12d::t_0bf7f4fa30c687 1-203
+src/shipper/cursor.ts
+  s_7a3458111ba12d::t_f03297acc5aaf2 1-115
+src/shipper/fs.ts
+  s_7a3458111ba12d::t_d6b3f85e80c243 1-145
+src/shipper/index.ts
+  s_7a3458111ba12d::t_7e376954984e99 1-17
+src/shipper/privacy.ts
+  s_7a3458111ba12d::t_cb08e1bf10d967 1-342
+src/shipper/shipper.ts
+  s_7a3458111ba12d::t_83a298a88a9571 1-389
+src/shipper/spool.ts
+  s_7a3458111ba12d::t_101502c82f21c0 1-180
+src/shipper/stats.ts
+  s_7a3458111ba12d::t_0913a36fb825ae 1-132
+src/shipper/tail.ts
+  s_7a3458111ba12d::t_73e762fcc532d1 1-87
+src/shipper/upload-transport.ts
+  s_7a3458111ba12d::t_33a9119babb685 1-184
+src/shipper/wire-ingest.ts
+  s_7a3458111ba12d::t_f51f4587aa0bd8 1-118
+tests/_helpers.ts
+  s_7a3458111ba12d::t_2fe3bc38a88b4b 1-178
+tests/_service-helpers.ts
+  s_7a3458111ba12d::t_eaa06b1c5e9e7e 1-66
+tests/_shipper-helpers.ts
+  s_7a3458111ba12d::t_688137d5bb35ae 1-169
+tests/backoff.test.ts
+  s_7a3458111ba12d::t_73fc44cb653f4d 1-41
+tests/config.test.ts
+  s_7a3458111ba12d::t_611f466f9218b9 1-138
+tests/connection-send.test.ts
+  s_7a3458111ba12d::t_6c01d6784733cd 1-80
+tests/connection.test.ts
+  s_7a3458111ba12d::t_f42ffd45cefb6b 1-371
+tests/dispatcher.test.ts
+  s_7a3458111ba12d::t_958c4fbe32c819 1-76
+tests/heartbeat.test.ts
+  s_7a3458111ba12d::t_a3ede24585d67d 1-164
+tests/register.test.ts
+  s_7a3458111ba12d::t_2a206bdee5c79b 1-106
+tests/relay.test.ts
+  s_7a3458111ba12d::t_f8089f9d2a9ff9 1-310
+tests/service.launchd.test.ts
+  s_7a3458111ba12d::t_0ff2d5cf8b1d60 1-133
+tests/service.orchestration.test.ts
+  s_7a3458111ba12d::t_dd36234e9c667c 1-158
+tests/service.systemd.test.ts
+  s_7a3458111ba12d::t_7546f31331e21c 1-154
+tests/service.windows.test.ts
+  s_7a3458111ba12d::t_314af7b042f118 1-156
+tests/shipper-privacy.test.ts
+  s_7a3458111ba12d::t_e2665524b34adf 1-236
+tests/shipper-spool.test.ts
+  s_7a3458111ba12d::t_5b75697443ebc0 1-182
+tests/shipper-stats.test.ts
+  s_7a3458111ba12d::t_f5717cafc53e38 1-67
+tests/shipper-tail.test.ts
+  s_7a3458111ba12d::t_f4d7c852e9155c 1-82
+tests/shipper-upload-transport.test.ts
+  s_7a3458111ba12d::t_e20bab2196eaa1 1-136
+tests/shipper.test.ts
+  s_7a3458111ba12d::t_83c4a0087d0d1b 1-242
+tests/transport.test.ts
+  s_7a3458111ba12d::t_26b36a33901f0a 1-249
+tests/wire.test.ts
+  s_7a3458111ba12d::t_cdb7c2d421c95a 1-95
+tsconfig.json
+  s_7a3458111ba12d::t_5f51d6a614abe4 1-16
+src/cli.ts
+  s_7a3458111ba12d::t_1c06111340aa4e 1-172
+src/core/config.ts
+  s_7a3458111ba12d::t_7e5771d64ede57 1-221
+src/core/register.ts
+  s_7a3458111ba12d::t_3ac16bc212c717 1-82
+src/core/wire.ts
+  s_7a3458111ba12d::t_8c69ddd0223ada 1-184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "3fef9c712c1061f5829c2165059b72e2b2ee7f7f",
+  "prompts": {},
+  "sessions": {
+    "s_7a3458111ba12d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "67af214c-5970-46d8-ba0c-b1eb09fe36db",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    },
+    "s_8c19f166a0a4cd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "df8298f2-beea-41ba-9052-0bf0c5fc46f2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
