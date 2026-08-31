@@ -319,8 +319,11 @@ export class ConfigStore {
       runner_id: runnerId,
       labels: Array.isArray(record.labels) ? record.labels.filter((l): l is string => typeof l === 'string') : [],
       capacity: typeof record.capacity === 'number' ? record.capacity : undefined,
-      os: typeof record.os === 'string' ? record.os : detectOs(),
-      agent_version: typeof record.agent_version === 'string' ? record.agent_version : AGENT_VERSION,
+      os: detectOs(),
+      agent_version: AGENT_VERSION,
+      // The CLI version and plugin version are not discoverable by the runner itself.
+      // If we don't read them here, they will reset to 'unknown' on start, which correctly
+      // reflects that the runner doesn't know them. The operator or CLI can pass them during register.
       cli_version: typeof record.cli_version === 'string' ? record.cli_version : 'unknown',
       plugin_version:
         typeof record.plugin_version === 'string' ? record.plugin_version : record.plugin_version === null ? null : undefined,

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { RegisterMessageSchema } from '@baizor/pipeline-protocol';
 import type { RunnerCapabilities } from '../src/core/capabilities';
-import { ConfigStore, type AgentIdentity } from '../src/core/config';
+import { ConfigStore, type AgentIdentity, AGENT_VERSION, detectOs } from '../src/core/config';
 import { applyRegisterAck, buildRegisterFrame, classifyReject, describeReject } from '../src/core/register';
 import { PROTOCOL_VERSION, type RegisterRejectMessage } from '../src/core/wire';
 import { MemFs } from './_helpers';
@@ -28,8 +28,8 @@ describe('buildRegisterFrame', () => {
       id: 'corr-1',
       runner_token: TOKEN,
       labels: ['os:linux'],
-      os: 'linux',
-      agent_version: '0.1.0',
+      os: detectOs(),
+      agent_version: AGENT_VERSION,
       cli_version: '2.0.0',
       plugin_version: '0.9.0',
       protocol_version: PROTOCOL_VERSION,

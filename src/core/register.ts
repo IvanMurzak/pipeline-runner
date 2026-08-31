@@ -24,7 +24,7 @@
  * between the two is `./register-credential.ts`'s job, not this module's.
  */
 
-import type { AgentIdentity } from './config';
+import { type AgentIdentity, AGENT_VERSION, detectOs } from './config';
 import type { ConfigStore } from './config';
 import type { RegisterAckMessage, RegisterMessage, RegisterRejectMessage } from './wire';
 import { PROTOCOL_VERSION } from './wire';
@@ -76,8 +76,8 @@ export function buildRegisterFrame(
     id,
     runner_token: runnerToken,
     labels: identity.labels,
-    os: identity.os,
-    agent_version: identity.agent_version,
+    os: detectOs(),
+    agent_version: AGENT_VERSION,
     cli_version: identity.cli_version,
     plugin_version: identity.plugin_version ?? null,
     protocol_version: PROTOCOL_VERSION,
