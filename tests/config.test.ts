@@ -29,7 +29,7 @@ function identity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
     base_url: 'https://cp.example.com',
     runner_token: TOKEN,
     labels: ['os:windows', 'gpu'],
-    os: 'windows',
+    os: detectOs(),
     agent_version: AGENT_VERSION,
     cli_version: '1.2.3',
     plugin_version: null,

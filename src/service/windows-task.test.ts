@@ -15,9 +15,19 @@ import { ServiceError, type ServiceContext, type ServiceExecResult } from './typ
 
 const PLAN = buildServicePlan({ home: 'C:\\Users\\Dev\\.pipeline-runner' }, 'win32', {});
 
-/** A fake exec that answers by matched arg, and records every call. */
+let isStopped = false;
+const RUNNING = { 
+  match: '', 
+  get result() {
+    return { stdout: isStopped ? 'TaskName: pipeline-runner\r\nStatus: Ready\r\n' : 'TaskName: pipeline-runner\r\nStatus: Running\r\n' };
+  }
+};
+// Update the world function to handle /End and /Run tracking for RUNNING
+// Since world uses answers.find(a => args.includes(a.match)), we can make RUNNING match everything and act as default.
+// Wait, actually let's just intercept /End and /Run in world()
 function world(answers: Array<{ match: string; result: Partial<ServiceExecResult> }>) {
   const calls: string[][] = [];
+  let stopped = false;
   const ctx: ServiceContext = {
     fs: {
       writeFileText: () => {},
@@ -29,7 +39,14 @@ function world(answers: Array<{ match: string; result: Partial<ServiceExecResult
     exec: {
       run(_cmd, args) {
         calls.push(args);
-        const hit = answers.find((a) => args.includes(a.match));
+        if (args.includes('/End')) stopped = true;
+        if (args.includes('/Run')) stopped = false;
+        
+        let hit = answers.find((a) => a.match && args.includes(a.match));
+        // If it's a query and we have RUNNING, but it's stopped, return Ready
+        if (args.includes('/Query') && answers.includes(RUNNING)) {
+          return { code: 0, stdout: stopped ? 'TaskName: pipeline-runner\r\nStatus: Ready\r\n' : 'TaskName: pipeline-runner\r\nStatus: Running\r\n', stderr: '' };
+        }
         return { code: 0, stdout: '', stderr: '', ...(hit?.result ?? {}) };
       },
     },
@@ -39,8 +56,6 @@ function world(answers: Array<{ match: string; result: Partial<ServiceExecResult
   };
   return { ctx, calls };
 }
-
-const RUNNING = { match: '/Query', result: { stdout: 'TaskName: pipeline-runner\r\nStatus: Running\r\n' } };
 const READY = { match: '/Query', result: { stdout: 'TaskName: pipeline-runner\r\nStatus: Ready\r\n' } };
 const MISSING = {
   match: '/Query',

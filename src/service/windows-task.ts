@@ -343,14 +343,30 @@ export const windowsTaskBackend: ServiceBackend = {
         `scheduled task '${name}' is not installed — run \`pipeline-runner service install\` first`,
       );
     }
-
-    const stopped = this.stop(plan, ctx);
-    const started = this.start(plan, ctx);
-    return {
-      ...started,
-      action: 'restart',
-      commands: [...rec.commands, ...stopped.commands, ...started.commands],
-      messages: [...stopped.messages, ...started.messages],
-    };
+    if (before === 'running') {
+      const ended = rec.run(['/End', '/TN', name]);
+      if (ended.code !== 0) fail(ended, 'schtasks /End');
+      
+      // Wait for the task to actually stop before starting it again
+      const startMs = Date.now();
+      while (Date.now() - startMs < 10000) { // 10s timeout
+        if (queryState(plan, rec) !== 'running') break;
+        // Basic sleep (this is synchronous, but these are synchronous scripts)
+        const blockUntil = Date.now() + 500;
+        while (Date.now() < blockUntil) { /* spin */ }
+      }
+    }
+    const ran = rec.run(['/Run', '/TN', name]);
+    if (ran.code !== 0) fail(ran, 'schtasks /Run');
+    const after = queryState(plan, rec);
+    return result(
+      'restart',
+      ctx,
+      rec,
+      after,
+      after === 'running'
+        ? [`scheduled task '${name}' restarted`]
+        : [`restart requested; the scheduler has not yet reported '${name}' running`],
+    );
   },
 };

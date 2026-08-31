@@ -33,10 +33,20 @@ const viewGives = (v: string) => ({
   when: (c: string, a: string[]) => c === 'npm' && a[0] === 'view',
   give: { stdout: `${v}\n` },
 });
-const taskIs = (stdout: string | typeof NO_TASK) => ({
-  when: (c: string) => c === 'schtasks.exe',
-  give: typeof stdout === 'string' ? { stdout } : stdout,
-});
+const taskIs = (stdout: string | typeof NO_TASK) => {
+  let isStopped = false;
+  return {
+    when: (c: string, a: string[]) => {
+      if (c === 'schtasks.exe' && a.includes('/End')) isStopped = true;
+      if (c === 'schtasks.exe' && a.includes('/Run')) isStopped = false;
+      return c === 'schtasks.exe';
+    },
+    get give() {
+      if (typeof stdout !== 'string') return stdout;
+      return { stdout: isStopped ? 'TaskName: pipeline-runner\r\nStatus: Ready\r\n' : stdout };
+    }
+  };
+};
 
 // A realistic env: `buildServicePlan` needs a config dir, and an empty env
 // makes it throw — which is a DIFFERENT outcome from "no service installed"
