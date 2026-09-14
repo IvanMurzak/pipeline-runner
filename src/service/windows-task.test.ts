@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { buildServicePlan } from './plan';
+import { buildServicePlan, winQuote } from './plan';
 import { parseInstanceFlags, selectBackend } from './index';
 import { parseTaskState, renderHiddenRunnerWrapper, renderTaskCreateCommand, windowsTaskBackend } from './windows-task';
 import { ServiceError, type ServiceContext, type ServiceExecResult } from './types';
@@ -106,10 +106,10 @@ describe('renderTaskCreateCommand (pure)', () => {
 
   test('the generated wrapper launches the real runner hidden, waits, and propagates its exit code', () => {
     expect(cmd.wrapperPath).toEndWith('pipeline-runner-hidden.js');
-    // The command is embedded as a JavaScript string literal, so Windows
-    // backslashes are escaped in the generated source.
-    expect(cmd.wrapperContent).toContain('bun.exe');
-    expect(cmd.wrapperContent).toContain('cli.ts start');
+    const runnerCommand = [PLAN.invocation.program, ...PLAN.invocation.args].map(winQuote).join(' ');
+    // Compare the embedded JavaScript literal, not a host-specific bun.exe
+    // suffix: this pure Windows renderer is also tested on Linux CI.
+    expect(cmd.wrapperContent).toContain(JSON.stringify(runnerCommand));
     expect(cmd.wrapperContent).toContain(', 0, true)');
     expect(cmd.wrapperContent).toContain('WScript.Quit(exitCode)');
   });
