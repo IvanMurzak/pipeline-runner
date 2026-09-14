@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { installCommand, PACKAGE_NAME, runUpdate } from './update';
-import { ServiceError, type ServiceExec, type ServiceExecResult } from './types';
+import { ServiceError, type ServiceExec, type ServiceExecResult, type ServiceFs } from './types';
 
 /**
  * `pipeline-runner update`.
@@ -55,6 +55,13 @@ const base = {
   platform: 'win32',
   env: { USERPROFILE: 'C:\\Users\\Dev' },
   logger: { debug() {}, info() {}, warn() {}, error() {} },
+  fs: {
+    writeFileText() {},
+    readFileText() { return null; },
+    removeFile() {},
+    mkdirp() {},
+    exists() { return false; },
+  } satisfies ServiceFs,
 };
 
 describe('installCommand (pure)', () => {

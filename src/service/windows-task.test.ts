@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { buildServicePlan } from './plan';
 import { parseInstanceFlags, selectBackend } from './index';
-import { parseTaskState, renderTaskCreateCommand, windowsTaskBackend } from './windows-task';
+import { parseTaskState, renderHiddenRunnerWrapper, renderTaskCreateCommand, windowsTaskBackend } from './windows-task';
 import { ServiceError, type ServiceContext, type ServiceExecResult } from './types';
 
 /**
@@ -27,13 +31,14 @@ const RUNNING = {
 // Wait, actually let's just intercept /End and /Run in world()
 function world(answers: Array<{ match: string; result: Partial<ServiceExecResult> }>) {
   const calls: string[][] = [];
+  const fsCalls: Array<{ verb: string; path: string; content?: string }> = [];
   let stopped = false;
   const ctx: ServiceContext = {
     fs: {
-      writeFileText: () => {},
+      writeFileText: (path, content) => { fsCalls.push({ verb: 'write', path, content }); },
       readFileText: () => null,
-      removeFile: () => {},
-      mkdirp: () => {},
+      removeFile: (path) => { fsCalls.push({ verb: 'remove', path }); },
+      mkdirp: (path) => { fsCalls.push({ verb: 'mkdir', path }); },
       exists: () => false,
     },
     exec: {
@@ -54,7 +59,7 @@ function world(answers: Array<{ match: string; result: Partial<ServiceExecResult
     env: {},
     platform: 'win32',
   };
-  return { ctx, calls };
+  return { ctx, calls, fsCalls };
 }
 const READY = { match: '/Query', result: { stdout: 'TaskName: pipeline-runner\r\nStatus: Ready\r\n' } };
 const MISSING = {
@@ -91,6 +96,63 @@ describe('renderTaskCreateCommand (pure)', () => {
   test('quotes the program and each argument — Windows paths contain spaces', () => {
     const spaced = buildServicePlan({ home: 'C:\\Users\\Some One\\.pipeline-runner' }, 'win32', {});
     expect(renderTaskCreateCommand(spaced).taskRun).toContain('"');
+  });
+
+  test('the scheduler action is a GUI host, never the console-subsystem bun executable', () => {
+    expect(cmd.taskRun).toStartWith('wscript.exe ');
+    expect(cmd.taskRun).not.toContain('bun.exe');
+    expect(cmd.createArgs[cmd.createArgs.indexOf('/TR') + 1]).toBe(cmd.taskRun);
+  });
+
+  test('the generated wrapper launches the real runner hidden, waits, and propagates its exit code', () => {
+    expect(cmd.wrapperPath).toEndWith('pipeline-runner-hidden.js');
+    // The command is embedded as a JavaScript string literal, so Windows
+    // backslashes are escaped in the generated source.
+    expect(cmd.wrapperContent).toContain('bun.exe');
+    expect(cmd.wrapperContent).toContain('cli.ts start');
+    expect(cmd.wrapperContent).toContain(', 0, true)');
+    expect(cmd.wrapperContent).toContain('WScript.Quit(exitCode)');
+  });
+
+  test('quotes spaces, backslashes, and embedded quotes as valid JScript data', () => {
+    const command = 'C:\\Program Files\\bun.exe "C:\\Some Path\\cli.ts" --label "quoted value"';
+    const wrapper = renderHiddenRunnerWrapper(command);
+    expect(wrapper).toContain(JSON.stringify(command));
+    expect(wrapper).not.toContain(`shell.Run(${command},`);
+  });
+
+  test.skipIf(process.platform !== 'win32')('the generated wrapper really propagates a child exit code via wscript', () => {
+    const root = mkdtempSync(join(tmpdir(), 'runner-wscript-test-'));
+    const file = join(root, 'wrapper.js');
+    try {
+      writeFileSync(file, renderHiddenRunnerWrapper('cmd.exe /d /c exit 23'));
+      const result = spawnSync('wscript.exe', [file], { windowsHide: true });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(23);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('preview output includes both the wrapper and registration command without touching the machine', () => {
+    const { ctx, calls, fsCalls } = world([]);
+    const definition = windowsTaskBackend.generate(PLAN, ctx);
+    expect(windowsTaskBackend.definitionPath(PLAN, ctx)).toEndWith('pipeline-runner-hidden.js');
+    expect(definition).toContain('WScript.Shell');
+    expect(definition).toContain('schtasks.exe /Create');
+    expect(definition).toContain('wscript.exe');
+    expect(calls).toHaveLength(0);
+    expect(fsCalls).toHaveLength(0);
+  });
+
+  test('named instances receive distinct wrappers and task names', () => {
+    const a = buildServicePlan({ name: 'cpu', home: 'C:\\runners\\cpu' }, 'win32', {});
+    const b = buildServicePlan({ name: 'gpu', home: 'C:\\runners\\gpu' }, 'win32', {});
+    const aCommand = renderTaskCreateCommand(a);
+    const bCommand = renderTaskCreateCommand(b);
+    expect(aCommand.wrapperPath).not.toBe(bCommand.wrapperPath);
+    expect(aCommand.createArgs).toContain('pipeline-runner@cpu');
+    expect(bCommand.createArgs).toContain('pipeline-runner@gpu');
   });
 });
 
@@ -145,6 +207,15 @@ describe('the awkward states every backend owes an answer to', () => {
 });
 
 describe('install', () => {
+  test('writes the wrapper before replacing and running the task', () => {
+    const { ctx, calls, fsCalls } = world([RUNNING]);
+    windowsTaskBackend.install(PLAN, ctx);
+    const write = fsCalls.find((call) => call.verb === 'write');
+    expect(write?.path).toEndWith('pipeline-runner-hidden.js');
+    expect(write?.content).toContain(', 0, true)');
+    expect(calls.map((args) => args[0]).slice(0, 3)).toEqual(['/End', '/Create', '/Change']);
+  });
+
   test('ends RUNNING, not merely registered, and records every command it ran', () => {
     const { ctx } = world([RUNNING]);
     const r = windowsTaskBackend.install(PLAN, ctx);
@@ -171,6 +242,19 @@ describe('install', () => {
     expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/RunAs/);
   });
 
+  test('a failed /Create removes the orphaned wrapper and never starts the task', () => {
+    const { ctx, calls, fsCalls } = world([{ match: '/Create', result: { code: 1, stderr: 'invalid task' } }]);
+    expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/invalid task/);
+    expect(fsCalls.some((call) => call.verb === 'remove' && call.path.endsWith('-hidden.js'))).toBe(true);
+    expect(calls.some((args) => args.includes('/Run'))).toBe(false);
+  });
+
+  test('a failed /Run is fatal but leaves the registered definition available for diagnosis', () => {
+    const { ctx, fsCalls } = world([{ match: '/Run', result: { code: 1, stderr: 'launch refused' } }]);
+    expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/launch refused/);
+    expect(fsCalls.some((call) => call.verb === 'remove')).toBe(false);
+  });
+
   test('a NON-privilege failure gets no elevation hint — the blanket advice is what people learn to ignore', () => {
     const { ctx } = world([{ match: '/Create', result: { code: 1, stderr: 'ERROR: The task XML is malformed.' } }]);
     expect(() => windowsTaskBackend.install(PLAN, ctx)).toThrow(/malformed/);
@@ -192,6 +276,38 @@ describe('restart — the verb an upgrade depends on', () => {
     const { ctx } = world([READY]);
     const r = windowsTaskBackend.restart(PLAN, ctx);
     expect(r.commands.map((c) => c.args[0])).not.toContain('/End');
+  });
+
+  test('refreshes a legacy definition before /Run and writes the hidden wrapper', () => {
+    const { ctx, calls, fsCalls } = world([READY]);
+    windowsTaskBackend.restart(PLAN, ctx);
+    const verbs = calls.map((args) => args[0]);
+    expect(verbs.indexOf('/Create')).toBeLessThan(verbs.indexOf('/Run'));
+    expect(fsCalls.some((call) => call.verb === 'write' && call.content?.includes('WScript.Shell'))).toBe(true);
+  });
+
+  test('a definition refresh failure never runs a stale task', () => {
+    const { ctx, calls } = world([READY, { match: '/Create', result: { code: 1, stderr: 'cannot update' } }]);
+    expect(() => windowsTaskBackend.restart(PLAN, ctx)).toThrow(/cannot update/);
+    expect(calls.some((args) => args.includes('/Run'))).toBe(false);
+  });
+});
+
+describe('uninstall', () => {
+  test('removes both an installed task and its generated wrapper', () => {
+    const { ctx, calls, fsCalls } = world([RUNNING]);
+    const result = windowsTaskBackend.uninstall(PLAN, ctx);
+    expect(result.state).toBe('not-installed');
+    expect(calls.some((args) => args.includes('/Delete'))).toBe(true);
+    expect(fsCalls.some((call) => call.verb === 'remove' && call.path.endsWith('-hidden.js'))).toBe(true);
+  });
+
+  test('an already absent task still cleans up a leftover wrapper', () => {
+    const { ctx, calls, fsCalls } = world([MISSING]);
+    const result = windowsTaskBackend.uninstall(PLAN, ctx);
+    expect(result.state).toBe('not-installed');
+    expect(calls.some((args) => args.includes('/Delete'))).toBe(false);
+    expect(fsCalls.some((call) => call.verb === 'remove')).toBe(true);
   });
 });
 

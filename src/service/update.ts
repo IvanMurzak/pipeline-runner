@@ -28,7 +28,7 @@
 
 import { consoleLogger, type Logger } from '../core/log';
 import { restartService, serviceStatus } from './index';
-import { ServiceError, nodeServiceExec, type ServiceExec } from './types';
+import { ServiceError, nodeServiceExec, type ServiceExec, type ServiceFs } from './types';
 
 /** The npm package this runner ships as. */
 export const PACKAGE_NAME = '@baizor/pipeline-runner';
@@ -42,6 +42,7 @@ export interface UpdateOptions {
   noRestart?: boolean;
   /** Injected seams (tests). */
   exec?: ServiceExec;
+  fs?: ServiceFs;
   logger?: Logger;
   platform?: string;
   env?: Record<string, string | undefined>;
@@ -128,6 +129,7 @@ export function runUpdate(opts: UpdateOptions = {}): UpdateOutcome {
   // Is anything supervising this runner? `status` answers without mutating.
   const serviceOpts = {
     ...(opts.exec ? { exec: opts.exec } : {}),
+    ...(opts.fs ? { fs: opts.fs } : {}),
     ...(opts.platform ? { platform: opts.platform } : {}),
     ...(opts.env ? { env: opts.env } : {}),
     logger,

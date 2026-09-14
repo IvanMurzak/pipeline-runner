@@ -6,7 +6,8 @@ OUT to the control plane's `/agent/v1` WSS channel (no inbound ports),
 registers with a scoped runner token, heartbeats, accepts job leases, checks
 out an isolated workspace, drives the run through the `pipeline` CLI, ships
 events back, and relays `needs_input` prompts. It can also install itself as
-a native OS service (systemd on Linux, launchd on macOS, a Windows Service).
+a native OS service (systemd on Linux, launchd on macOS, or a hidden per-user
+Task Scheduler job on Windows).
 
 ## Prerequisite: the `pipeline` CLI must be on PATH
 
@@ -36,6 +37,10 @@ bun src/cli.ts start
 
 # inspect the stored identity (credentials redacted)
 bun src/cli.ts status
+
+# inspect durable logs, or stream them live without opening a service console
+bun src/cli.ts logs --since 1h
+bun src/cli.ts logs --follow
 
 # install/uninstall/status as a native OS service
 bun src/cli.ts service <install|uninstall|status> [--dry-run]
@@ -106,9 +111,33 @@ them cannot attach credentials to an unrelated `register --token`.
 | `--drop-token` | no | Also remove the legacy runner token from the config. Removes the fallback — only do this once the credential-window report is clear. |
 | `--home <path>` | no | Which isolated runner home to migrate, when several runners share this host. |
 
-`service install` supports `--dry-run` to print the generated systemd
-unit / launchd plist / `sc.exe create` + `sc.exe failure` commands without
-touching the system.
+`service install` supports `--dry-run` to print the generated systemd unit,
+launchd plist, Windows Task Scheduler command + hidden wrapper, or the opt-in
+SCM commands without touching the system.
+
+### Durable logs
+
+Every `start` process writes one JSON object per line under the runner data
+directory: `%LOCALAPPDATA%\pipeline-runner\logs` on Windows,
+`$XDG_STATE_HOME/pipeline-runner/logs` (falling back to
+`~/.local/state/pipeline-runner/logs`) on Linux/macOS, or `<home>/data/logs`
+for an instance pinned with `--home`. Files roll at UTC midnight and are kept
+for 30 days. A hard kill can damage at most the final incomplete line, which
+the reader ignores.
+
+`pipeline-runner logs` renders the last 200 records by default. Useful forms:
+
+```sh
+pipeline-runner logs --follow
+pipeline-runner logs --since 30m --level warn
+pipeline-runner logs --limit 1000 --json
+pipeline-runner logs --home <path> --follow
+```
+
+`--level` is a minimum severity (`debug`, `info`, `warn`, `error`). `--since`
+accepts durations such as `30s`, `15m`, `12h`, `7d`, or an ISO-8601 timestamp.
+Interactive output colors the severity column; `NO_COLOR` disables it. The
+default limit is 200 matching records, and `--limit 0` reads all of them.
 
 ### `service start` / `stop` / `restart`
 
@@ -156,14 +185,14 @@ platform:
   it before any login), then `sudo systemctl enable --now
   pipeline-runner.service`. This is a manual step — `service install` never
   requests elevation and does not manage system units itself.
-- **Windows (SCM):** install additionally runs
-  `sc.exe failure <name> reset= 86400 actions= restart/5000`, so the Service
-  Control Manager restarts the process 5s after a crash (the failure counter
-  resets after 24h of uninterrupted uptime). `sc.exe create ... start= auto`
-  alone — what this backend did before — starts the service at boot but
-  configures NO recovery action, so the SCM never restarted a crashed
-  process. Verify the configured recovery action with
-  `sc.exe qfailure pipeline-runner`.
+- **Windows (default Task Scheduler backend):** a per-user ONLOGON task runs as
+  the registered user. Its action is the GUI-subsystem `wscript.exe`, whose
+  generated wrapper starts Bun hidden, waits for it, and propagates its exit
+  code. No console or Windows Terminal window is created; use
+  `pipeline-runner logs --follow` instead. Re-run `service install` (or
+  `service restart` after upgrading to a build with this behavior) to migrate
+  an older direct-`bun.exe` task. The opt-in `--service-host scm` backend is
+  retained for wrapped/headless installations that must run while logged out.
 - **macOS (launchd, LaunchAgent):** `RunAtLoad` + `KeepAlive` restart the
   daemon on crash and at LOGIN, but explicitly **not at boot** before anyone
   logs in — there is no root LaunchDaemon (`/Library/LaunchDaemons`) support

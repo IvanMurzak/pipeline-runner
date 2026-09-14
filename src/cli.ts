@@ -77,6 +77,9 @@
  *       Read `./department/journal-read.ts`'s module doc BEFORE touching it:
  *       it carries the privacy position for this surface.
  *
+ *   logs [--follow] [--since <duration|ISO-time>] [--level <level>]
+ *       Read the daemon's durable, daily-rotated JSONL log.
+ *
  *   status   Print the stored identity (token redacted).
  */
 
@@ -101,7 +104,8 @@ import {
   resolveRunStateDir,
   resolveWorkspaceRoot,
 } from './core/home';
-import { consoleLogger } from './core/log';
+import { configurePersistentLogging, consoleLogger } from './core/log';
+import { runLogs } from './commands/logs';
 // department-mesh d5 (P6, 13 §10.2): which credential registers this runner,
 // and which secret authenticates it as an OAuth client. See
 // `./core/register-credential.ts` — the connection wires the provider itself.
@@ -204,7 +208,7 @@ function envValue(name: string): string | undefined {
 }
 
 function fail(message: string): never {
-  console.error(`[pipeline-runner] error: ${message}`);
+  consoleLogger.error(message);
   process.exit(1);
 }
 
@@ -219,6 +223,7 @@ function usage(): never {
       '           [--gpu] [--container] [--store-only]',
       '  set-credentials --client-id <id> --client-secret <secret> [--drop-token] [--home <path>]',
       '  start [--home <path>]',
+      '  logs [--follow] [--json] [--limit <n>] [--level <level>] [--since <duration|ISO-time>] [--home <path>]',
       '  bind --department <id> --command <cmd> [--adapter <id>] [--arg <a>]...',
       '       [--cwd <path>] [--lifecycle <per-task|per-context|daemon>]',
       '       [--permission-mode <mode>] [--allow-tool <tool>]... [--settings-file <path>]',
@@ -478,6 +483,18 @@ function runStart(argv: string[] = []): void {
   // the definition's ExecStart/ProgramArguments/binPath bakes in this flag.
   const { values: startValues } = parseArgs({ args: argv, options: { home: { type: 'string' } } });
   if (startValues.home) process.env[PIPELINE_RUNNER_HOME_ENV] = startValues.home;
+
+  // Configure this before the lock and config reads so startup failures are
+  // durable too. The logger continues to mirror to console for foreground,
+  // systemd-journal and launchd compatibility; the Windows scheduler starts
+  // it through a hidden host, so that console has no visible window there.
+  try {
+    const logDir = configurePersistentLogging();
+    consoleLogger.info(`durable log enabled: ${logDir}`);
+  } catch (err) {
+    // Observability must degrade, never prevent the runner from serving.
+    consoleLogger.warn(`durable logging unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // d7: the per-home exclusive lock — "one daemon per home" (07 §2.2). Must
   // be acquired BEFORE the store/job-store/department journal below touch
@@ -1184,6 +1201,9 @@ switch (command) {
   // simplified-onboarding x22: the local department journal, read back.
   case 'journal':
     runJournal(rest);
+    break;
+  case 'logs':
+    process.exitCode = await runLogs(rest);
     break;
   case 'status':
     runStatus();
