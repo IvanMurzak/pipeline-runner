@@ -1,0 +1,19 @@
+src/service/windows-task.test.ts
+  s_c0506a385307d1::t_5d684e6b18da0c 6,109-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1ac38eff5290b24e8f4782751404fa160cdc97a0",
+  "prompts": {},
+  "sessions": {
+    "s_c0506a385307d1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09d29-2443-7f71-8287-bb185cb3ad03",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Ivan Murzak <Ivan.D.Murzak@gmail.com>"
+    }
+  }
+}
