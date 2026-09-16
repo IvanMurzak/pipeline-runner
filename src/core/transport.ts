@@ -23,6 +23,7 @@
  * the socket loop.
  */
 
+import { discardBody } from './http-body';
 import type { Logger } from './log';
 import { nullLogger } from './log';
 import type { WireFrame } from './wire';
@@ -188,8 +189,18 @@ export class LongPollTransport implements Transport {
           closeOnce({ error: err instanceof Error ? err.message : String(err) });
           return;
         }
-        if (closed) return;
+        // Both exits below walk away from a response nobody will read, and
+        // `connection.ts` re-opens this transport with backoff forever — so the
+        // body is cancelled explicitly on each, or a control plane that answers
+        // non-2xx (or a close that lands mid-poll) strands one socket per
+        // reconnect until GC (`./http-body.ts`). `discardBody` never rejects,
+        // so awaiting it here cannot escape the loop.
+        if (closed) {
+          await discardBody(response);
+          return;
+        }
         if (!response.ok) {
+          await discardBody(response);
           closeOnce({ error: `HTTP ${response.status}` });
           return;
         }
@@ -197,6 +208,7 @@ export class LongPollTransport implements Transport {
         try {
           decoded = await response.json();
         } catch {
+          await discardBody(response);
           logger.warn('non-JSON long-poll body ignored');
         }
         const frames =

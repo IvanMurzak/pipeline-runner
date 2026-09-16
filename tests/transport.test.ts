@@ -73,8 +73,12 @@ class FetchScript {
       });
     })) as unknown as typeof fetch;
 
-  respond(index: number, payload: unknown, status = 200): void {
-    this.calls[index]!.resolve(new Response(JSON.stringify(payload), { status }));
+  /** Returns the `Response` handed to the loop, so a test can assert on what
+   *  the loop did with its body (handle hygiene — see the leak tests below). */
+  respond(index: number, payload: unknown, status = 200): Response {
+    const response = new Response(JSON.stringify(payload), { status });
+    this.calls[index]!.resolve(response);
+    return response;
   }
 }
 
@@ -245,5 +249,55 @@ describe('LongPollTransport', () => {
     script.respond(0, { frames: [{ type: 'late_frame' }] }); // the in-flight poll returns late
     await tick();
     expect(closes).toHaveLength(1); // still exactly one close, no late delivery crash
+  });
+
+  // ── Handle hygiene ─────────────────────────────────────────────────────────
+  // An unread `fetch` body holds its socket until GC, and `connection.ts`
+  // re-opens this transport with backoff indefinitely — so a poll cycle that
+  // returns without reading the body strands one handle per reconnect, forever
+  // (~5,500 live handles after ~5,350 cycles in the report that prompted this).
+  // Cancelling the stream disturbs it, so `bodyUsed` is the observable form of
+  // "the handle was released".
+  test('a non-2xx poll releases the response body before closing', async () => {
+    const { transport, script } = makeTransport();
+    const { events, closes } = collectEvents();
+    transport.open(events);
+    await tick();
+    const response = script.respond(0, { error: 'down' }, 503);
+    await tick();
+    expect(closes).toEqual([{ error: 'HTTP 503' }]); // behaviour unchanged…
+    expect(response.bodyUsed).toBe(true); // …and the socket is not stranded.
+  });
+
+  test('a poll that lands after a local close releases its body too', async () => {
+    // The other way out of the cycle without reading: `close()` won the race
+    // against an in-flight poll, so the loop returns at the `closed` check
+    // BEFORE the status check. Same leak, same fix.
+    const { transport, script } = makeTransport();
+    const { events } = collectEvents();
+    const connection = transport.open(events);
+    await tick();
+    connection.close();
+    await tick();
+    const response = script.respond(0, { frames: [] });
+    await tick();
+    expect(response.bodyUsed).toBe(true);
+  });
+
+  // Weaker than the two above by construction: a failed `.json()` has usually
+  // already drained the stream, so this passes with or without the explicit
+  // cancel. It is here to pin the invariant for the case where it has NOT —
+  // a body that errors mid-read — and so that the exit path is not quietly
+  // dropped from the "every early exit cancels" rule later.
+  test('a non-JSON poll body ends up released, not left half-read', async () => {
+    const { transport, script, logger } = makeTransport();
+    const { events } = collectEvents();
+    transport.open(events);
+    await tick();
+    const response = new Response('<html>proxy error</html>', { status: 200 });
+    script.calls[0]!.resolve(response);
+    await tick();
+    expect(logger.joined()).toContain('non-JSON long-poll body ignored');
+    expect(response.bodyUsed).toBe(true);
   });
 });
