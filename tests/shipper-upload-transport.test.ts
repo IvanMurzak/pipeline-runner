@@ -133,4 +133,47 @@ describe('HttpUploadTransport (canonical HTTPS batch; server auth gap flagged)',
       }
     }
   });
+
+  // ── Handle hygiene ─────────────────────────────────────────────────────────
+  // An unread `fetch` body keeps its socket checked out until the `Response` is
+  // garbage-collected, which may be never in a daemon. This upload is the worst
+  // place in the runner for that: `Shipper.drain` re-arms it on a backoff timer
+  // for as long as the control plane keeps failing, so a status branch that
+  // walked away without reading stranded one handle PER RETRY — a user reported
+  // ~5,500 live handles after ~5,350 cycles. Cancelling the stream disturbs it,
+  // so `bodyUsed` is the observable form of "the handle was released".
+  test('a non-2xx response never leaves its body — and its socket — unread', async () => {
+    for (const status of [400, 401, 500, 503]) {
+      const response = jsonResponse(status, { error: 'nope' });
+      expect(response.bodyUsed).toBe(false);
+      const transport = new HttpUploadTransport({
+        baseUrl: 'https://pipeline.example.com',
+        token: TOKEN,
+        fetchImpl: async () => response,
+      });
+      const result = await transport.upload(BATCH);
+      expect(result.ok).toBe(false); // classification unchanged…
+      expect(response.bodyUsed).toBe(true); // …and nothing is left holding the socket.
+    }
+  });
+
+  test('the abandoned body is cancelled at the stream, not merely dropped', async () => {
+    // Same claim as above, asserted on the mechanism itself rather than on
+    // `bodyUsed`: the underlying source is told to release its resources.
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => controller.enqueue(new TextEncoder().encode('{"error":"down"}')),
+      cancel: () => {
+        cancelled = true;
+      },
+    });
+    const transport = new HttpUploadTransport({
+      baseUrl: 'https://pipeline.example.com',
+      token: TOKEN,
+      fetchImpl: async () => new Response(body, { status: 503 }),
+    });
+    const result = await transport.upload(BATCH);
+    expect(result).toEqual({ ok: false, retryable: true, error: 'HTTP 503' });
+    expect(cancelled).toBe(true);
+  });
 });

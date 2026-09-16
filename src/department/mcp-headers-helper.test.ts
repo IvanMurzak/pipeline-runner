@@ -176,6 +176,23 @@ describe('the headers-helper program', () => {
     }
   });
 
+  test('a failed call never walks away from an unread body', async () => {
+    // Handle hygiene (`../core/http-body.ts`). This program is short-lived, so
+    // its own leak dies with it — the assertion is here because the rule is
+    // "EVERY early exit cancels", and the two long-running call sites
+    // (`shipper/upload-transport.ts`, `core/transport.ts`) are where the same
+    // omission cost a user ~5,500 live handles. An unread body keeps its socket
+    // until GC; cancelling it flips `bodyUsed`.
+    for (const response of [
+      new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 }),
+      new Response('<html>not json</html>', { status: 200 }),
+    ]) {
+      const { io: helperIo } = io({ respond: () => response });
+      expect(await runHeadersHelper(helperIo)).toBe(1);
+      expect(response.bodyUsed).toBe(true);
+    }
+  });
+
   test('nothing it writes anywhere ever contains the secret', async () => {
     const cases = [
       io(),

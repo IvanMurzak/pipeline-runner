@@ -49,6 +49,11 @@
 // independence: a helper that disagreed with the supervisor about a name is
 // exactly the silent 401 loop x21 was built to end.
 import { ENGINE_MCP_HELPER_SECRET_ENV, ENGINE_MCP_HELPER_URL_ENV, readEngineEnv } from './engine';
+// The second import, held to the same bar: `../core/http-body.ts` imports
+// nothing and is one function. This program is short-lived, so its own leak
+// dies with it — it discards the body anyway because the rule is "every early
+// exit cancels", and a rule with an exception is a rule nobody applies.
+import { discardBody } from '../core/http-body';
 
 /** Claude Code allows the helper 10s; fail inside that window so the CLI sees
  *  a clean non-zero exit and its own message rather than a kill. */
@@ -115,6 +120,7 @@ export async function runHeadersHelper(io: HelperIo): Promise<number> {
   }
 
   if (!response.ok) {
+    await discardBody(response);
     io.stderr(`pipeline mcp-headers-helper: the runner refused (HTTP ${response.status})\n`);
     return 1;
   }
@@ -123,6 +129,7 @@ export async function runHeadersHelper(io: HelperIo): Promise<number> {
   try {
     parsed = await response.json();
   } catch {
+    await discardBody(response);
     io.stderr('pipeline mcp-headers-helper: the runner answered with something that is not JSON\n');
     return 1;
   }

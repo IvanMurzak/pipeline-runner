@@ -32,6 +32,7 @@
 import type { Clock } from '../core/clock';
 import { systemClock } from '../core/clock';
 import type { Dispatcher } from '../core/dispatcher';
+import { discardBody } from '../core/http-body';
 import type { WireFrame } from '../core/wire';
 import type { IngestBatchRequest, IngestBatchResponse } from './wire-ingest';
 import { buildUploadFrame, isUploadAck, parseIngestBatchResponse } from './wire-ingest';
@@ -168,12 +169,20 @@ export class HttpUploadTransport implements UploadTransport {
       try {
         decoded = await response.json();
       } catch {
-        /* fall through to the shape check */
+        // Not JSON, or the stream died mid-read. Either way the body is no
+        // longer ours to read — release whatever is left of it (see
+        // `core/http-body.ts`) and fall through to the shape check.
+        await discardBody(response);
       }
       const ack = parseIngestBatchResponse(decoded);
       if (ack === null) return { ok: false, retryable: true, error: 'malformed ingest response' };
       return { ok: true, ack };
     }
+    // Every branch below abandons the response without reading it, and this
+    // upload is retried by `Shipper.drain`'s backoff timer for as long as the
+    // control plane keeps failing — so the body MUST be cancelled explicitly or
+    // each retry strands another socket until GC (`core/http-body.ts`).
+    await discardBody(response);
     // 4xx: the batch (or the credential) is wrong — a retry of the same bytes
     // cannot succeed. 5xx and everything else: server-side, retryable.
     if (response.status >= 400 && response.status < 500) {
