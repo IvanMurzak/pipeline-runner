@@ -1,0 +1,83 @@
+# What consumers must NOT receive in the @baizor/pipeline-runner tarball.
+#
+# ── Why a denylist and not `files` ──────────────────────────────────────────
+# `package.json` declares `"bin": { "pipeline-runner": "src/cli.ts" }` and
+# `"exports": { ".": "./src/index.ts" }`. There is no build step, no bundle and
+# no `dist/`: the published package runs RAW TYPESCRIPT straight out of `src/`,
+# and Bun resolves the import graph at runtime from whatever files the install
+# actually put on disk.
+#
+# That makes the failure mode of over-excluding invisible here and fatal there:
+# the package installs cleanly and then dies with `Cannot find module` on the
+# consumer's first run. So this is a DENYLIST of things proven to be
+# unreachable from `src/cli.ts` / `src/index.ts`, NOT a `files` allowlist in
+# package.json. Please do not "tidy" it into one — an allowlist inverts the
+# default, so every new runtime file added to `src/` would have to remember to
+# opt in, and the one that forgets ships broken.
+#
+# Before excluding anything under `src/`, walk the import graph from
+# `src/cli.ts` and `src/index.ts` (every `from '…'`, `import('…')`,
+# `require('…')`, including type-only imports) and confirm nothing reaches it.
+# `.github/workflows/release.yml` packs the real tarball and asserts every
+# `bin` entry is inside it — that is the backstop, not the proof.
+#
+# ── The .gitignore-shadowing trap ───────────────────────────────────────────
+# npm consults `.gitignore` ONLY when no `.npmignore` exists. The moment this
+# file appeared, `.gitignore` stopped being read for packing (that is exactly
+# what npm's `gitignore-fallback` warning was about). So `.gitignore`'s entries
+# are duplicated below, on purpose. If you add an entry to `.gitignore` that
+# should not ship, add it here too — nothing will remind you.
+
+# ── Carried over from .gitignore (see the trap above) ───────────────────────
+node_modules/
+dist/
+*.log
+
+# ── CI / repo plumbing: meaningless once installed ──────────────────────────
+.github/
+.gitattributes
+bun.lock
+
+# ── Tests ───────────────────────────────────────────────────────────────────
+# The standalone suite. Nothing in the runtime graph imports out of `tests/`;
+# the only mentions in shipped source are prose in comments.
+tests/
+
+# Colocated suites under `src/` — this repo keeps `foo.test.ts` next to
+# `foo.ts` (including the `*.real.test.ts` variants). None of them is imported
+# by a non-test module; `src/department/claude-code.test.ts` alone is 102 kB.
+*.test.ts
+
+# ── Test-only helpers that do NOT look like tests ───────────────────────────
+# Underscore-prefixed, so they survive the `*.test.ts` pattern above, and each
+# was checked individually rather than assumed from its name. Every importer of
+# these three is a `*.test.ts` file; the single mention inside the runtime
+# graph is a comment in `src/department/engine.ts` pointing at the conformance
+# suite, not an import. `_adapter-conformance.ts` additionally imports
+# `../../tests/_helpers`, which this file excludes — so shipping it would leave
+# a dangling import in the tarball.
+#
+# Listed one by one rather than as `src/**/_*.ts`: a blanket underscore rule
+# would silently swallow a future runtime module that happens to start with an
+# underscore.
+src/department/_adapter-conformance.ts
+src/department/_test-helpers.ts
+src/jobs/_helpers.ts
+
+# Scripted child-process runtimes spawned by the department suites. No runtime
+# module references this directory by import or by path string.
+src/department/fixtures/
+
+# ── Deliberately KEPT, so nobody "finishes the job" by removing them ────────
+#   README.md, LICENSE, package.json — npm always includes these anyway.
+#   tsconfig.json — Bun reads the nearest tsconfig when it executes raw TS
+#     (`verbatimModuleSyntax`, `allowImportingTsExtensions`), and it is 413 B.
+#   docs/ (~39 kB) — `src/cli.ts` prints "see docs/cross-machine-resume.md" to
+#     the user's terminal, and other shipped modules cite `docs/*.md` by path.
+#     A pointer that dead-ends in an installed package is worse than 39 kB.
+#   src/department/mcp-relay.ts, src/department/mcp-headers-helper.ts,
+#     src/dispatch/index.ts, src/shipper/index.ts — not reached from the
+#     current entry points, but they are ordinary runtime modules (barrel files
+#     and MCP plumbing), not test scaffolding. Dropping them would be a
+#     dead-code decision wearing a packaging costume, and any future import
+#     would break the published package without breaking CI.
